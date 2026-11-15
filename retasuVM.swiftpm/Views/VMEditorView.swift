@@ -126,6 +126,7 @@ struct VMEditorView: View {
                 allowedContentTypes: [
                     UTType(filenameExtension: "iso") ?? .data,
                     UTType(filenameExtension: "img") ?? .data,
+                    UTType(filenameExtension: "efi") ?? .data,
                     .data,
                 ]
             ) { result in
@@ -169,7 +170,7 @@ struct VMEditorView: View {
             }
             return "ゲストイメージは、起動時にエミュレータへ読み込む OS です。\(guestImage.displayName): \(guestImage.detail)"
         case .x86:
-            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。Multiboot 対応カーネル（ELF32 ファイル、または ISO 内の KERNEL.ELF）は 32 ビット プロテクトモードで直接起動します。割り込みコントローラ（PIC）、タイマ（PIT）、PCI、IDE ディスク、キーボード、RTC などの周辺デバイスも再現しています。試作用のサンプルは GitHub Releases から入手できます。"
+            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。Multiboot 対応カーネル（ELF32 ファイル、または ISO 内の KERNEL.ELF）は 32 ビット プロテクトモードで直接起動でき、64 ビット ロングモードへの移行も可能です。UEFI アプリケーション（.efi、PE32+ / x86-64）は最小 UEFI ファームウェアで起動します。割り込みコントローラ（PIC / APIC）、タイマ（PIT）、PCI、IDE ディスク、キーボード、RTC、ACPI テーブルなどの周辺デバイスも再現しています。試作用のサンプルは GitHub Releases から入手できます。"
         case .arm:
             return "ARMv7-A エミュレータ上で、内蔵のデモゲスト「ArmDemoOS」が動きます（fact で 12! の計算、echo、help が使えます）。"
         }
