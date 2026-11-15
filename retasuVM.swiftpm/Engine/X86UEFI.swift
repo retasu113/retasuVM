@@ -394,10 +394,12 @@ enum X86UEFI {
         private var framebufferWidth: Int { gopModes[gopCurrentMode].width }
         private var framebufferHeight: Int { gopModes[gopCurrentMode].height }
         private var highMonotonicCount: UInt64 = 0
-        // 構成テーブル（初期値は ACPI 2.0 → RSDP）
+        // 構成テーブル（初期値は ACPI 2.0 → RSDP と SMBIOS）
         private var configEntries: [(guid: [UInt8], table: UInt64)] = [
             ([0x71, 0xE8, 0x68, 0x88, 0xF1, 0xE4, 0xD3, 0x11,
               0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81], 0xE0000),
+            ([0x31, 0x2D, 0x9D, 0xEB, 0x88, 0x2D, 0xD3, 0x11,
+              0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D], 0xE2000),
         ]
 
         // よく使う GUID（メモリ表現: 先頭 3 フィールドはリトルエンディアン）

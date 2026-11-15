@@ -31,6 +31,9 @@ final class X86DeviceBus {
     let keyboard = X86KeyboardController()
     let pci = X86PCIHost()
     let ide = X86IDEController()
+    let hpet = X86HPET()
+    let smc = X86SMC()
+    let ahci = X86AHCIController()
 
     private var ppiPort61: UInt8 = 0
     private var port92: UInt8 = 0
@@ -123,6 +126,8 @@ final class X86DeviceBus {
     init() {
         ide.bus = self
         keyboard.bus = self
+        hpet.bus = self
+        ahci.bus = self
     }
 
     func reset() {
@@ -132,6 +137,9 @@ final class X86DeviceBus {
         ioapic.reset()
         keyboard.reset()
         ide.reset()
+        hpet.reset()
+        smc.reset()
+        ahci.reset()
         serialIER = 0
         serialLCR = 0
     }
@@ -148,6 +156,7 @@ final class X86DeviceBus {
         }
         pic.setLine(1, keyboard.hasData)
         ioapic.setPinLevel(1, keyboard.hasData)
+        hpet.update(now: now)
         let serialAsserted = serialIER & 0x01 != 0 && (cpu?.hasInput ?? false)
         pic.setLine(4, serialAsserted)
         ioapic.setPinLevel(4, serialAsserted)
@@ -163,14 +172,22 @@ final class X86DeviceBus {
 
     // MARK: - MMIO（LAPIC / IOAPIC）
 
-    /// MMIO 領域（LAPIC 0xFEE00000、IOAPIC 0xFEC00000）かどうか。
+    /// MMIO 領域（LAPIC / IOAPIC / HPET / AHCI）かどうか。
     static func isMMIOAddress(_ physical: UInt64) -> Bool {
         (physical >= 0xFEE00000 && physical < 0xFEE01000)
             || (physical >= 0xFEC00000 && physical < 0xFEC01000)
+            || (physical >= X86HPET.baseAddress && physical < X86HPET.baseAddress + 0x400)
+            || (physical >= X86AHCIController.abarAddress && physical < X86AHCIController.abarAddress + 0x1000)
     }
 
     /// MMIO 読み取り。レジスタは 32 ビット単位で、バイトレーンを切り出す。
     func readMMIO(physical: UInt64, size: Int) -> UInt64 {
+        if physical >= X86HPET.baseAddress && physical < X86HPET.baseAddress + 0x400 {
+            return hpet.read(offset: Int(physical - X86HPET.baseAddress), size: size, now: lastNow)
+        }
+        if physical >= X86AHCIController.abarAddress && physical < X86AHCIController.abarAddress + 0x1000 {
+            return ahci.read(offset: Int(physical - X86AHCIController.abarAddress), size: size)
+        }
         let isLAPIC = physical >= 0xFEE00000
         let offset = Int(physical - (isLAPIC ? 0xFEE00000 : 0xFEC00000))
         let registerOffset = offset & ~3
@@ -192,6 +209,14 @@ final class X86DeviceBus {
 
     /// MMIO 書き込み。部分書き込みはレジスタ値へマージする。
     func writeMMIO(physical: UInt64, size: Int, _ value: UInt64) {
+        if physical >= X86HPET.baseAddress && physical < X86HPET.baseAddress + 0x400 {
+            hpet.write(offset: Int(physical - X86HPET.baseAddress), size: size, value, now: lastNow)
+            return
+        }
+        if physical >= X86AHCIController.abarAddress && physical < X86AHCIController.abarAddress + 0x1000 {
+            ahci.write(offset: Int(physical - X86AHCIController.abarAddress), size: size, value)
+            return
+        }
         let isLAPIC = physical >= 0xFEE00000
         let offset = Int(physical - (isLAPIC ? 0xFEE00000 : 0xFEC00000))
         let registerOffset = offset & ~3
@@ -303,6 +328,10 @@ final class X86DeviceBus {
         case 0x3DA: // 入力ステータス 1（帰線期間ビットを時間で切り替えてポーリングを抜けさせる）
             let phase = ((cpu?.nowNanos ?? 0) / 11_000_000) & 1
             return phase == 0 ? 0x01 : 0x08
+        case 0x300: // SMC データポート
+            return smc.readData()
+        case 0x304: // SMC コマンド / ステータスポート
+            return smc.readStatus()
         case 0x00...0x1F, 0xC0...0xDF: // DMA コントローラ（スタブ）
             return 0xFF
         default:
@@ -362,6 +391,10 @@ final class X86DeviceBus {
             serialScratch = value
         case 0xE9: // デバッグコンソール（Bochs / QEMU の debugcon 互換）
             cpu?.onChar?(value)
+        case 0x300: // SMC データポート
+            smc.writeData(value)
+        case 0x304: // SMC コマンドポート
+            smc.writeCommand(value)
         case 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7:
             ide.writeRegister(port, value)
         case 0xC000...0xC00F: // バスマスタ IDE（BAR4 = 0xC000 固定）
@@ -948,6 +981,15 @@ final class X86PCIHost {
         ide[0x21] = 0xC0
         devices[0x09] = ide
         devices[0x10] = Self.makeDevice(vendor: 0x1234, device: 0x1111, classCode: 0x030000, revision: 0x02, headerType: 0x00)
+        var ahci = Self.makeDevice(vendor: 0x8086, device: 0x2922, classCode: 0x010601, revision: 0x00, headerType: 0x00)
+        // BAR5 (ABAR): MMIO 0xFEB00000（4 KiB）
+        ahci[0x24] = 0x00
+        ahci[0x25] = 0x00
+        ahci[0x26] = 0xB0
+        ahci[0x27] = 0xFE
+        ahci[0x3C] = 11 // Interrupt Line: IRQ11
+        ahci[0x3D] = 1  // Interrupt Pin: INTA
+        devices[0x18] = ahci
     }
 
     private static func makeDevice(vendor: UInt16, device: UInt16, classCode: UInt32, revision: UInt8, headerType: UInt8) -> [UInt8] {
@@ -1591,5 +1633,594 @@ final class X86IOAPIC {
             }
         default: break
         }
+    }
+}
+
+
+// MARK: - HPET
+
+/// High Precision Event Timer（MMIO 0xFED00000、タイマ 3 本、64 ビット
+/// メインカウンタ、10 MHz = 周期 100 ns）。macOS のカーネル (XNU) が
+/// 起動に必須とするタイマ。レガシー置換モード（タイマ 0 → IRQ0、
+/// タイマ 1 → IRQ8）と、IOAPIC へのルーティング指定の両方に対応する。
+final class X86HPET {
+    static let baseAddress: UInt64 = 0xFED00000
+    weak var bus: X86DeviceBus?
+
+    private var config: UInt64 = 0          // bit0: ENABLE、bit1: LEG_RT
+    private var interruptStatus: UInt64 = 0 // レベル型タイマの状態（W1C）
+    private var epochTicks: UInt64 = 0
+    private var frozenCounter: UInt64 = 0
+
+    private struct Timer {
+        var config: UInt64 = 0
+        var comparator: UInt64 = 0
+        var armed = false
+        var step: UInt64 = 0
+        var levelAsserted = false
+    }
+    private var timers = [Timer](repeating: Timer(), count: 3)
+
+    func reset() {
+        config = 0
+        interruptStatus = 0
+        epochTicks = 0
+        frozenCounter = 0
+        timers = [Timer](repeating: Timer(), count: 3)
+    }
+
+    /// メインカウンタ（10 MHz: 100 ns ごとに 1 進む）。
+    private func counter(now: UInt64) -> UInt64 {
+        config & 1 != 0 ? (now / 100) &- epochTicks : frozenCounter
+    }
+
+    func read(offset: Int, size: Int, now: UInt64) -> UInt64 {
+        let register = readRegister(offset & ~7, now: now)
+        if size >= 8 { return register }
+        let lane = offset & 7
+        return (register >> (lane * 8)) & ((UInt64(1) << (size * 8)) - 1)
+    }
+
+    func write(offset: Int, size: Int, _ value: UInt64, now: UInt64) {
+        let registerOffset = offset & ~7
+        let lane = offset & 7
+        let current = readRegister(registerOffset, now: now)
+        let merged: UInt64
+        if size >= 8 {
+            merged = value
+        } else {
+            let mask: UInt64 = ((UInt64(1) << (size * 8)) - 1) << (lane * 8)
+            merged = (current & ~mask) | ((value & ((UInt64(1) << (size * 8)) - 1)) << (lane * 8))
+        }
+        writeRegister(registerOffset, merged, now: now)
+    }
+
+    private func readRegister(_ offset: Int, now: UInt64) -> UInt64 {
+        switch offset {
+        case 0x00: // GCAP_ID: ベンダ 8086 / タイマ 3 / 64 ビット / レガシー置換可 / 周期 100 ns
+            return 0x05F5E100_8086A201
+        case 0x10:
+            return config
+        case 0x20:
+            return interruptStatus
+        case 0xF0:
+            return counter(now: now)
+        case 0x100, 0x120, 0x140: // タイマ コンフィギュレーション
+            let index = (offset - 0x100) / 0x20
+            return timers[index].config | (1 << 4) | (1 << 5) | (0x00FFFFFF << 32)
+        case 0x108, 0x128, 0x148: // コンパレータ
+            let index = (offset - 0x100) / 0x20
+            return timers[index].comparator
+        default:
+            return 0
+        }
+    }
+
+    private func writeRegister(_ offset: Int, _ value: UInt64, now: UInt64) {
+        switch offset {
+        case 0x10:
+            let wasEnabled = config & 1 != 0
+            let isEnabled = value & 1 != 0
+            if !wasEnabled && isEnabled {
+                epochTicks = (now / 100) &- frozenCounter
+            } else if wasEnabled && !isEnabled {
+                frozenCounter = counter(now: now)
+            }
+            config = value & 0x3
+        case 0x20: // W1C: レベル型の割り込み線も下げる
+            let cleared = interruptStatus & value
+            interruptStatus &= ~value
+            for i in timers.indices where cleared & (UInt64(1) << i) != 0 && timers[i].levelAsserted {
+                timers[i].levelAsserted = false
+                let route = Int((timers[i].config >> 9) & 0x1F)
+                bus?.ioapic.setPinLevel(route, false)
+            }
+        case 0xF0:
+            if config & 1 != 0 {
+                epochTicks = (now / 100) &- value
+            } else {
+                frozenCounter = value
+            }
+        case 0x100, 0x120, 0x140:
+            let index = (offset - 0x100) / 0x20
+            timers[index].config = value & (0x2 | 0x4 | 0x8 | 0x40 | (0x1F << 9))
+        case 0x108, 0x128, 0x148:
+            let index = (offset - 0x100) / 0x20
+            timers[index].comparator = value
+            timers[index].armed = true
+            let current = counter(now: now)
+            timers[index].step = value > current ? value - current : 0
+        default:
+            break
+        }
+    }
+
+    /// コンパレータ到達の監視（updateDevices から毎回呼ばれる）。
+    func update(now: UInt64) {
+        guard config & 1 != 0 else { return }
+        let current = counter(now: now)
+        for i in timers.indices {
+            guard timers[i].armed, timers[i].config & 0x4 != 0,
+                  current >= timers[i].comparator else { continue }
+            fire(i)
+            if timers[i].config & 0x8 != 0 { // 周期モード: 再装填
+                let step = timers[i].step == 0 ? 1 : timers[i].step
+                var next = timers[i].comparator &+ step
+                if next <= current { next = current &+ step }
+                timers[i].comparator = next
+            } else {
+                timers[i].armed = false
+            }
+        }
+    }
+
+    private func fire(_ index: Int) {
+        let timerConfig = timers[index].config
+        if config & 0x2 != 0 && index <= 1 { // レガシー置換: T0 → IRQ0、T1 → IRQ8
+            bus?.pulseInterruptLine(index == 0 ? 0 : 8)
+            if timerConfig & 0x2 != 0 { interruptStatus |= UInt64(1) << index }
+            return
+        }
+        let route = Int((timerConfig >> 9) & 0x1F)
+        if timerConfig & 0x2 != 0 { // レベル型
+            interruptStatus |= UInt64(1) << index
+            timers[index].levelAsserted = true
+            bus?.ioapic.setPinLevel(route, true)
+        } else { // エッジ型
+            bus?.ioapic.pulsePin(route)
+        }
+    }
+}
+
+// MARK: - Apple SMC
+
+/// Apple System Management Controller（I/O ポート 0x300 = データ、
+/// 0x304 = コマンド / ステータス）の最小エミュレーション。
+/// キープロトコル（0x10 読み取り / 0x11 書き込み / 0x12 インデックス
+/// 取得 / 0x13 キー情報）を実装し、macOS が要求する OSK0 / OSK1
+/// キー（"our hard work by these words guarded, please steal, (c)
+/// AppleCom…" の 64 バイト）を返す。
+final class X86SMC {
+    private struct Key {
+        let name: String
+        let type: String
+        let value: [UInt8]
+    }
+    private let keys: [Key]
+
+    // プロトコル状態: 0 コマンド待ち / 1 キー名 / 2 長さ / 3 書込データ / 4 インデックス
+    private var phase = 0
+    private var command: UInt8 = 0
+    private var keyBytes: [UInt8] = []
+    private var writeLength = 0
+    private var writeBytes: [UInt8] = []
+    private var indexBytes: [UInt8] = []
+    private var response: [UInt8] = []
+
+    init() {
+        var list: [Key] = [
+            Key(name: "#KEY", type: "ui32", value: []),
+            Key(name: "OSK0", type: "ch8*", value: [UInt8]("our hard work by these words gua".utf8)),
+            Key(name: "OSK1", type: "ch8*", value: [UInt8]("rded, please steal, (c) AppleCom".utf8)),
+            Key(name: "REV ", type: "ch8*", value: [0x02, 0x25, 0x0F, 0x00, 0x00, 0x03]),
+            Key(name: "MSLD", type: "ui8 ", value: [0]),
+            Key(name: "BNum", type: "ui8 ", value: [1]),
+        ]
+        let count = list.count
+        list[0] = Key(name: "#KEY", type: "ui32", value: [
+            UInt8((count >> 24) & 0xFF), UInt8((count >> 16) & 0xFF),
+            UInt8((count >> 8) & 0xFF), UInt8(count & 0xFF)])
+        keys = list
+    }
+
+    func reset() {
+        phase = 0
+        keyBytes = []
+        writeBytes = []
+        indexBytes = []
+        response = []
+    }
+
+    /// ステータス: bit0 = 応答データあり、bit2 = 入力受付可。
+    func readStatus() -> UInt8 {
+        response.isEmpty ? 0x04 : 0x01
+    }
+
+    func readData() -> UInt8 {
+        response.isEmpty ? 0 : response.removeFirst()
+    }
+
+    func writeCommand(_ value: UInt8) {
+        guard phase == 0, response.isEmpty else { return }
+        command = value
+        keyBytes = []
+        indexBytes = []
+        switch value {
+        case 0x10, 0x11, 0x13:
+            phase = 1
+        case 0x12:
+            phase = 4
+        default:
+            break
+        }
+    }
+
+    func writeData(_ value: UInt8) {
+        switch phase {
+        case 1:
+            keyBytes.append(value)
+            guard keyBytes.count == 4 else { return }
+            if command == 0x13 {
+                response = keyInfo(for: keyBytes)
+                phase = 0
+            } else {
+                phase = 2
+            }
+        case 2:
+            let length = Int(value)
+            if command == 0x10 {
+                response = readValue(for: keyBytes, length: length)
+                phase = 0
+            } else {
+                writeLength = length
+                writeBytes = []
+                phase = length == 0 ? 0 : 3
+            }
+        case 3:
+            writeBytes.append(value)
+            if writeBytes.count >= writeLength { phase = 0 }
+        case 4:
+            indexBytes.append(value)
+            guard indexBytes.count == 2 else { return }
+            let index = (Int(indexBytes[0]) << 8) | Int(indexBytes[1])
+            response = index < keys.count ? [UInt8](keys[index].name.utf8) : [0, 0, 0, 0]
+            phase = 0
+        default:
+            break
+        }
+    }
+
+    private func findKey(_ bytes: [UInt8]) -> Key? {
+        let name = String(bytes: bytes, encoding: .ascii) ?? ""
+        return keys.first { $0.name == name }
+    }
+
+    private func keyInfo(for bytes: [UInt8]) -> [UInt8] {
+        guard let key = findKey(bytes) else { return [0, 0, 0, 0, 0, 0] }
+        return [UInt8(key.value.count)] + [UInt8](key.type.utf8) + [0]
+    }
+
+    private func readValue(for bytes: [UInt8], length: Int) -> [UInt8] {
+        guard let key = findKey(bytes) else { return [UInt8](repeating: 0, count: length) }
+        var value = key.value
+        while value.count < length { value.append(0) }
+        return Array(value.prefix(length))
+    }
+}
+
+// MARK: - AHCI（SATA）コントローラ
+
+/// AHCI 1.3 互換の SATA ホストコントローラ（PCI デバイス 3、BAR5 は
+/// 0xFEB00000 固定）。ポート 0 に IDE と共有するディスクを接続し、
+/// コマンドリスト / レジスタ FIS / PRDT による DMA 転送（IDENTIFY
+/// DEVICE、READ / WRITE DMA (EXT)、FLUSH CACHE）を同期的に実行する。
+/// 現在の macOS は IDE (PATA) ドライバを持たないため、SATA が
+/// ディスクアクセスの前提になる。
+final class X86AHCIController {
+    static let abarAddress: UInt64 = 0xFEB00000
+    weak var bus: X86DeviceBus?
+
+    private var ghc: UInt32 = 0
+    private var globalInterruptStatus: UInt32 = 0
+    private var commandListBase: UInt64 = 0
+    private var fisBase: UInt64 = 0
+    private var portInterruptStatus: UInt32 = 0
+    private var portInterruptEnable: UInt32 = 0
+    private var portCommand: UInt32 = 0
+    private var portSControl: UInt32 = 0
+    private var portSActive: UInt32 = 0
+    private var portCommandIssue: UInt32 = 0
+    private var lastCommandError = false
+
+    private var disk: X86DiskImage? { bus?.cpu?.attachedDisk }
+    private var devicePresent: Bool { disk != nil }
+
+    func reset() {
+        ghc = 0
+        globalInterruptStatus = 0
+        commandListBase = 0
+        fisBase = 0
+        portInterruptStatus = 0
+        portInterruptEnable = 0
+        portCommand = 0
+        portSControl = 0
+        portSActive = 0
+        portCommandIssue = 0
+        lastCommandError = false
+    }
+
+    func read(offset: Int, size: Int) -> UInt64 {
+        let register = readRegister(offset & ~3)
+        if size >= 4 { return UInt64(register) }
+        let lane = offset & 3
+        return UInt64(register >> (lane * 8)) & ((UInt64(1) << (size * 8)) - 1)
+    }
+
+    func write(offset: Int, size: Int, _ value: UInt64) {
+        let registerOffset = offset & ~3
+        let lane = offset & 3
+        let current = readRegister(registerOffset)
+        let merged: UInt32
+        if size >= 4 {
+            merged = UInt32(value & 0xFFFFFFFF)
+        } else {
+            let mask: UInt32 = UInt32((UInt64(1) << (size * 8)) - 1) << (lane * 8)
+            merged = (current & ~mask) | (UInt32(value) << (lane * 8))
+        }
+        writeRegister(registerOffset, merged)
+    }
+
+    private func readRegister(_ offset: Int) -> UInt32 {
+        switch offset {
+        case 0x00: return 0x80301F00 // CAP: S64A / Gen3 / スロット 32 / ポート 1
+        case 0x04: return ghc
+        case 0x08: return devicePresent ? 1 : 0 // PI
+        case 0x0C: return 0x00010301 // VS: AHCI 1.3.1
+        case 0x10: return globalInterruptStatus
+        case 0x100: return UInt32(commandListBase & 0xFFFFFFFF)
+        case 0x104: return UInt32(commandListBase >> 32)
+        case 0x108: return UInt32(fisBase & 0xFFFFFFFF)
+        case 0x10C: return UInt32(fisBase >> 32)
+        case 0x110: return portInterruptStatus
+        case 0x114: return portInterruptEnable
+        case 0x118:
+            var value = portCommand
+            if portCommand & 0x01 != 0 { value |= 0x8000 } // CR = ST
+            if portCommand & 0x10 != 0 { value |= 0x4000 } // FR = FRE
+            return value
+        case 0x120: return devicePresent ? (lastCommandError ? 0x41 : 0x40) : 0 // TFD
+        case 0x124: return devicePresent ? 0x00000101 : 0xFFFFFFFF // SIG: ATA デバイス
+        case 0x128: return devicePresent ? 0x00000103 : 0 // SSTS: DET=3 / IPM=1
+        case 0x12C: return portSControl
+        case 0x130: return 0 // SERR
+        case 0x134: return portSActive
+        case 0x138: return portCommandIssue
+        default: return 0
+        }
+    }
+
+    private func writeRegister(_ offset: Int, _ value: UInt32) {
+        switch offset {
+        case 0x04:
+            if value & 0x01 != 0 { reset(); return } // HR（ホストリセット）
+            ghc = value & 0x80000002 // AE + IE
+        case 0x10:
+            globalInterruptStatus &= ~value
+        case 0x100:
+            commandListBase = (commandListBase & 0xFFFFFFFF00000000) | UInt64(value & 0xFFFFFC00)
+        case 0x104:
+            commandListBase = (commandListBase & 0xFFFFFFFF) | (UInt64(value) << 32)
+        case 0x108:
+            fisBase = (fisBase & 0xFFFFFFFF00000000) | UInt64(value & 0xFFFFFF00)
+        case 0x10C:
+            fisBase = (fisBase & 0xFFFFFFFF) | (UInt64(value) << 32)
+        case 0x110:
+            portInterruptStatus &= ~value
+        case 0x114:
+            portInterruptEnable = value
+        case 0x118:
+            portCommand = value & 0x1F // ST / SUD / POD / CLO / FRE
+        case 0x12C:
+            portSControl = value
+        case 0x134:
+            portSActive = value
+        case 0x138:
+            let newBits = value & ~portCommandIssue
+            portCommandIssue = value
+            for slot in 0..<32 where newBits & (UInt32(1) << slot) != 0 {
+                executeCommand(slot: slot)
+            }
+        default:
+            break
+        }
+    }
+
+    // MARK: コマンド実行
+
+    private func executeCommand(slot: Int) {
+        defer { portCommandIssue &= ~(UInt32(1) << slot) }
+        guard let cpu = bus?.cpu, let disk else { completeWithError(); return }
+        let headerAddress = commandListBase + UInt64(slot) * 32
+        let header0 = guestRead32(cpu, headerAddress)
+        let prdtl = Int((header0 >> 16) & 0xFFFF)
+        let tableAddress = UInt64(guestRead32(cpu, headerAddress + 8))
+            | (UInt64(guestRead32(cpu, headerAddress + 12)) << 32)
+        var fis = [UInt8](repeating: 0, count: 20)
+        for i in 0..<20 { fis[i] = guestRead8(cpu, tableAddress + UInt64(i)) }
+        guard fis[0] == 0x27 else { completeWithError(); return }
+        let command = fis[2]
+        var lba = UInt64(fis[4]) | (UInt64(fis[5]) << 8) | (UInt64(fis[6]) << 16)
+        var count = 0
+        if command == 0x25 || command == 0x35 { // LBA48
+            lba |= (UInt64(fis[8]) << 24) | (UInt64(fis[9]) << 32) | (UInt64(fis[10]) << 40)
+            count = Int(fis[12]) | (Int(fis[13]) << 8)
+            if count == 0 { count = 0x10000 }
+        } else {
+            lba |= UInt64(fis[7] & 0x0F) << 24
+            count = Int(fis[12])
+            if count == 0 { count = 256 }
+        }
+        let transferred: Int
+        switch command {
+        case 0xEC: // IDENTIFY DEVICE
+            transferred = transferToGuest(cpu, tableAddress: tableAddress, prdtl: prdtl,
+                                          data: Self.identifyData(sectorCount: disk.sectorCount))
+        case 0x25, 0xC8: // READ DMA EXT / READ DMA
+            guard lba + UInt64(count) <= UInt64(disk.sectorCount) else { completeWithError(); return }
+            let start = Int(lba) * 512
+            transferred = transferToGuest(cpu, tableAddress: tableAddress, prdtl: prdtl,
+                                          data: Array(disk.data[start..<(start + count * 512)]))
+        case 0x35, 0xCA: // WRITE DMA EXT / WRITE DMA
+            guard lba + UInt64(count) <= UInt64(disk.sectorCount) else { completeWithError(); return }
+            let data = transferFromGuest(cpu, tableAddress: tableAddress, prdtl: prdtl, length: count * 512)
+            let start = Int(lba) * 512
+            disk.data.replaceSubrange(start..<(start + data.count), with: data)
+            transferred = data.count
+        case 0xE7, 0xEA: // FLUSH CACHE (EXT)
+            transferred = 0
+        default:
+            completeWithError()
+            return
+        }
+        guestWrite32(cpu, headerAddress + 4, UInt32(transferred)) // PRDBC
+        lastCommandError = false
+        portInterruptStatus |= 0x01 // DHRS
+        globalInterruptStatus |= 0x01
+        notifyIfEnabled()
+    }
+
+    private func completeWithError() {
+        lastCommandError = true
+        portInterruptStatus |= 0x40000000 // TFES
+        globalInterruptStatus |= 0x01
+        notifyIfEnabled()
+    }
+
+    private func notifyIfEnabled() {
+        if portInterruptEnable & portInterruptStatus != 0 && ghc & 0x02 != 0 {
+            bus?.pulseInterruptLine(11)
+        }
+    }
+
+    // MARK: PRDT 転送とゲストメモリアクセス
+
+    private func transferToGuest(_ cpu: X86CPU, tableAddress: UInt64, prdtl: Int, data: [UInt8]) -> Int {
+        var written = 0
+        for entry in 0..<prdtl where written < data.count {
+            let entryAddress = tableAddress + 0x80 + UInt64(entry) * 16
+            let base = UInt64(guestRead32(cpu, entryAddress)) | (UInt64(guestRead32(cpu, entryAddress + 4)) << 32)
+            let capacity = Int(guestRead32(cpu, entryAddress + 12) & 0x3FFFFF) + 1
+            let chunk = min(capacity, data.count - written)
+            guestWriteBytes(cpu, base, Array(data[written..<(written + chunk)]))
+            written += chunk
+        }
+        return written
+    }
+
+    private func transferFromGuest(_ cpu: X86CPU, tableAddress: UInt64, prdtl: Int, length: Int) -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(length)
+        for entry in 0..<prdtl where data.count < length {
+            let entryAddress = tableAddress + 0x80 + UInt64(entry) * 16
+            let base = UInt64(guestRead32(cpu, entryAddress)) | (UInt64(guestRead32(cpu, entryAddress + 4)) << 32)
+            let capacity = Int(guestRead32(cpu, entryAddress + 12) & 0x3FFFFF) + 1
+            let chunk = min(capacity, length - data.count)
+            data += guestReadBytes(cpu, base, count: chunk)
+        }
+        return data
+    }
+
+    private func guestRead8(_ cpu: X86CPU, _ address: UInt64) -> UInt8 {
+        UInt8((try? cpu.readMemoryValue(at: Int(address & 0xFFFFFFFF), size: 1)) ?? 0)
+    }
+
+    private func guestRead32(_ cpu: X86CPU, _ address: UInt64) -> UInt32 {
+        UInt32((try? cpu.readMemoryValue(at: Int(address & 0xFFFFFFFF), size: 4)) ?? 0)
+    }
+
+    private func guestReadBytes(_ cpu: X86CPU, _ address: UInt64, count: Int) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: count)
+        var offset = 0
+        while offset < count {
+            let chunk = min(4, count - offset)
+            let value = (try? cpu.readMemoryValue(at: Int((address + UInt64(offset)) & 0xFFFFFFFF), size: chunk)) ?? 0
+            for i in 0..<chunk { bytes[offset + i] = UInt8((value >> (8 * i)) & 0xFF) }
+            offset += chunk
+        }
+        return bytes
+    }
+
+    private func guestWriteBytes(_ cpu: X86CPU, _ address: UInt64, _ bytes: [UInt8]) {
+        var offset = 0
+        while offset < bytes.count {
+            let chunk = min(4, bytes.count - offset)
+            var value: UInt64 = 0
+            for i in 0..<chunk { value |= UInt64(bytes[offset + i]) << (8 * i) }
+            try? cpu.writeMemoryValue(at: Int((address + UInt64(offset)) & 0xFFFFFFFF), size: chunk, value)
+            offset += chunk
+        }
+    }
+
+    private func guestWrite32(_ cpu: X86CPU, _ address: UInt64, _ value: UInt32) {
+        try? cpu.writeMemoryValue(at: Int(address & 0xFFFFFFFF), size: 4, UInt64(value))
+    }
+
+    // MARK: IDENTIFY DEVICE
+
+    private static func identifyData(sectorCount: Int) -> [UInt8] {
+        var words = [UInt16](repeating: 0, count: 256)
+        words[0] = 0x0040
+        words[1] = 16383 // シリンダ（旧ジオメトリ）
+        words[3] = 16    // ヘッド
+        words[6] = 63    // セクタ / トラック
+        func setString(_ range: ClosedRange<Int>, _ string: String) {
+            var chars = [UInt8](string.utf8)
+            while chars.count < (range.upperBound - range.lowerBound + 1) * 2 { chars.append(0x20) }
+            for (i, index) in range.enumerated() {
+                words[index] = (UInt16(chars[i * 2]) << 8) | UInt16(chars[i * 2 + 1])
+            }
+        }
+        setString(10...19, "RETASU00000000000001")
+        setString(23...26, "0.13")
+        setString(27...46, "retasuVM AHCI Disk")
+        words[47] = 0x8000
+        words[49] = 0x0300 // LBA + DMA 対応
+        words[53] = 0x0002
+        let total28 = min(sectorCount, 0x0FFFFFFF)
+        words[60] = UInt16(total28 & 0xFFFF)
+        words[61] = UInt16(total28 >> 16)
+        words[63] = 0x0407 // マルチワード DMA モード 2 選択
+        words[64] = 0x0003 // PIO モード 3 / 4
+        words[80] = 0x00F0 // ATA / ATAPI 4〜7
+        words[82] = 0x0040
+        words[83] = 0x4400 // LBA48 対応
+        words[85] = 0x0040
+        words[86] = 0x0400
+        words[88] = 0x203F // UDMA モード 5 選択
+        let total = UInt64(sectorCount)
+        words[100] = UInt16(total & 0xFFFF)
+        words[101] = UInt16((total >> 16) & 0xFFFF)
+        words[102] = UInt16((total >> 32) & 0xFFFF)
+        words[103] = UInt16((total >> 48) & 0xFFFF)
+        var bytes = [UInt8](repeating: 0, count: 512)
+        for i in 0..<256 {
+            bytes[i * 2] = UInt8(words[i] & 0xFF)
+            bytes[i * 2 + 1] = UInt8(words[i] >> 8)
+        }
+        bytes[510] = 0xA5
+        var sum = 0
+        for i in 0..<512 where i != 511 { sum += Int(bytes[i]) }
+        bytes[511] = UInt8((256 - (sum % 256)) % 256)
+        return bytes
     }
 }

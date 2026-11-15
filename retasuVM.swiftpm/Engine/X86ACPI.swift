@@ -14,6 +14,7 @@ enum X86ACPI {
     static let fadtAddress = 0xE1200
     static let dsdtAddress = 0xE1400
     static let madtAddress = 0xE1800
+    static let hpetAddress = 0xE1A00
 
     private static let oemID = "RETASU"
     private static let oemTableID = "RETASUVM"
@@ -23,14 +24,17 @@ enum X86ACPI {
         let dsdt = buildDSDT()
         let fadt = buildFADT(dsdtAddress: dsdtAddress)
         let madt = buildMADT()
-        let xsdt = buildSDT(signature: "XSDT", revision: 1, entries: [fadtAddress, madtAddress], entrySize: 8)
-        let rsdt = buildSDT(signature: "RSDT", revision: 1, entries: [fadtAddress, madtAddress], entrySize: 4)
+        let hpet = buildHPET()
+        let xsdt = buildSDT(signature: "XSDT", revision: 1, entries: [fadtAddress, madtAddress, hpetAddress], entrySize: 8)
+        let rsdt = buildSDT(signature: "RSDT", revision: 1, entries: [fadtAddress, madtAddress, hpetAddress], entrySize: 4)
         cpu.loadData(xsdt, at: xsdtAddress)
         cpu.loadData(rsdt, at: rsdtAddress)
         cpu.loadData(fadt, at: fadtAddress)
         cpu.loadData(dsdt, at: dsdtAddress)
         cpu.loadData(madt, at: madtAddress)
+        cpu.loadData(hpet, at: hpetAddress)
         cpu.loadData(buildRSDP(), at: rsdpAddress)
+        X86SMBIOS.install(cpu: cpu)
     }
 
     // MARK: - RSDP
@@ -117,31 +121,66 @@ enum X86ACPI {
         return bytes
     }
 
+    // MARK: - HPET
+
+    private static func buildHPET() -> [UInt8] {
+        var bytes = sdtHeader(signature: "HPET", length: 56, revision: 1)
+        bytes += [UInt8](repeating: 0, count: 56 - 36)
+        write32(&bytes, at: 36, 0x8086A201) // イベントタイマブロック ID
+        // Base Address (GAS): メモリ空間、0xFED00000
+        write64(&bytes, at: 44, 0xFED00000)
+        write16(&bytes, at: 53, 0x0080) // 最小クロックチック
+        finalizeChecksum(&bytes)
+        return bytes
+    }
+
     // MARK: - DSDT（最小 AML）
 
     private static func buildDSDT() -> [UInt8] {
-        // Scope (\_SB) { Device (PCI0) { Name (_HID, EisaId("PNP0A08"))
-        //                                Name (_CID, EisaId("PNP0A03"))
-        //                                Name (_UID, 0) } }
-        var device: [UInt8] = []
-        device += [0x5B, 0x82] // DeviceOp
-        var deviceBody: [UInt8] = [UInt8]("PCI0".utf8)
-        deviceBody += nameAML("_HID", eisaID("PNP0A08"))
-        deviceBody += nameAML("_CID", eisaID("PNP0A03"))
-        deviceBody += [0x08] + [UInt8]("_UID".utf8) + [0x0A, 0x00] // NameOp + BytePrefix 0
-        device.append(UInt8(deviceBody.count + 1)) // PkgLength（自身を含む）
-        device += deviceBody
-        var aml: [UInt8] = [0x10] // ScopeOp
-        var scopeBody: [UInt8] = [0x5C, 0x5F, 0x53, 0x42] // "\_SB"
-        scopeBody += device
-        aml.append(UInt8(scopeBody.count + 1))
-        aml += scopeBody
+        // Scope (\\_SB) { Device (PCI0) {...} Device (HPET) {...} Device (SMC_) {...} }
+        var pciBody: [UInt8] = [UInt8]("PCI0".utf8)
+        pciBody += nameAML("_HID", eisaID("PNP0A08"))
+        pciBody += nameAML("_CID", eisaID("PNP0A03"))
+        pciBody += [0x08] + [UInt8]("_UID".utf8) + [0x0A, 0x00]
+
+        var hpetBody: [UInt8] = [UInt8]("HPET".utf8)
+        hpetBody += nameAML("_HID", eisaID("PNP0103"))
+        hpetBody += [0x08] + [UInt8]("_UID".utf8) + [0x0A, 0x00]
+        // _CRS: Memory32Fixed (ReadWrite, 0xFED00000, 0x400)
+        var template: [UInt8] = [0x86, 0x09, 0x00, 0x01]
+        append32(&template, 0xFED00000)
+        append32(&template, 0x400)
+        template += [0x79, 0x00] // EndTag
+        var crs: [UInt8] = [0x08] + [UInt8]("_CRS".utf8)
+        crs += [0x11] + pkgLength(template.count + 2) + [0x0A, UInt8(template.count)] + template
+        hpetBody += crs
+
+        var smcBody: [UInt8] = [UInt8]("SMC_".utf8)
+        smcBody += nameAML("_HID", eisaID("APP0001"))
+
+        var scopeBody: [UInt8] = [0x5C, 0x5F, 0x53, 0x42] // "\\_SB"
+        scopeBody += deviceAML(pciBody)
+        scopeBody += deviceAML(hpetBody)
+        scopeBody += deviceAML(smcBody)
+        let aml: [UInt8] = [0x10] + pkgLength(scopeBody.count) + scopeBody
         var bytes = sdtHeader(signature: "DSDT", length: 36 + aml.count, revision: 2)
         bytes += aml
         finalizeChecksum(&bytes)
         return bytes
     }
 
+    private static func deviceAML(_ body: [UInt8]) -> [UInt8] {
+        [0x5B, 0x82] + pkgLength(body.count) + body // DeviceOp
+    }
+
+    /// AML の PkgLength（長さフィールド自体を含む総長をエンコードする）。
+    private static func pkgLength(_ bodyCount: Int) -> [UInt8] {
+        if bodyCount + 1 < 64 {
+            return [UInt8(bodyCount + 1)]
+        }
+        let total = bodyCount + 2
+        return [0x40 | UInt8(total & 0x0F), UInt8((total >> 4) & 0xFF)]
+    }
     private static func nameAML(_ name: String, _ value: [UInt8]) -> [UInt8] {
         [0x08] + [UInt8](name.utf8) + value
     }

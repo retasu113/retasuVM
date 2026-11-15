@@ -2437,11 +2437,11 @@ final class X86CPU {
             switch registers[0] {
             case 0:
                 registers[0] = 7
-                registers[3] = 0x61746552 // EBX: "Reta"
-                registers[2] = 0x4D567573 // EDX: "suVM"
-                registers[1] = 0x20363878 // ECX: "x86 "
+                registers[3] = 0x756E6547 // EBX: "Genu"
+                registers[2] = 0x49656E69 // EDX: "ineI"
+                registers[1] = 0x6C65746E // ECX: "ntel"
             case 1:
-                registers[0] = 0x00000611
+                registers[0] = 0x000806EA // family 6 / model 142 (Coffee Lake) / stepping 10
                 registers[3] = 0
                 registers[1] = 0x0CC82201 // ECX: SSE3 / SSSE3 / CMPXCHG16B / SSE4.1 / MOVBE / POPCNT / XSAVE / OSXSAVE
                 registers[2] = 0x07000379 // FPU / PSE / TSC / MSR / PAE / CX8 / APIC / FXSR / SSE / SSE2
@@ -2460,6 +2460,24 @@ final class X86CPU {
                 registers[3] = 0
                 registers[1] = 0x00000001 // ECX: LAHF / SAHF（64 ビット）
                 registers[2] = 0x28100000 // EDX: NX / RDTSCP / ロングモード
+            case 0x80000002, 0x80000003, 0x80000004:
+                // ブランド文字列（48 バイト、NUL パディング）
+                let brandBytes = [UInt8]("Intel(R) Core(TM) i5-8259U CPU @ 2.30GHz".utf8)
+                let leafIndex = Int(registers[0] - 0x80000002) * 16
+                func brandWord(_ offset: Int) -> UInt64 {
+                    var value: UInt64 = 0
+                    for i in 0..<4 {
+                        let index = leafIndex + offset + i
+                        if index < brandBytes.count {
+                            value |= UInt64(brandBytes[index]) << (8 * i)
+                        }
+                    }
+                    return value
+                }
+                registers[0] = brandWord(0)
+                registers[3] = brandWord(4)
+                registers[1] = brandWord(8)
+                registers[2] = brandWord(12)
             case 0x80000008:
                 registers[0] = 0x00003030 // 物理 / リニアとも 48 ビット
                 registers[3] = 0
