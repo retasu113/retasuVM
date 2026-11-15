@@ -44,8 +44,9 @@ retasuVM.swiftpm/
 │   ├── X86BIOS.swift          … x86 BIOS サービス層とブート処理（E820 含む）
 │   ├── ElTorito.swift         … El Torito ブート拡張パーサ（x86 ISO ブート）
 │   ├── Multiboot.swift        … Multiboot ブートローダ（ELF32 カーネル起動）
-│   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / RTC / キーボード / PCI / IDE / VGA モード 13h）
-│   ├── X86ACPI.swift          … ACPI テーブル生成（RSDP / XSDT / FADT / DSDT / MADT）
+│   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / HPET / RTC / キーボード / PCI / IDE / AHCI / Apple SMC / VGA モード 13h）
+│   ├── X86ACPI.swift          … ACPI テーブル生成（RSDP / XSDT / FADT / DSDT / MADT / HPET）
+│   ├── X86SMBIOS.swift        … SMBIOS テーブル生成（タイプ 0 / 1 / 2 / 3 / 4 / 17、iMac19,1 として提示）
 │   ├── X86FAT.swift           … FAT12 / 16 / 32 ファイルシステム（読み書き）
 │   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Loaded Image + LoadImage（デバイスパス対応）+ ConIn + イベント通知・グループ + ドライババインディング + GOP（3 モード）+ Block I/O + SFS + 変数 + メモリアロケータ + Secure Boot + SetVirtualAddressMap）
 │   ├── SHA256.swift           … SHA-256 実装（Secure Boot の Authenticode ハッシュ用）

@@ -2,6 +2,44 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.13.0] - 2026-11-15
+
+### 追加
+
+- macOS（XNU）の起動基盤を追加した。
+  - CPUID: ベンダ文字列を「GenuineIntel」に変更し、リーフ 1 の署名を
+    family 6 / model 142（Coffee Lake、i5-8259U 相当）にした。
+    リーフ 0x80000002〜0x80000004 のブランド文字列も返す。
+  - HPET: MMIO 0xFED00000 に 64 ビット メインカウンタ（10 MHz）と
+    タイマ 3 本を実装。IOAPIC ルーティングとレガシー置換
+    （タイマ 0 → IRQ0、タイマ 1 → IRQ8）に対応。ACPI HPET テーブルと
+    DSDT の HPET デバイス（PNP0103、_CRS 付き）も追加した。
+  - Apple SMC: I/O ポート 0x300 / 0x304 のキープロトコル
+    （読み取り / 書き込み / インデックス取得 / キー情報）を実装し、
+    OSK0 / OSK1 キー（64 バイトの文字列）、#KEY、REV、MSLD、BNum を
+    返す。DSDT に SMC デバイス（APP0001）も宣言した。
+  - AHCI (SATA): PCI デバイス 3 に AHCI 1.3 コントローラを追加
+    （BAR5 = 0xFEB00000）。コマンドリスト / レジスタ FIS / PRDT で
+    IDENTIFY DEVICE、READ / WRITE DMA (EXT)、FLUSH CACHE を実行する。
+    ディスクは IDE と共有する。
+  - SMBIOS: 2.7 形式のテーブル（タイプ 0 / 1 / 2 / 3 / 4 / 17）を
+    0xE2000 に配置し、システム情報を iMac19,1 として提示する。
+    UEFI の構成テーブルにも SMBIOS GUID で登録した。
+
+### 検証
+
+- 新規統合テスト（macOS 基盤カーネル: CPUID、ACPI の HPET テーブル探索と
+  チェックサム、HPET カウンタとタイマ割り込み、SMC の OSK キー一致、
+  SMBIOS の機種名、AHCI の IDENTIFY と読み書き往復）と全回帰テストに合格。
+- 実機（iPhone / iPad の Swift Playgrounds）での検証は未実施。
+
+### 注意
+
+- 本バージョンは macOS の「起動基盤」であり、macOS 自体はまだ起動しない。
+  Apple 純正ブートローダ (boot.efi) の互換性検証と、XNU のハードウェア
+  チェックへの対応（および利用者自身の macOS インストールイメージ）が
+  別途必要。
+
 ## [0.12.0] - 2026-11-15
 
 ### 追加
