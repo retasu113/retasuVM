@@ -47,7 +47,7 @@ retasuVM.swiftpm/
 │   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / RTC / キーボード / PCI / IDE）
 │   ├── X86ACPI.swift          … ACPI テーブル生成（RSDP / XSDT / FADT / DSDT / MADT）
 │   ├── X86FAT.swift           … FAT12 / 16 / 32 ファイルシステム（読み書き）
-│   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Loaded Image + LoadImage + GOP + Block I/O + SFS + 変数）
+│   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Loaded Image + LoadImage（デバイスパス対応）+ ConIn + イベント通知 + ドライババインディング + GOP + Block I/O + SFS + 変数）
 │   ├── X86Session.swift       … x86 実行セッション
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ
@@ -57,7 +57,7 @@ retasuVM.swiftpm/
 │   ├── VMListView.swift       … 一覧
 │   ├── VMDetailView.swift     … 詳細・操作
 │   ├── VMEditorView.swift     … 作成・編集フォーム
-│   ├── VMConsoleView.swift    … コンソール
+│   ├── VMConsoleView.swift    … コンソール / 画面表示（GOP・VGA）
 │   ├── VMStatusBadge.swift    … 状態バッジ
 │   └── SettingsView.swift     … 設定・情報
 └── Assets.xcassets/           … アイコン（プレースホルダ）・アクセントカラー

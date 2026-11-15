@@ -2,6 +2,79 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.11.0] - 2026-11-15
+
+### 追加
+
+- x86 CPU に x87 FPU を実装した。全メモリ形式（32 / 64 ビット
+  浮動小数点、16 / 32 / 64 ビット整数、80 ビット拡張精度）と
+  レジスタ形式、FCMOVcc、FUCOMI / FCOMI（EFLAGS へ反映）、
+  超越関数（FSIN / FCOS / FSINCOS / FPTAN / FPATAN /
+  FYL2X 系 / FSCALE / FXTRACT / FPREM 系 / FRNDINT）、
+  FNSTSW / FNINIT / FNCLEX、FLDENV / FNSTENV（制御 /
+  状態ワード）に対応。制御ワードの丸め制御を FIST に反映し、
+  CR0.EM のときは #NM を出す。
+- x86 CPU に SSE / SSE2 サブセットを実装した。転送
+  （MOVAPS 系 / MOVDQA 系 / MOVD / MOVQ）、浮動小数点演算
+  （ADD / SUB / MUL / DIV / MIN / MAX / SQRT、PS / PD / SS /
+  SD）、比較、変換（CVT 系）、整数演算（PADD / PSUB 系、
+  飽和演算、PACK / PUNPCK、シフト）、シャッフル、FXSAVE /
+  FXRSTOR、LDMXCSR / STMXCSR に対応。CPUID で FXSR /
+  SSE / SSE2 を申告するようになった。
+- UEFI に ConIn（Simple Text Input プロトコル）を追加した。
+  アプリのコンソール入力がキー入力として届き、ReadKeyStroke
+  と WaitForEvent イベントで受け取れる。
+- UEFI のイベント通知関数（NotifyFunction）を実際に呼ぶ
+  ようになった。SignalEvent、タイマ期限、プロトコル
+  インストール（RegisterProtocolNotify）、ExitBootServices
+  と SetVirtualAddressMap のイベントグループで通知が配送
+  される。配送はセッションループの合間にゲストコールとして
+  実行し、終了後にレジスタとスタックを復元する。
+- UEFI の ConnectController / DisconnectController が
+  Driver Binding プロトコルを持つドライバの Supported /
+  Start / Stop を呼ぶようになった（ドライババインディング）。
+- LoadImage がデバイスパス（FilePath ノード）経由で Simple
+  File System ボリューム上のファイルから読み込めるように
+  なった。
+- アプリのコンソールに「画面」表示を追加した。UEFI の GOP
+  フレームバッファ（640×400 BGRA）と VGA テキスト画面
+  （80×25）を描画し、コンソール表示と切り替えられる。
+  250 ミリ秒間隔で更新する。
+- セッションの実行チャンクを 50,000 命令から 200,000 命令
+  へ増やした。スピン待ちするゲスト（UEFI アプリのポーリング
+  など）の実行速度が大幅に改善した。
+
+### 検証
+
+- 新規統合テスト: FPU / SSE 検証カーネル（FLD / FADDP /
+  FILD / FSQRT / FCOMPP、ADDPS / PADDD / CVTTSS2SI、
+  FXSAVE → FXRSTOR の往復）、UEFI4（ConIn の読み取りと
+  WaitForEvent、イベント通知、プロトコル通知、ドライバの
+  Supported / Start / Stop、デバイスパス経由の LoadImage、
+  ExitBootServices イベントグループ通知）。すべて合格。
+- 全回帰テスト（リング / DMA / ロングモード / デバイス /
+  Multiboot / タスクスイッチ・SWAPGS / BIOS ISO / UEFI
+  サンプル 3 種 / LFN / 変数永続化 / RISC-V / ARM /
+  Codable 寛容デコード）合格。全 36 ファイルの文法
+  チェックとエンジン + モデルの型チェック合格。
+- 実機（iPhone / iPad の Swift Playgrounds）での検証は未実施。
+
+### 既知の制限
+
+- Secure Boot、TPM、カプセル / ESRT は未提供。
+  SetVirtualAddressMap は恒等マップ前提の受理のみで、仮想
+  アドレスへの変換は行わない。一般の OS（Windows /
+  現在の Linux）はまだ起動できない。
+- 通知関数の配送はセッションループの合間（同期的ではない）
+  で、同時に 1 つずつ。WaitForEvent は最大 30 秒で打ち切る。
+- FPU の FLDENV / FNSTENV は制御 / 状態ワードのみ転送する。
+  FXSAVE は全モードで 32 ビット形式。CR0.TS による #NM
+  （遅延 FPU 切替）は未対応。SSE は SSE / SSE2 のサブセット
+  で、SSE3 以降と MMX レジスタは未実装。
+- LoadImage のデバイスパス解決は Simple File System
+  ボリューム上のファイルを対象とする。
+- アプリの画面表示はポーリング更新（250 ミリ秒間隔）。
+
 ## [0.10.0] - 2026-11-15
 
 ### 追加
