@@ -169,7 +169,7 @@ struct VMEditorView: View {
             }
             return "ゲストイメージは、起動時にエミュレータへ読み込む OS です。\(guestImage.displayName): \(guestImage.detail)"
         case .x86:
-            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。16 ビット リアルモードで動作するブートプログラムや小さな OS が対象です。試作用のサンプル ISO は GitHub Releases から入手できます。"
+            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。Multiboot 対応カーネル（ELF32 ファイル、または ISO 内の KERNEL.ELF）は 32 ビット プロテクトモードで直接起動します。試作用のサンプルは GitHub Releases から入手できます。"
         case .arm:
             return "ARMv7-A エミュレータ上で、内蔵のデモゲスト「ArmDemoOS」が動きます（fact で 12! の計算、echo、help が使えます）。"
         }

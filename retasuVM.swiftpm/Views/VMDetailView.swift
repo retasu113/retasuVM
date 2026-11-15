@@ -185,7 +185,7 @@ struct VMDetailView: View {
                     LabeledContent("ゲストイメージ", value: vm.configuration.guestImage.displayName)
                 }
             case .x86:
-                LabeledContent("起動方法", value: "BIOS（ISO / イメージ）")
+                LabeledContent("起動方法", value: "BIOS / Multiboot（ISO・イメージ・ELF）")
                 LabeledContent("イメージ", value: vm.configuration.isoDisplayName ?? "未選択")
             case .arm:
                 LabeledContent("ゲスト", value: "ArmDemoOS")
