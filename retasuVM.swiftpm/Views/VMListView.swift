@@ -7,6 +7,10 @@ import SwiftUI
 struct VMListView: View {
     @EnvironmentObject private var store: VMStore
     @Binding var selection: VirtualMachine.ID?
+    /// スプリットビューでは選択ベース、iPhone では NavigationLink ベースで
+    /// 遷移する。判定は親（ContentView）が明示的に渡す（サイドバー内の
+    /// horizontalSizeClass は親と異なる場合があるため、ここでは読まない）。
+    var usesSplitSelection: Bool = false
     @State private var showingEditor = false
     @State private var searchText = ""
 
@@ -84,14 +88,6 @@ struct VMListView: View {
             .tag(vm.id)
         }
     }
-
-    /// スプリットビューでは選択ベース、iPhone では NavigationLink ベースで遷移する。
-    private var usesSplitSelection: Bool {
-        horizontalSizeClassIsRegular
-    }
-
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClassIsRegularEnv
-    private var horizontalSizeClassIsRegular: Bool { horizontalSizeClassIsRegularEnv == .regular }
 }
 
 /// 一覧の 1 行分。名前・構成サマリ・状態バッジを表示する。

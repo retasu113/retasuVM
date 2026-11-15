@@ -49,7 +49,7 @@ struct VMDetailView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button("編集") { showingEditor = true }
-                    .disabled(vm.state == .running || store.isTransitioning(vm))
+                    .disabled(vm.state == .running || vm.state == .paused || store.isTransitioning(vm))
             }
         }
         .sheet(isPresented: $showingEditor) {

@@ -19,6 +19,9 @@ struct VMEditorView: View {
     @State private var guestImage: GuestImage
     @State private var useISO: Bool
     @State private var isoFileName: String?
+    /// この編集セッション中に取り込んだ ISO のファイル名。
+    /// キャンセルや差し替えで未使用になった場合に片付けるために保持する。
+    @State private var importedFileName: String?
     @State private var isoDisplayName: String?
     @State private var cpuCount: Int
     @State private var memoryMB: Int
@@ -141,7 +144,7 @@ struct VMEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("キャンセル") { dismiss() }
+                    Button("キャンセル") { cancelEditing() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { save() }
@@ -192,9 +195,17 @@ struct VMEditorView: View {
         case .success(let urls):
             guard let url = urls.first else { return }
             do {
-                // 古い ISO の削除は保存時に行う（キャンセル時に元の VM が
-                // 参照するファイルを消してしまわないため）
-                isoFileName = try store.importISO(from: url, architecture: architecture)
+                // 元の VM が参照する ISO の削除は保存時に行う（キャンセル時に
+                // 元の VM が参照するファイルを消してしまわないため）。
+                // ただし、このセッションで取り込んだ前回のファイルは
+                // 差し替え時点で未使用になるため、ここで片付ける。
+                let newFileName = try store.importISO(from: url, architecture: architecture)
+                if let previous = importedFileName,
+                   previous != editing?.configuration.isoFileName {
+                    store.deleteISOFile(named: previous)
+                }
+                isoFileName = newFileName
+                importedFileName = newFileName
                 isoDisplayName = url.lastPathComponent
             } catch {
                 importError = error.localizedDescription
@@ -244,6 +255,19 @@ struct VMEditorView: View {
             }
         } else {
             store.add(name: trimmedName, configuration: configuration)
+        }
+        // 取り込んだのに最終構成が参照しないファイル（アーキテクチャ変更等）は片付ける
+        if let importedFileName, importedFileName != configuration.isoFileName {
+            store.deleteISOFile(named: importedFileName)
+        }
+        dismiss()
+    }
+
+    /// キャンセル時の後片付け。取り込んだファイルが元の VM のものを
+    /// 指していない限り、未使用の取り込みファイルを削除してから閉じる。
+    private func cancelEditing() {
+        if let importedFileName, importedFileName != editing?.configuration.isoFileName {
+            store.deleteISOFile(named: importedFileName)
         }
         dismiss()
     }
