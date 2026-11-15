@@ -200,6 +200,8 @@ final class X86DeviceBus {
             return port == 0x2FD ? 0x60 : 0
         case 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7:
             return ide.readRegister(port)
+        case 0xC000...0xC00F: // バスマスタ IDE（BAR4 = 0xC000 固定）
+            return UInt8(ide.readBusMaster(offset: Int(port - 0xC000), size: 1) & 0xFF)
         case 0x3F6:
             return ide.readStatus()
         case 0x170, 0x177: // セカンダリ IDE（デバイスなし）
@@ -284,6 +286,8 @@ final class X86DeviceBus {
             cpu?.onChar?(value)
         case 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7:
             ide.writeRegister(port, value)
+        case 0xC000...0xC00F: // バスマスタ IDE（BAR4 = 0xC000 固定）
+            ide.writeBusMaster(offset: Int(port - 0xC000), value: UInt32(value), size: 1)
         case 0x3F6:
             ide.writeControl(value)
         case 0x3C0:
@@ -847,7 +851,7 @@ final class X86PCIHost {
         devices[0x00] = Self.makeDevice(vendor: 0x8086, device: 0x1237, classCode: 0x060000, revision: 0x02, headerType: 0x00)
         devices[0x08] = Self.makeDevice(vendor: 0x8086, device: 0x7000, classCode: 0x060100, revision: 0x00, headerType: 0x80)
         var ide = Self.makeDevice(vendor: 0x8086, device: 0x7010, classCode: 0x010180, revision: 0x00, headerType: 0x00)
-        // BAR4: バスマスタ IDE の I/O ベース（実装は PIO のみ）
+        // BAR4: バスマスタ IDE の I/O ベース（0xC000）
         ide[0x20] = 0x01
         ide[0x21] = 0xC0
         devices[0x09] = ide
@@ -903,8 +907,9 @@ final class X86PCIHost {
         let baseRegister = Int(configAddress & 0xFC)
         for i in 0..<size {
             let offset = baseRegister + Int(port - 0xCFC) + i
-            // ベンダ / デバイス / クラス / リビジョン（0x00〜0x0B）は読み取り専用
-            if offset >= 12, offset < 256 {
+            // ベンダ / デバイス（0x00〜0x03）とクラス / リビジョン
+            // （0x08〜0x0B）は読み取り専用。コマンド（0x04）は書き込み可。
+            if offset >= 4, !(8...11).contains(offset), offset < 256 {
                 devices[key]?[offset] = UInt8((value >> (8 * i)) & 0xFF)
             }
         }
@@ -913,7 +918,7 @@ final class X86PCIHost {
 
 // MARK: - IDE（ATA）コントローラ
 
-/// プライマリ IDE バスの ATA コントローラ（PIO 転送のみ）。
+/// プライマリ IDE バスの ATA コントローラ（PIO 転送 + バスマスタ DMA）。
 /// ディスクは BIOS と共有する `X86DiskImage` を使う。
 final class X86IDEController {
     weak var bus: X86DeviceBus?
@@ -1073,6 +1078,12 @@ final class X86IDEController {
             receiveMode = false
             dataReady = true
             raiseInterrupt()
+        case 0xC8, 0xC9: // READ DMA（ディスク → メモリ）
+            pendingDMARead = true
+            runDMAIfReady()
+        case 0xCA, 0xCB: // WRITE DMA（メモリ → ディスク）
+            pendingDMARead = false
+            runDMAIfReady()
         case 0xE7, 0xEA: // FLUSH CACHE
             raiseInterrupt()
         case 0x91, 0xEF, 0x00: // INITIALIZE / SET FEATURES / NOP
@@ -1093,6 +1104,125 @@ final class X86IDEController {
             let available = disk.data.count - start
             disk.data.replaceSubrange(start..<(start + available), with: buffer[0..<available])
         }
+        raiseInterrupt()
+    }
+
+    // MARK: バスマスタ DMA
+
+    /// バスマスタ コマンドレジスタ（bit0 = 開始、bit3 = 方向）。
+    private var busMasterCommand: UInt8 = 0
+    /// バスマスタ ステータス（bit0 = アクティブ、bit2 = 割り込み、
+    /// bit5/6 = DMA 対応チャネル）。
+    private var busMasterStatus: UInt8 = 0x60
+    /// PRDT（物理領域ディスクリプタテーブル）のアドレス。
+    private var prdtAddress: UInt32 = 0
+    /// 実行待ちの DMA 方向（true = READ DMA、false = WRITE DMA）。
+    private var pendingDMARead: Bool?
+
+    func readBusMaster(offset: Int, size: Int) -> UInt32 {
+        var value: UInt32 = 0
+        for i in 0..<size {
+            value |= UInt32(busMasterByte(at: offset + i)) << (8 * i)
+        }
+        return value
+    }
+
+    private func busMasterByte(at offset: Int) -> UInt8 {
+        switch offset {
+        case 0: return busMasterCommand
+        case 2: return busMasterStatus
+        case 4...7: return UInt8((prdtAddress >> UInt32(8 * (offset - 4))) & 0xFF)
+        default: return 0
+        }
+    }
+
+    func writeBusMaster(offset: Int, value: UInt32, size: Int) {
+        for i in 0..<size {
+            writeBusMasterByte(at: offset + i, byte: UInt8((value >> (8 * i)) & 0xFF))
+        }
+    }
+
+    private func writeBusMasterByte(at offset: Int, byte: UInt8) {
+        switch offset {
+        case 0:
+            busMasterCommand = byte & 0x09
+            if byte & 0x01 != 0 { runDMAIfReady() }
+        case 2:
+            // 割り込みビットは write-1-to-clear
+            if byte & 0x04 != 0 { busMasterStatus &= ~0x04 }
+        case 4...7:
+            let shift = UInt32(8 * (offset - 4))
+            prdtAddress = (prdtAddress & ~(0xFF << shift)) | (UInt32(byte) << shift)
+        default:
+            break
+        }
+    }
+
+    private func guestReadBytes(_ address: Int, count: Int) -> [UInt8] {
+        guard let cpu = bus?.cpu else { return [UInt8](repeating: 0, count: count) }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(count)
+        var offset = 0
+        while offset < count {
+            let chunk = min(4, count - offset)
+            let value = (try? cpu.readMemoryValue(at: address + offset, size: chunk)) ?? 0
+            for i in 0..<chunk { bytes.append(UInt8((value >> (8 * i)) & 0xFF)) }
+            offset += chunk
+        }
+        return bytes
+    }
+
+    private func guestWriteBytes(_ address: Int, bytes: [UInt8]) {
+        guard let cpu = bus?.cpu else { return }
+        var offset = 0
+        while offset < bytes.count {
+            let chunk = min(4, bytes.count - offset)
+            var value: UInt64 = 0
+            for i in 0..<chunk { value |= UInt64(bytes[offset + i]) << (8 * i) }
+            try? cpu.writeMemoryValue(at: address + offset, size: chunk, value)
+            offset += chunk
+        }
+    }
+
+    /// DMA コマンドが発行済みで開始ビットが立っていれば転送を実行する。
+    /// 転送は同期的に完了し、IRQ14 と ステータスの割り込みビットで通知する。
+    private func runDMAIfReady() {
+        guard busMasterCommand & 0x01 != 0, let isRead = pendingDMARead,
+              let disk, bus?.cpu != nil else { return }
+        pendingDMARead = nil
+        busMasterStatus |= 0x01 // アクティブ
+        var remaining = transferCount * 512
+        var diskOffset = currentLBA * 512
+        var entryAddress = Int(prdtAddress)
+        var entries = 0
+        while remaining > 0, entries < 1024 {
+            entries += 1
+            guard let cpu = bus?.cpu,
+                  let base = try? cpu.readMemoryValue(at: entryAddress, size: 4),
+                  let info = try? cpu.readMemoryValue(at: entryAddress + 4, size: 4) else { break }
+            var count = Int(info & 0xFFFF)
+            if count == 0 { count = 0x10000 }
+            let transfer = min(count, remaining)
+            if isRead {
+                var bytes = [UInt8](repeating: 0, count: transfer)
+                if diskOffset < disk.data.count {
+                    let available = min(transfer, disk.data.count - diskOffset)
+                    bytes.replaceSubrange(0..<available, with: disk.data[diskOffset..<(diskOffset + available)])
+                }
+                guestWriteBytes(Int(base), bytes: bytes)
+            } else {
+                let bytes = guestReadBytes(Int(base), count: transfer)
+                if diskOffset < disk.data.count {
+                    let available = min(transfer, disk.data.count - diskOffset)
+                    disk.data.replaceSubrange(diskOffset..<(diskOffset + available), with: bytes[0..<available])
+                }
+            }
+            diskOffset += transfer
+            remaining -= transfer
+            if info & 0x80000000 != 0 { break } // EOT
+            entryAddress += 8
+        }
+        busMasterStatus = (busMasterStatus & ~0x01) | 0x04 // 完了 + 割り込み
         raiseInterrupt()
     }
 
@@ -1120,7 +1250,7 @@ final class X86IDEController {
         text(23, "1.0", 4)            // ファームウェア
         text(27, "retasuVM ATA Disk", 20) // モデル
         word(47, 0x8000)
-        word(49, 0x0200) // LBA サポート
+        word(49, 0x0300) // LBA + DMA サポート
         word(60, UInt16(totalSectors & 0xFFFF))
         word(61, UInt16((totalSectors >> 16) & 0xFFFF))
         return block
