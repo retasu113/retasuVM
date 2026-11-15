@@ -69,6 +69,9 @@ final class VMStore: ObservableObject {
     func delete(_ vm: VirtualMachine) {
         sessions[vm.id]?.terminate()
         sessions[vm.id] = nil
+        if let isoFileName = vm.configuration.isoFileName {
+            deleteISOFile(named: isoFileName)
+        }
         machines.removeAll { $0.id == vm.id }
         consoleLogs[vm.id] = nil
         consoleText[vm.id] = nil
@@ -108,22 +111,100 @@ final class VMStore: ObservableObject {
             }
         }
 
-        do {
-            try session.boot(guestImage: vm.configuration.guestImage)
-        } catch {
-            machines[index].state = .error
-            machines[index].errorMessage = error.localizedDescription
-            appendLog(for: vm.id, lines: ["[retasuVM] 起動に失敗しました: \(error.localizedDescription)"])
-            save()
-            return
+        let bootDescription: String
+        if vm.configuration.useISO {
+            // ISO ブート: ISO 9660 を解析し、ルート直下の BOOT.BIN を起動する
+            guard let isoData = loadISOData(for: vm) else {
+                failStart(index: index, vm: vm, message: "ISO ファイルが見つかりません")
+                return
+            }
+            let image: ISO9660Image
+            do {
+                image = try ISO9660Image(data: isoData)
+            } catch {
+                failStart(index: index, vm: vm, message: error.localizedDescription)
+                return
+            }
+            guard let bootBinary = image.file(named: "BOOT.BIN") else {
+                failStart(index: index, vm: vm, message: "ISO 内に BOOT.BIN がありません（retasuVM 形式の ISO が必要です）")
+                return
+            }
+            guard bootBinary.count <= 1 << 20 else {
+                failStart(index: index, vm: vm, message: "BOOT.BIN がゲストメモリ（1 MiB）より大きいため起動できません")
+                return
+            }
+            session.boot(program: bootBinary, entry: 0, diskImage: isoData)
+            bootDescription = "ISO「\(image.volumeLabel.isEmpty ? (vm.configuration.isoDisplayName ?? "名称なし") : image.volumeLabel)」"
+        } else {
+            do {
+                try session.boot(guestImage: vm.configuration.guestImage)
+            } catch {
+                failStart(index: index, vm: vm, message: error.localizedDescription)
+                return
+            }
+            bootDescription = vm.configuration.guestImage.displayName
         }
 
         sessions[vm.id] = session
         machines[index].state = .running
         machines[index].errorMessage = nil
         machines[index].lastStartedAt = Date()
-        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を起動しました（\(vm.configuration.guestImage.displayName) ブート）"])
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を起動しました（\(bootDescription) ブート）"])
         save()
+    }
+
+    private func failStart(index: Int, vm: VirtualMachine, message: String) {
+        machines[index].state = .error
+        machines[index].errorMessage = message
+        consoleText[vm.id, default: ""] += "\n[retasuVM] 起動に失敗しました: \(message)\n"
+        appendLog(for: vm.id, lines: ["[retasuVM] 起動に失敗しました: \(message)"])
+        save()
+    }
+
+    // MARK: - ISO ファイルの管理
+
+    /// ISO の保存先ディレクトリ（ドキュメント/ISOs）。
+    private var isoDirectory: URL? {
+        guard let fileURL else { return nil }
+        let directory = fileURL.deletingLastPathComponent().appendingPathComponent("ISOs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    /// 選択された ISO をアプリ内へコピーし、検証して保存名を返す。
+    /// retasuVM 形式（ISO 9660 でルート直下に BOOT.BIN がある）でなければエラーを投げる。
+    func importISO(from url: URL) throws -> String {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessing { url.stopAccessingSecurityScopedResource() }
+        }
+        let data = try Data(contentsOf: url)
+        let image = try ISO9660Image(data: [UInt8](data))
+        guard image.file(named: "BOOT.BIN") != nil else {
+            throw ISO9660Error.missingBootBinary
+        }
+        guard let directory = isoDirectory else {
+            throw ISO9660Error.storageUnavailable
+        }
+        let storedName = UUID().uuidString + ".iso"
+        try data.write(to: directory.appendingPathComponent(storedName), options: [.atomic])
+        return storedName
+    }
+
+    /// 保存済み ISO のデータを読み込む。
+    func loadISOData(for vm: VirtualMachine) -> [UInt8]? {
+        guard let fileName = vm.configuration.isoFileName,
+              let directory = isoDirectory else { return nil }
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(fileName)) else {
+            return nil
+        }
+        return [UInt8](data)
+    }
+
+    /// 保存済み ISO を削除する（VM の削除時や差し替え時）。
+    func deleteISOFile(named fileName: String) {
+        guard let directory = isoDirectory else { return }
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(fileName))
     }
 
     /// 停止: セッションを終了する（電源断）。

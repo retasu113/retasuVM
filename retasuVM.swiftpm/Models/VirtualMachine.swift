@@ -67,6 +67,12 @@ struct VMConfiguration: Equatable {
     var guestOS: GuestOS = .linux
     /// 起動するゲスト OS イメージ（実際にエミュレータで動くもの）
     var guestImage: GuestImage = .retasuOS
+    /// ISO ファイルから起動するか（true の場合は guestImage より優先）
+    var useISO: Bool = false
+    /// アプリ内にコピーした ISO の保存名（useISO のときのみ）
+    var isoFileName: String? = nil
+    /// 選択した ISO の元のファイル名（表示用）
+    var isoDisplayName: String? = nil
     var networkEnabled: Bool = true
     var sharedFolderEnabled: Bool = false
 
@@ -85,10 +91,12 @@ struct VMConfiguration: Equatable {
 
 extension VMConfiguration: Codable {
     private enum CodingKeys: String, CodingKey {
-        case cpuCount, memoryMB, diskGB, guestOS, guestImage, networkEnabled, sharedFolderEnabled
+        case cpuCount, memoryMB, diskGB, guestOS, guestImage
+        case useISO, isoFileName, isoDisplayName
+        case networkEnabled, sharedFolderEnabled
     }
 
-    /// 旧バージョンの保存データ（guestImage キーが無い）も読み込めるよう、
+    /// 旧バージョンの保存データ（新しいキーが無い）も読み込めるよう、
     /// 各キーを任意としてデコードする。
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -97,6 +105,9 @@ extension VMConfiguration: Codable {
         diskGB = try container.decodeIfPresent(Int.self, forKey: .diskGB) ?? 32
         guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
         guestImage = try container.decodeIfPresent(GuestImage.self, forKey: .guestImage) ?? .retasuOS
+        useISO = try container.decodeIfPresent(Bool.self, forKey: .useISO) ?? false
+        isoFileName = try container.decodeIfPresent(String.self, forKey: .isoFileName)
+        isoDisplayName = try container.decodeIfPresent(String.self, forKey: .isoDisplayName)
         networkEnabled = try container.decodeIfPresent(Bool.self, forKey: .networkEnabled) ?? true
         sharedFolderEnabled = try container.decodeIfPresent(Bool.self, forKey: .sharedFolderEnabled) ?? false
     }
@@ -108,6 +119,9 @@ extension VMConfiguration: Codable {
         try container.encode(diskGB, forKey: .diskGB)
         try container.encode(guestOS, forKey: .guestOS)
         try container.encode(guestImage, forKey: .guestImage)
+        try container.encode(useISO, forKey: .useISO)
+        try container.encodeIfPresent(isoFileName, forKey: .isoFileName)
+        try container.encodeIfPresent(isoDisplayName, forKey: .isoDisplayName)
         try container.encode(networkEnabled, forKey: .networkEnabled)
         try container.encode(sharedFolderEnabled, forKey: .sharedFolderEnabled)
     }
