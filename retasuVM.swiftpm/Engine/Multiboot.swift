@@ -50,7 +50,7 @@ enum Multiboot {
 
     /// ファイル先頭 8 KiB から Multiboot ヘッダ（マジック + チェックサム）を探す。
     private static func findHeader(in data: [UInt8]) -> (offset: Int, flags: UInt32)? {
-        let limit = min(data.count - 12, 8192)
+        let limit = min(data.count - 12, 8192 - 12) // ヘッダは先頭 8 KiB 以内に完全に収まること
         guard limit >= 0 else { return nil }
         var offset = 0
         while offset <= limit {
@@ -82,9 +82,9 @@ enum Multiboot {
             let loadEndAddress = read32(imageData, header.offset + 20)
             let bssEndAddress = read32(imageData, header.offset + 24)
             entry = read32(imageData, header.offset + 28)
-            let fileStart = header.offset - Int(headerAddress - loadAddress)
+            let fileStart = header.offset - (Int(headerAddress) - Int(loadAddress))
             let loadLength = loadEndAddress == 0 ? imageData.count - fileStart : Int(loadEndAddress - loadAddress)
-            guard fileStart >= 0, loadLength >= 0, fileStart + loadLength <= imageData.count,
+            guard headerAddress >= loadAddress, fileStart >= 0, loadLength >= 0, fileStart + loadLength <= imageData.count,
                   Int(loadAddress) + loadLength <= memorySize else {
                 throw MultibootError.unsupportedImage
             }

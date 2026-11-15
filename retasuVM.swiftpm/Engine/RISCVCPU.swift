@@ -54,6 +54,9 @@ final class RISCVCPU {
     private(set) var waitingForInput = false
 
     private var inputQueue: [UInt8] = []
+    /// 入力キューと入力待ちフラグを UI スレッドと実行スレッドの両方から
+    /// 触るため、ロックで保護する。
+    private let inputLock = NSLock()
 
     /// 装着中のディスクイメージ（ISO ファイルの中身）。セクタサイズは 2048。
     private(set) var diskData: [UInt8]?
@@ -100,14 +103,20 @@ final class RISCVCPU {
     }
 
     func provideInput(_ bytes: [UInt8]) {
+        inputLock.lock()
         inputQueue += bytes
         if !bytes.isEmpty {
             // 入力が届いたら入力待ちを解除する（run() が再開できるように）
             waitingForInput = false
         }
+        inputLock.unlock()
     }
 
-    var pendingInputCount: Int { inputQueue.count }
+    var pendingInputCount: Int {
+        inputLock.lock()
+        defer { inputLock.unlock() }
+        return inputQueue.count
+    }
 
     // MARK: - 実行
 
@@ -318,12 +327,16 @@ final class RISCVCPU {
             }
             return true
         case 4: // getchar
+            inputLock.lock()
             guard !inputQueue.isEmpty else {
                 waitingForInput = true
+                inputLock.unlock()
                 return false
             }
             waitingForInput = false
-            setReg(10, UInt32(inputQueue.removeFirst()))
+            let byte = inputQueue.removeFirst()
+            inputLock.unlock()
+            setReg(10, UInt32(byte))
             return true
         case 5: // clear console
             onClear?()

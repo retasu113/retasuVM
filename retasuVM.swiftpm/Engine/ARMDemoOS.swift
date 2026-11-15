@@ -131,8 +131,11 @@ enum ARMDemoOS {
             beq rl_backspace
             cmp r0, #127
             beq rl_backspace
+            cmp r5, #127
+            bge rl_echo_only
             strb r0, [r4, r5]
             add r5, r5, #1
+    rl_echo_only:
             svc #1
             b rl_loop
     rl_backspace:

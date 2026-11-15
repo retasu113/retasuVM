@@ -10,8 +10,10 @@ struct AssembledProgram {
     let symbols: [String: UInt32]
 }
 
-enum AssemblerError: Error, CustomStringConvertible {
+enum AssemblerError: Error, CustomStringConvertible, LocalizedError {
     case syntax(line: Int, message: String)
+
+    var errorDescription: String? { description }
 
     var description: String {
         switch self {
@@ -380,9 +382,28 @@ struct RISCVAssembler {
             return value
         }
         func imm(_ text: String, bits: Int) throws -> Int64 {
-            if let value = parseNumber(text) { return value }
-            if let symbol = symbols[text] { return Int64(symbol) }
-            throw err("即値またはシンボルが不正です: \(text)")
+            let value: Int64
+            if let parsed = parseNumber(text) { value = parsed }
+            else if let symbol = symbols[text] { value = Int64(symbol) }
+            else { throw err("即値またはシンボルが不正です: \(text)") }
+            // フィールド幅に収まらない即値は黙って切り捨てずエラーにする
+            switch bits {
+            case 12:
+                guard (-2048...2047).contains(value) else {
+                    throw err("即値が 12 ビット符号付きの範囲外です: \(text)")
+                }
+            case 20:
+                guard (-524288...1048575).contains(value) else {
+                    throw err("即値が 20 ビットの範囲外です: \(text)")
+                }
+            case 5:
+                guard (0...31).contains(value) else {
+                    throw err("シフト量が範囲外です: \(text)")
+                }
+            default:
+                break
+            }
+            return value
         }
         func target(_ text: String) throws -> Int64 {
             if let value = parseNumber(text) { return value }
@@ -620,7 +641,8 @@ struct RISCVAssembler {
     // MARK: - オペランド解析ユーティリティ
 
     private func splitStatement(_ statement: String) -> (String, [String]) {
-        let parts = statement.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        let parts = statement.replacingOccurrences(of: "\t", with: " ")
+            .split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
         let mnemonic = (parts.first.map(String.init) ?? "").lowercased()
         guard parts.count == 2 else { return (mnemonic, []) }
         return (mnemonic, splitOperands(String(parts[1])))

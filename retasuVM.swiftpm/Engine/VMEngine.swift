@@ -58,6 +58,12 @@ final class EmulatorSession: GuestSession {
     }
 
     private func start(program: [UInt8], entry: UInt32, diskImage: [UInt8]?) {
+        // 二重に起動された場合は前の実行を止めてから始める
+        runTask?.cancel()
+        flagLock.lock()
+        terminatedFlag = false
+        pausedFlag = false
+        flagLock.unlock()
         if let diskImage {
             cpu.attachDisk(diskImage)
         }

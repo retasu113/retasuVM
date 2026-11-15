@@ -40,6 +40,8 @@ final class X86BIOS {
     private var sectorsPerTrack = 63
     private(set) var bootDrive: UInt8 = 0x80
     private let startTime = Date()
+    /// INT 1Ah の日付変更フラグ用: 最後に報告した日番号。
+    private var lastTickDay: UInt64 = 0
 
     init(cpu: X86CPU) {
         self.cpu = cpu
@@ -212,9 +214,15 @@ final class X86BIOS {
             transfer(lba: Int(lbaLow), count: Int(countValue), buffer: buffer, isWrite: ah == 0x43)
         case 0x48: // 拡張パラメータ取得
             let packet = cpu.physicalAddress(segment: cpu.segment(3), offset: UInt32(cpu.register16(6)))
+            let bufferSize = (try? cpu.readMemory(at: packet, size: 2)) ?? 0
+            guard bufferSize >= 0x1A else {
+                setDiskResult(success: false, status: 0x01)
+                return .handled
+            }
             let total = diskData.count / diskSectorSize
             let cylinders = max(1, total / (heads * sectorsPerTrack))
             try? cpu.writeMemory(at: packet, size: 2, 0x001A)
+            try? cpu.writeMemory(at: packet + 2, size: 2, 0) // 情報フラグ
             try? cpu.writeMemory(at: packet + 4, size: 4, UInt32(cylinders))
             try? cpu.writeMemory(at: packet + 8, size: 4, UInt32(heads))
             try? cpu.writeMemory(at: packet + 12, size: 4, UInt32(sectorsPerTrack))
@@ -321,11 +329,14 @@ final class X86BIOS {
         let ah = cpu.register8(4)
         let now = Date()
         switch ah {
-        case 0x00: // ティック数（18.2 Hz 相当）
-            let ticks = UInt32(now.timeIntervalSince(startTime) * 18.206) & 0xFFFFF
+        case 0x00: // ティック数（18.2 Hz 相当、1 日 = 0x1800B0 で巻き戻る）
+            let totalTicks = UInt64(now.timeIntervalSince(startTime) * 18.206)
+            let ticks = UInt32(totalTicks % 0x1800B0)
             cpu.setRegister16(1, UInt16(ticks >> 16))
             cpu.setRegister16(2, UInt16(ticks & 0xFFFF))
-            cpu.setRegister8(0, 0)
+            let day = totalTicks / 0x1800B0
+            cpu.setRegister8(0, day > lastTickDay ? 1 : 0) // 日付変更フラグ
+            if day > lastTickDay { lastTickDay = day }
         case 0x02: // 時刻（BCD）
             let components = Calendar.current.dateComponents([.hour, .minute, .second], from: now)
             cpu.setRegister8(5, Self.bcd(components.hour ?? 0))

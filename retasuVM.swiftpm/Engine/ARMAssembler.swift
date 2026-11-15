@@ -102,7 +102,7 @@ struct ARMAssembler {
         }
         for (poolIndex, expression) in literalPool.enumerated() {
             let value = try evaluate(expression, lineNumber: 0)
-            writeWord(UInt32(bitPattern: Int32(value)), at: Int(poolAddress) + poolIndex * 4, into: &bytes)
+            writeWord(UInt32(truncatingIfNeeded: value), at: Int(poolAddress) + poolIndex * 4, into: &bytes)
         }
         return Program(bytes: bytes, entry: 0)
     }
@@ -425,7 +425,7 @@ struct ARMAssembler {
         if first.hasPrefix("#") {
             let value = try evaluate(String(first.dropFirst()), lineNumber: lineNumber)
             guard value >= 0, let encoded = encodeRotatedImmediate(UInt32(value)) else {
-                throw ARMAssemblerError.unencodableImmediate(line: lineNumber, value: UInt32(bitPattern: Int32(value)))
+                throw ARMAssemblerError.unencodableImmediate(line: lineNumber, value: UInt32(truncatingIfNeeded: value))
             }
             return (1 << 25) | (encoded.rotation << 8) | encoded.imm8
         }
@@ -444,14 +444,21 @@ struct ARMAssembler {
             case "ror": shiftType = 3
             default: throw ARMAssemblerError.syntax(line: lineNumber, message: "シフト種別 '\(shiftParts[0])' が不正です")
             }
-            word |= shiftType << 5
             if shiftParts[1].hasPrefix("#") {
                 let amount = try evaluate(String(shiftParts[1].dropFirst()), lineNumber: lineNumber)
                 guard (0...32).contains(amount) else {
                     throw ARMAssemblerError.outOfRange(line: lineNumber, message: "シフト量が範囲外です")
                 }
-                word |= UInt32(amount == 32 ? 0 : amount) << 7
+                if amount == 32 && shiftType == 0 {
+                    throw ARMAssemblerError.outOfRange(line: lineNumber, message: "lsl のシフト量は 0〜31 です")
+                }
+                if amount == 32 && shiftType == 3 {
+                    // ror #32 は回転なしと等価（シフト指定を付けない）
+                } else {
+                    word |= (shiftType << 5) | (UInt32(amount == 32 ? 0 : amount) << 7)
+                }
             } else {
+                word |= shiftType << 5
                 let rs = try parseRegister(shiftParts[1], lineNumber: lineNumber)
                 word |= (UInt32(rs) << 8) | (1 << 4)
             }
@@ -536,10 +543,12 @@ struct ARMAssembler {
             }
             let poolEntryAddress = Int64(poolAddress) + Int64(poolIndex) * 4
             let offset = poolEntryAddress - (Int64(address) + 8)
-            guard (0...4095).contains(offset) else {
+            guard (-4095...4095).contains(offset) else {
                 throw ARMAssemblerError.outOfRange(line: lineNumber, message: "リテラルプールが遠すぎます")
             }
-            return cond | 0x059F0000 | (UInt32(rd) << 12) | UInt32(offset)
+            var word = cond | 0x059F0000 | isByte | (UInt32(rd) << 12) | UInt32(abs(offset))
+            if offset < 0 { word &= ~(1 << 23) } // U ビットを落として減算形式にする
+            return word
         }
 
         // ラベル直接参照（PC 相対）
@@ -684,7 +693,7 @@ struct ARMAssembler {
             }
         case ".word":
             for token in splitOperands(argument) {
-                writeWord(UInt32(bitPattern: Int32(try evaluate(token, lineNumber: lineNumber))), at: cursor, into: &bytes)
+                writeWord(UInt32(truncatingIfNeeded: try evaluate(token, lineNumber: lineNumber)), at: cursor, into: &bytes)
                 cursor += 4
             }
         case ".space":

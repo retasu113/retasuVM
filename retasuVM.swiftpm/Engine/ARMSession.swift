@@ -31,6 +31,12 @@ final class ARMSession: GuestSession {
 
     /// アセンブリソースからゲストを組み立てて実行を開始する。
     func boot(source: String) throws {
+        // 二重に起動された場合は前の実行を止めてから始める
+        runTask?.cancel()
+        stateLock.lock()
+        terminatedFlag = false
+        pausedFlag = false
+        stateLock.unlock()
         var assembler = ARMAssembler()
         let program = try assembler.assemble(source)
         cpu.setRandomSeed(UInt32(Date().timeIntervalSince1970) &* 2654435761 | 1)
@@ -50,16 +56,18 @@ final class ARMSession: GuestSession {
                 try cpu.run(maxInstructions: 50_000)
             } catch {
                 flushOutput()
-                onFault?((error as? ARMFault)?.description ?? error.localizedDescription)
+                if !isTerminated { onFault?((error as? ARMFault)?.description ?? error.localizedDescription) }
                 return
             }
             if cpu.halted {
                 flushOutput()
-                onHalt?(cpu.exitCode)
+                if !isTerminated { onHalt?(cpu.exitCode) }
                 return
             }
             if cpu.waitingForInput {
                 try? await Task.sleep(nanoseconds: 20_000_000)
+            } else {
+                await Task.yield()
             }
         }
     }

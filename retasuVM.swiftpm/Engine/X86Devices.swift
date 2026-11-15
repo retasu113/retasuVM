@@ -207,7 +207,7 @@ final class X86DeviceBus {
         case 0x170, 0x177: // セカンダリ IDE（デバイスなし）
             return 0
         case 0x3C1:
-            return vgaAttribute[vgaAttributeIndex]
+            return vgaAttribute[vgaAttributeIndex % vgaAttribute.count]
         case 0x3C4:
             return vgaSequencerIndex
         case 0x3C5:
@@ -294,7 +294,7 @@ final class X86DeviceBus {
             if !vgaAttributeFlipFlop {
                 vgaAttributeIndex = Int(value & 0x1F)
             } else {
-                vgaAttribute[vgaAttributeIndex] = value
+                vgaAttribute[vgaAttributeIndex % vgaAttribute.count] = value
             }
             vgaAttributeFlipFlop.toggle()
         case 0x3C2:
@@ -614,7 +614,8 @@ final class X86PIT {
                 return
             }
             channels[index].accessMode = access
-            channels[index].mode = Int((value >> 1) & 0x07)
+            let rawMode = Int((value >> 1) & 0x07)
+            channels[index].mode = rawMode == 6 ? 2 : rawMode == 7 ? 3 : rawMode // モード 6 / 7 は 2 / 3 の別名
             channels[index].writeHighNext = false
             return
         }
@@ -899,8 +900,15 @@ final class X86PCIHost {
     }
 
     func writePort(_ port: UInt16, value: UInt32, size: Int) {
-        if port == 0xCF8 {
-            configAddress = value
+        if (0xCF8...0xCFB).contains(port) {
+            // バイトレーン単位でマージする（部分書き込み対応）
+            var merged = configAddress
+            let lane = Int(port - 0xCF8)
+            for i in 0..<size where lane + i < 4 {
+                let shift = 8 * (lane + i)
+                merged = (merged & ~(0xFF << shift)) | (((value >> (8 * i)) & 0xFF) << shift)
+            }
+            configAddress = merged
             return
         }
         guard port >= 0xCFC, let key = selectedDevice() else { return }
@@ -1056,6 +1064,7 @@ final class X86IDEController {
         }
         switch command {
         case 0x20, 0x21: // READ SECTORS
+            guard currentLBA + transferCount <= disk.sectorCount else { fail(); return }
             let start = currentLBA * 512
             let length = transferCount * 512
             buffer = [UInt8](repeating: 0, count: length)
@@ -1068,6 +1077,7 @@ final class X86IDEController {
             dataReady = true
             raiseInterrupt()
         case 0x30, 0x31: // WRITE SECTORS
+            guard currentLBA + transferCount <= disk.sectorCount else { fail(); return }
             buffer = [UInt8](repeating: 0, count: transferCount * 512)
             bufferIndex = 0
             receiveMode = true
@@ -1190,6 +1200,11 @@ final class X86IDEController {
         guard busMasterCommand & 0x01 != 0, let isRead = pendingDMARead,
               let disk, bus?.cpu != nil else { return }
         pendingDMARead = nil
+        if currentLBA + transferCount > disk.sectorCount {
+            busMasterStatus |= 0x02 // エラービット
+            fail()
+            return
+        }
         busMasterStatus |= 0x01 // アクティブ
         var remaining = transferCount * 512
         var diskOffset = currentLBA * 512

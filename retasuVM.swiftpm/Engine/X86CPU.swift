@@ -37,9 +37,10 @@ enum X86Fault: Error, CustomStringConvertible, LocalizedError {
 /// サービス（`X86BIOS`）へ委譲し、プロテクトモードでは IDT のゲートを
 /// 使う。シリアルポート（COM1: 0x3F8）はコンソールへ接続されている。
 ///
-/// 対象外: タスクスイッチ（TSS 切り替え）、ユーザーモード
-/// （特権レベルはリング 0 のみ）、SYSCALL / SYSRET、浮動小数点演算。
-/// これらに当たると `X86Fault` で停止する。
+/// 特権レベルはリング 0〜3 に対応し、TSS によるスタック切り替え、
+/// SYSCALL / SYSRET、ハードウェアタスクスイッチ（32 ビット TSS）も
+/// 実装している。対象外は浮動小数点演算で、それに当たると
+/// `X86Fault` で停止する。
 final class X86CPU {
     /// レジスタ番号（x86 エンコーディング順）: 0=EAX 1=ECX 2=EDX 3=EBX 4=ESP 5=EBP 6=ESI 7=EDI
     private(set) var registers: [UInt64] = [UInt64](repeating: 0, count: 16)
@@ -100,6 +101,8 @@ final class X86CPU {
         var permitsWrite = true
         /// ディスクリプタ特権レベル（DPL）。
         var dpl: Int = 0
+        /// 適合型コードセグメントかどうか。
+        var conforming = false
     }
 
     /// コントロールレジスタ（CR0 / CR2 / CR3 / CR4 を使用）。
@@ -159,6 +162,122 @@ final class X86CPU {
             return try? readMemoryValue(at: Int(tssBase + 4), size: 8)
         }
         return try? readMemoryValue(at: Int(tssBase + 4), size: 4)
+    }
+
+    /// far 転送先セレクタがタスクゲート / TSS ディスクリプタなら、
+    /// 切り替え先の TSS セレクタを返す（通常セグメントなら nil）。
+    private func taskGateOrTSS(selector: UInt16) throws -> UInt16? {
+        guard protectedMode, selector & 0xFFF8 != 0 else { return nil }
+        let tableBase = selector & 0x0004 != 0 ? ldtrCache.base : gdtrBase
+        let address = Int(tableBase + UInt64(selector & 0xFFF8))
+        let access = try readMemoryValue(at: address + 5, size: 1)
+        guard access & 0x10 == 0 else { return nil } // システムセグメントのみ
+        switch access & 0xF {
+        case 0x5: // タスクゲート
+            guard access & 0x80 != 0 else {
+                throw CPUTrap.exception(vector: 11, errorCode: UInt32(selector & 0xFFFC))
+            }
+            return UInt16(try readMemoryValue(at: address + 2, size: 2) & 0xFFFF)
+        case 0x9, 0xB, 0x1, 0x3: // TSS（32 ビット / 16 ビット、空き / ビジー）
+            return selector
+        default:
+            return nil
+        }
+    }
+
+    private enum TaskSwitchKind {
+        case jump       // JMP: 旧タスクのビジーを解除する
+        case nested     // CALL / 割り込み: 旧タスクはビジーのまま、NT とバックリンクを設定
+        case iretReturn // NT つき IRET: 旧タスクのビジーを解除する
+    }
+
+    /// ハードウェアタスクスイッチ（32 ビット TSS、レガシーモード専用）。
+    /// 現在の状態を現在の TSS へ保存し、新しい TSS から状態を読み込む。
+    private func switchTask(toTSSSelector selector: UInt16, kind: TaskSwitchKind, returnIP: UInt64) throws {
+        guard !longModeActive else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+        guard selector & 0xFFF8 != 0 else { throw CPUTrap.exception(vector: 10, errorCode: 0) }
+        let tableBase = selector & 0x0004 != 0 ? ldtrCache.base : gdtrBase
+        let descriptorAddress = Int(tableBase + UInt64(selector & 0xFFF8))
+        let access = try readMemoryValue(at: descriptorAddress + 5, size: 1)
+        let descriptorType = access & 0xF
+        guard access & 0x10 == 0, descriptorType == 0x9 else {
+            // ビジー（0xB）や 16 ビット TSS（0x1 / 0x3）への切り替えは不可
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        guard access & 0x80 != 0 else {
+            throw CPUTrap.exception(vector: 11, errorCode: UInt32(selector & 0xFFFC))
+        }
+        let newCache = try descriptorCache(selector: selector)
+        guard newCache.limit >= 103 else {
+            throw CPUTrap.exception(vector: 10, errorCode: UInt32(selector & 0xFFFC))
+        }
+        let newBase = newCache.base
+        // 新タスクの EFLAGS を先に読み、VM86 タスクは弾く
+        let loadedFlags = try readMemoryValue(at: Int(newBase) + 36, size: 4)
+        guard loadedFlags & 0x20000 == 0 else {
+            throw CPUTrap.exception(vector: 13, errorCode: 0)
+        }
+        // 現在の状態を現在の TSS へ保存する
+        if tssPresent && taskRegister & 0xFFF8 != 0 {
+            let old = Int(tssBase)
+            try writeMemoryValue(at: old + 28, size: 4, controlRegisters[3])
+            try writeMemoryValue(at: old + 32, size: 4, returnIP)
+            try writeMemoryValue(at: old + 36, size: 4, UInt64(flags))
+            for (index, offset) in [40, 44, 48, 52, 56, 60, 64, 68].enumerated() {
+                try writeMemoryValue(at: old + offset, size: 4, registers[index])
+            }
+            for (index, offset) in [72, 76, 80, 84, 88, 92].enumerated() {
+                try writeMemoryValue(at: old + offset, size: 2, UInt64(segments[index]))
+            }
+            try writeMemoryValue(at: old + 96, size: 2, UInt64(ldtrSelector))
+            if kind != .nested {
+                // JMP / IRET による切り替えでは旧タスクのビジーを解除する
+                let oldTableBase = taskRegister & 0x0004 != 0 ? ldtrCache.base : gdtrBase
+                let oldDescriptor = Int(oldTableBase + UInt64(taskRegister & 0xFFF8))
+                let oldAccess = try readMemoryValue(at: oldDescriptor + 5, size: 1)
+                try writeMemoryValue(at: oldDescriptor + 5, size: 1, oldAccess & ~0x2)
+            }
+        }
+        // 新タスクをビジーにし、ネスト時はバックリンクを書く
+        try writeMemoryValue(at: descriptorAddress + 5, size: 1, access | 0x2)
+        if kind == .nested {
+            try writeMemoryValue(at: Int(newBase), size: 2, UInt64(taskRegister))
+        }
+        // 新しい状態を読み込む
+        controlRegisters[3] = try readMemoryValue(at: Int(newBase) + 28, size: 4)
+        instructionPointer = try readMemoryValue(at: Int(newBase) + 32, size: 4)
+        var newFlags = UInt32(loadedFlags & 0xFFFFFFFF)
+        if kind == .nested { newFlags |= 0x4000 } // NT
+        flags = newFlags
+        for (index, offset) in [40, 44, 48, 52, 56, 60, 64, 68].enumerated() {
+            registers[index] = try readMemoryValue(at: Int(newBase) + offset, size: 4)
+        }
+        let newLDT = UInt16(try readMemoryValue(at: Int(newBase) + 96, size: 2) & 0xFFFF)
+        ldtrSelector = newLDT
+        ldtrCache = newLDT & 0xFFF8 != 0 ? try descriptorCache(selector: newLDT) : SegmentCache()
+        let segmentOffsets = [72, 76, 80, 84, 88, 92]
+        let segmentSelectors = try segmentOffsets.map { UInt16(try readMemoryValue(at: Int(newBase) + $0, size: 2) & 0xFFFF) }
+        // CS / SS はキャッシュを直接設定し、データセグメントは検証つきで読む
+        let csCache = try descriptorCache(selector: segmentSelectors[1])
+        guard csCache.present, csCache.isCode else {
+            throw CPUTrap.exception(vector: 10, errorCode: UInt32(segmentSelectors[1] & 0xFFFC))
+        }
+        segments[1] = segmentSelectors[1]
+        segmentCaches[1] = csCache
+        let ssCache = try descriptorCache(selector: segmentSelectors[2])
+        guard ssCache.present, !ssCache.isCode, ssCache.permitsWrite else {
+            throw CPUTrap.exception(vector: 10, errorCode: UInt32(segmentSelectors[2] & 0xFFFC))
+        }
+        segments[2] = segmentSelectors[2]
+        segmentCaches[2] = ssCache
+        try loadSegmentRegister(0, segmentSelectors[0]) // ES
+        try loadSegmentRegister(3, segmentSelectors[3]) // DS
+        try loadSegmentRegister(4, segmentSelectors[4]) // FS
+        try loadSegmentRegister(5, segmentSelectors[5]) // GS
+        taskRegister = selector
+        tssBase = newBase
+        tssPresent = true
+        controlRegisters[0] |= 0x8 // CR0.TS
     }
 
     /// CPU 内部で発生した例外（IDT へ配送するため step 内で捕捉する）。
@@ -474,13 +593,17 @@ final class X86CPU {
             isExpandDown: !isSystem && type & 0x8 == 0 && type & 0x4 != 0,
             permitsRead: isSystem ? false : (type & 0x8 == 0 || type & 0x2 != 0),
             permitsWrite: isSystem ? false : (type & 0x8 == 0 && type & 0x2 != 0),
-            dpl: Int((access >> 5) & 0x3)
+            dpl: Int((access >> 5) & 0x3),
+            conforming: !isSystem && type & 0x8 != 0 && type & 0x4 != 0
         )
     }
 
     /// ゲスト命令によるセグメントレジスタのロード。プロテクトモードでは
     /// ディスクリプタを検証する（CS は far 転送専用のためここでは扱わない）。
     func loadSegmentRegister(_ index: Int, _ selector: UInt16) throws {
+        guard (0...5).contains(index) else {
+            throw CPUTrap.exception(vector: 13, errorCode: 0)
+        }
         guard protectedMode else {
             setSegment(index, selector)
             return
@@ -534,9 +657,60 @@ final class X86CPU {
         segmentCaches[1] = cache
     }
 
+    /// ゲストの far 転送（JMP FAR / CALL FAR / RETF / IRET）で CS を
+    /// ロードする。特権検査を行う: 非適合セグメントは転送では
+    /// DPL == CPL、戻りでは DPL >= CPL が必要。適合セグメントは
+    /// DPL <= CPL で、CPL は変わらない。
+    func loadCodeSegmentForTransfer(_ selector: UInt16, isReturn: Bool) throws {
+        guard protectedMode else {
+            try loadCodeSegment(selector)
+            return
+        }
+        guard selector & 0xFFF8 != 0 else {
+            throw CPUTrap.exception(vector: 13, errorCode: 0)
+        }
+        let cache = try descriptorCache(selector: selector)
+        guard cache.present, cache.isCode else {
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        if cache.conforming {
+            guard cache.dpl <= currentPrivilegeLevel else {
+                throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+            }
+            var adjusted = cache
+            adjusted.dpl = currentPrivilegeLevel
+            segments[1] = selector
+            segmentCaches[1] = adjusted
+        } else {
+            let allowed = isReturn ? cache.dpl >= currentPrivilegeLevel : cache.dpl == currentPrivilegeLevel
+            guard allowed else {
+                throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+            }
+            segments[1] = selector
+            segmentCaches[1] = cache
+        }
+    }
+
     func flag(_ bit: UInt32) -> Bool { flags & bit != 0 }
     func setFlag(_ bit: UInt32, _ on: Bool) {
         flags = on ? (flags | bit) : (flags & ~bit)
+    }
+
+    /// POPF / IRET 系のフラグ復元。CPL != 0 では IOPL を保持し、
+    /// CPL > 現在の IOPL では IF も保持する（実機の規則）。
+    func flagsAfterRestore(_ value: UInt64, keepHighHalf: Bool, cpl: Int) -> UInt32 {
+        var result = (UInt32(value & 0xFFFFFFFF) & 0x3FD5) | 0x0002
+        let currentIOPL = (flags >> 12) & 0x3
+        if cpl != 0 {
+            result = (result & ~0x3000) | (flags & 0x3000)
+        }
+        if UInt32(cpl) > currentIOPL {
+            result = (result & ~0x0200) | (flags & 0x0200)
+        }
+        if keepHighHalf {
+            result |= flags & 0xFFFF0000
+        }
+        return result
     }
 
     // MARK: - メモリアクセス
@@ -633,6 +807,7 @@ final class X86CPU {
             if present { code |= 0x01 }
             if isWrite { code |= 0x02 }
             if isFetch { code |= 0x10 }
+            if currentPrivilegeLevel == 3 { code |= 0x04 }
             return .exception(vector: 14, errorCode: code)
         }
         guard pde & 1 != 0 else { throw pageFault(present: false) }
@@ -644,6 +819,12 @@ final class X86CPU {
             throw CPUTrap.exception(vector: 14, errorCode: code)
         }
         if pde & 0x80 != 0 {
+            if isWrite && pde & 0x2 == 0 && (currentPrivilegeLevel == 3 || controlRegisters[0] & 0x10000 != 0) {
+                controlRegisters[2] = linear
+                var code: UInt32 = 0x01 | 0x02
+                if currentPrivilegeLevel == 3 { code |= 0x04 }
+                throw CPUTrap.exception(vector: 14, errorCode: code)
+            }
             // 4 MiB ページ（PSE）
             if pde & 0x20 == 0 || (isWrite && pde & 0x40 == 0) {
                 pde |= 0x20
@@ -661,6 +842,12 @@ final class X86CPU {
             var code: UInt32 = 0x01 | 0x04
             if isWrite { code |= 0x02 }
             if isFetch { code |= 0x10 }
+            throw CPUTrap.exception(vector: 14, errorCode: code)
+        }
+        if isWrite && (pde & 0x2 == 0 || pte & 0x2 == 0) && (currentPrivilegeLevel == 3 || controlRegisters[0] & 0x10000 != 0) {
+            controlRegisters[2] = linear
+            var code: UInt32 = 0x01 | 0x02
+            if currentPrivilegeLevel == 3 { code |= 0x04 }
             throw CPUTrap.exception(vector: 14, errorCode: code)
         }
         if pde & 0x20 == 0 {
@@ -683,33 +870,43 @@ final class X86CPU {
             if present { code |= 0x01 }
             if isWrite { code |= 0x02 }
             if isFetch { code |= 0x10 }
+            if currentPrivilegeLevel == 3 { code |= 0x04 }
             return .exception(vector: 14, errorCode: code)
         }
         if longModeActive {
             // 正準アドレスチェック（ビット 47 の符号拡張）
             let bit47 = (linear >> 47) & 1
             let upper = linear >> 48
-            guard upper == (bit47 == 1 ? 0xFFFF : 0) else { throw pageFault(present: true) }
+            guard upper == (bit47 == 1 ? 0xFFFF : 0) else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
         }
         let nxEnabled = efer & 0x800 != 0
         var tablePhysical = longModeActive ? (controlRegisters[3] & ~0xFFF) : (controlRegisters[3] & ~0x1F)
         let levelShifts: [UInt64] = longModeActive ? [39, 30, 21, 12] : [30, 21, 12]
+        var effectiveWritable = true
         for (level, shift) in levelShifts.enumerated() {
             let index = (linear >> shift) & 0x1FF
             let entryAddress = tablePhysical + index * 8
             var entry = try readMemoryValue(at: Int(entryAddress), size: 8)
             guard entry & 1 != 0 else { throw pageFault(present: false) }
-            if currentPrivilegeLevel == 3 && entry & 0x4 == 0 {
+            if currentPrivilegeLevel == 3 && entry & 0x4 == 0 && (longModeActive || level > 0) {
                 controlRegisters[2] = linear
                 var usCode: UInt32 = 0x01 | 0x04
                 if isWrite { usCode |= 0x02 }
                 if isFetch { usCode |= 0x10 }
                 throw CPUTrap.exception(vector: 14, errorCode: usCode)
             }
+            effectiveWritable = effectiveWritable && entry & 0x2 != 0
             let isLast = level == levelShifts.count - 1
             let largePageAllowed = shift == 21 || (shift == 30 && longModeActive)
             if !isLast && largePageAllowed && entry & 0x80 != 0 {
                 if isFetch && nxEnabled && entry >> 63 != 0 { throw pageFault(present: true) }
+                if isWrite && !effectiveWritable && (currentPrivilegeLevel == 3 || controlRegisters[0] & 0x10000 != 0) {
+                    controlRegisters[2] = linear
+                    var code: UInt32 = 0x01 | 0x02
+                    if currentPrivilegeLevel == 3 { code |= 0x04 }
+                    throw CPUTrap.exception(vector: 14, errorCode: code)
+                }
+
                 var updated = entry | 0x20
                 if isWrite { updated |= 0x40 }
                 if updated != entry { try writeMemoryValue(at: Int(entryAddress), size: 8, updated) }
@@ -721,6 +918,13 @@ final class X86CPU {
             }
             if isLast {
                 if isFetch && nxEnabled && entry >> 63 != 0 { throw pageFault(present: true) }
+                if isWrite && !effectiveWritable && (currentPrivilegeLevel == 3 || controlRegisters[0] & 0x10000 != 0) {
+                    controlRegisters[2] = linear
+                    var code: UInt32 = 0x01 | 0x02
+                    if currentPrivilegeLevel == 3 { code |= 0x04 }
+                    throw CPUTrap.exception(vector: 14, errorCode: code)
+                }
+
                 var updated = entry | 0x20
                 if isWrite { updated |= 0x40 }
                 if updated != entry { try writeMemoryValue(at: Int(entryAddress), size: 8, updated) }
@@ -860,6 +1064,9 @@ final class X86CPU {
             }
         case 7: offset = UInt64(register16(3))
         default: break
+        }
+        if mod == 0 {
+            offset &= 0xFFFF // 16 ビットアドレッシングでは基底の和も 16 ビットに巻き戻る
         }
         if mod == 1 {
             let displacement = Int8(bitPattern: try fetch8())
@@ -1215,6 +1422,14 @@ final class X86CPU {
         var rex: UInt8 = 0
         while true {
             let byte = try fetch8()
+            // REX の直後が別のプレフィクスバイトなら、その REX は無効になる
+            if rex != 0 {
+                switch byte {
+                case 0x66, 0x67, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0xF0, 0xF2, 0xF3:
+                    rex = 0
+                default: break
+                }
+            }
             switch byte {
             case 0x66: operandSize = operandSize == defaultOperand ? (defaultOperand == 2 ? 4 : 2) : defaultOperand
             case 0x67: addressSize = addressSize == defaultAddress ? (defaultAddress == 8 ? 4 : (defaultAddress == 2 ? 4 : 2)) : defaultAddress
@@ -1258,6 +1473,15 @@ final class X86CPU {
         let high = try readMemory(at: address + 4, size: 4)
         let access = (high >> 8) & 0xFF
         let gateType = access & 0x1F
+        if gateType == 0x5 {
+            // タスクゲート: ゲート内の TSS セレクタへ切り替える
+            guard access & 0x80 != 0 else {
+                throw X86Fault.exceptionUndeliverable(vector)
+            }
+            let tssSelector = UInt16((low >> 16) & 0xFFFF)
+            try switchTask(toTSSSelector: tssSelector, kind: .nested, returnIP: returnIP)
+            return
+        }
         guard access & 0x80 != 0, gateType == 0xE || gateType == 0xF || gateType == 0x6 || gateType == 0x7 else {
             throw X86Fault.exceptionUndeliverable(vector)
         }
@@ -1277,6 +1501,13 @@ final class X86CPU {
            let kernelStack = tssStackPointer0() {
             registers[4] = kernelStack
             switchedStack = true
+            // SS も TSS の SS0 へ切り替える（32 ビット TSS: SS0 は +8）
+            if let ss0 = try? readMemoryValue(at: Int(tssBase + 8), size: 2), ss0 & 0xFFF8 != 0 {
+                segments[2] = UInt16(ss0)
+                if let ssCache = try? descriptorCache(selector: UInt16(ss0)) {
+                    segmentCaches[2] = ssCache
+                }
+            }
         }
         try loadCodeSegment(selector)
         if switchedStack {
@@ -1296,8 +1527,8 @@ final class X86CPU {
     }
 
     /// ロングモードのゲート配送（16 バイト IDT エントリ、SS / RSP /
-    /// RFLAGS / CS / RIP の 8 バイトプッシュ。TSS によるスタック
-    /// 切り替えはリング 0 のみのため未対応）。
+    /// RFLAGS / CS / RIP の 8 バイトプッシュ。特権レベルをまたぐ場合は
+    /// TSS の RSP0 へ、IST 指定のゲートは TSS の IST スタックへ切り替える）。
     private func dispatchGate64(vector: UInt8, errorCode: UInt32?, returnIP: UInt64) throws {
         let entryOffset = UInt64(vector) * 16
         guard entryOffset + 15 <= UInt64(idtrLimit) else {
@@ -1317,10 +1548,16 @@ final class X86CPU {
         let savedCS = segments[1]
         let savedSS = segments[2]
         let savedRSP = registers[4]
-        // より特権の高いレベルへ移る場合は TSS の RSP0 へスタックを切り替える
-        let targetCache = try? descriptorCache(selector: selector)
-        if let targetCache, targetCache.dpl < currentPrivilegeLevel,
-           let kernelStack = tssStackPointer0() {
+        // IST 指定のゲートは TSS の IST スタックを、それ以外で特権レベルを
+        // またぐ場合は TSS の RSP0 を使う
+        let istIndex = Int((low >> 32) & 0x7)
+        if istIndex != 0 && tssPresent {
+            if let istStack = try? readMemoryValue(at: Int(tssBase) + 36 + (istIndex - 1) * 8, size: 8) {
+                registers[4] = istStack
+            }
+        } else if let targetCache = try? descriptorCache(selector: selector),
+                  targetCache.dpl < currentPrivilegeLevel,
+                  let kernelStack = tssStackPointer0() {
             registers[4] = kernelStack
         }
         try loadCodeSegment(selector)
@@ -1344,17 +1581,32 @@ final class X86CPU {
         // ALU グリッド（0x00〜0x3D）とセグメント push/pop、BCD 補正
         if opcode <= 0x3D {
             switch opcode {
-            case 0x06: try push(UInt64(segments[0]), size: stackOperandSize(operandSize)); return
-            case 0x07: try loadSegmentRegister(0, UInt16(try pop(size: stackOperandSize(operandSize)) & 0xFFFF)); return
-            case 0x0E: try push(UInt64(segments[1]), size: stackOperandSize(operandSize)); return
-            case 0x16: try push(UInt64(segments[2]), size: stackOperandSize(operandSize)); return
-            case 0x17: // POP SS（次の命令までは割り込みを受け付けない）
+            case 0x06: // PUSH ES（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try push(UInt64(segments[0]), size: stackOperandSize(operandSize)); return
+            case 0x07: // POP ES（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try loadSegmentRegister(0, UInt16(try pop(size: stackOperandSize(operandSize)) & 0xFFFF)); return
+            case 0x0E: // PUSH CS（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try push(UInt64(segments[1]), size: stackOperandSize(operandSize)); return
+            case 0x16: // PUSH SS（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try push(UInt64(segments[2]), size: stackOperandSize(operandSize)); return
+            case 0x17: // POP SS（64 ビットモードでは #UD。次の命令までは割り込みを受け付けない）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
                 try loadSegmentRegister(2, UInt16(try pop(size: stackOperandSize(operandSize)) & 0xFFFF))
                 interruptInhibit = 2
                 return
-            case 0x1E: try push(UInt64(segments[3]), size: stackOperandSize(operandSize)); return
-            case 0x1F: try loadSegmentRegister(3, UInt16(try pop(size: stackOperandSize(operandSize)) & 0xFFFF)); return
-            case 0x27, 0x2F, 0x37, 0x3F: executeBCDAdjust(opcode); return
+            case 0x1E: // PUSH DS（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try push(UInt64(segments[3]), size: stackOperandSize(operandSize)); return
+            case 0x1F: // POP DS（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                try loadSegmentRegister(3, UInt16(try pop(size: stackOperandSize(operandSize)) & 0xFFFF)); return
+            case 0x27, 0x2F, 0x37, 0x3F: // BCD 補正（64 ビットモードでは #UD）
+                guard !inLongMode else { throw opcodeFault(opcode, address: address) }
+                executeBCDAdjust(opcode); return
             default: break
             }
             if opcode & 7 <= 5 {
@@ -1382,8 +1634,8 @@ final class X86CPU {
             let index = Int(opcode - 0x58) | (decodeREX & 0x01 != 0 ? 8 : 0)
             let size = stackOperandSize(operandSize)
             setRegisterValue(index, size: size, try pop(size: size))
-        case 0x63: // MOVSXD（ロングモード）/ ARPL
-            if inLongMode {
+        case 0x63: // MOVSXD（IA-32e モード）/ ARPL（レガシー）
+            if longModeActive {
                 let modRM = try decodeModRM()
                 let source = try readOperand(modRM, size: 4)
                 setRegisterValue(modRM.reg, size: operandSize, UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(source & 0xFFFFFFFF)))))
@@ -1476,6 +1728,7 @@ final class X86CPU {
             }
         case 0x8C: // MOV セグメント → r/m
             let modRM = try decodeModRM()
+            guard modRM.reg <= 5 else { throw CPUTrap.exception(vector: 6, errorCode: 0) }
             try writeOperand(modRM, size: 2, UInt64(segments[modRM.reg]))
         case 0x8D: // LEA
             let modRM = try decodeModRM()
@@ -1483,6 +1736,7 @@ final class X86CPU {
             setRegisterValue(modRM.reg, size: operandSize, resolvedOffset(modRM))
         case 0x8E: // MOV r/m → セグメント
             let modRM = try decodeModRM()
+            guard modRM.reg <= 5 else { throw CPUTrap.exception(vector: 6, errorCode: 0) }
             guard modRM.reg != 1 else { throw X86Fault.unimplementedOpcode(opcode, address: address) }
             let value = try readOperand(modRM, size: 2)
             try loadSegmentRegister(modRM.reg, UInt16(value & 0xFFFF))
@@ -1505,25 +1759,26 @@ final class X86CPU {
             setRegisterValue(0, size: operandSize, UInt64(bitPattern: signExtend(registerValue(0, size: sourceSize), size: sourceSize)))
         case 0x99: // CWD / CDQ / CQO
             setRegisterValue(2, size: operandSize, signExtend(registerValue(0, size: operandSize), size: operandSize) < 0 ? mask(forSize: operandSize) : 0)
-        case 0x9A: // CALL far
+        case 0x9A: // CALL far（64 ビットモードでは #UD）
+            guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let offset = try fetchImmediate(operandSize)
             let newSegment = try fetch16()
+            if let tssSelector = try taskGateOrTSS(selector: newSegment) {
+                try switchTask(toTSSSelector: tssSelector, kind: .nested, returnIP: instructionPointer)
+                return
+            }
             let size = stackOperandSize(operandSize)
             try push(UInt64(segments[1]), size: size)
             try push(instructionPointer, size: size)
-            try loadCodeSegment(newSegment)
+            try loadCodeSegmentForTransfer(newSegment, isReturn: false)
             instructionPointer = offset & ipMask
         case 0x9C: // PUSHF
             let size = stackOperandSize(operandSize)
             try push(UInt64(flags), size: size)
-        case 0x9D: // POPF
+        case 0x9D: // POPF（CPL > 0 では IOPL を、CPL > IOPL では IF を保持する）
             let size = stackOperandSize(operandSize)
             let value = try pop(size: size)
-            if size == 2 {
-                flags = (UInt32(value & 0xFFFF) & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
-            } else {
-                flags = UInt32(value & 0xFFFFFFFF) | 0x0002
-            }
+            flags = flagsAfterRestore(value, keepHighHalf: size == 2, cpl: currentPrivilegeLevel)
         case 0x9E: // SAHF
             flags = (flags & ~0xD5) | (UInt32(register8(4)) & 0xD5)
         case 0x9F: // LAHF
@@ -1539,7 +1794,7 @@ final class X86CPU {
                 try writeGuest(segmentIndex: segmentIndex, offset: offset, size: size, registerValue(0, size: size))
             }
         case 0xA4...0xA7, 0xAA...0xAF, 0x6C...0x6F: // 文字列操作（INS / OUTS を含む）
-            try executeStringOperation(opcode: opcode, operandSize: operandSize, repeatPrefix: repeatPrefix)
+            try executeStringOperation(opcode: opcode, operandSize: operandSize, repeatPrefix: repeatPrefix, startIP: startIP)
         case 0xA8, 0xA9: // TEST AL / eAX, imm（64 ビットモードでは imm32 符号拡張）
             let size = opcode == 0xA8 ? 1 : operandSize
             let immediate = try fetchSignExtendedImmediate(size)
@@ -1567,7 +1822,8 @@ final class X86CPU {
             let modRM = try decodeModRM()
             let value = try fetchSignExtendedImmediate(size)
             try writeOperand(modRM, size: size, value)
-        case 0xC8: // ENTER
+        case 0xC8: // ENTER（64 ビットモードでは #UD）
+            guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let allocation = try fetch16()
             let level = Int(try fetch8() & 31)
             let size = stackOperandSize(operandSize)
@@ -1594,15 +1850,43 @@ final class X86CPU {
             let size = stackOperandSize(operandSize)
             let returnIP = try pop(size: size)
             let newSegment = UInt16(try pop(size: size) & 0xFFFF)
-            try loadCodeSegment(newSegment)
+            var returnStack: UInt64?
+            var returnSS: UInt16 = 0
+            if let target = try? descriptorCache(selector: newSegment),
+               !target.conforming, target.dpl > currentPrivilegeLevel {
+                returnStack = try pop(size: size)
+                returnSS = UInt16(try pop(size: size) & 0xFFFF)
+            }
+            try loadCodeSegmentForTransfer(newSegment, isReturn: true)
             instructionPointer = returnIP & ipMask
+            if let returnStack {
+                registers[4] = size == 2 ? (registers[4] & ~0xFFFF) | (returnStack & 0xFFFF) : returnStack & 0xFFFFFFFF
+                segments[2] = returnSS
+                if returnSS & 0xFFF8 != 0, let ssCache = try? descriptorCache(selector: returnSS) {
+                    segmentCaches[2] = ssCache
+                }
+            }
             setStackPointer(stackPointer &+ UInt64(extra))
         case 0xCB: // RETF
             let size = stackOperandSize(operandSize)
             let returnIP = try pop(size: size)
             let newSegment = UInt16(try pop(size: size) & 0xFFFF)
-            try loadCodeSegment(newSegment)
+            var returnStack: UInt64?
+            var returnSS: UInt16 = 0
+            if let target = try? descriptorCache(selector: newSegment),
+               !target.conforming, target.dpl > currentPrivilegeLevel {
+                returnStack = try pop(size: size)
+                returnSS = UInt16(try pop(size: size) & 0xFFFF)
+            }
+            try loadCodeSegmentForTransfer(newSegment, isReturn: true)
             instructionPointer = returnIP & ipMask
+            if let returnStack {
+                registers[4] = size == 2 ? (registers[4] & ~0xFFFF) | (returnStack & 0xFFFF) : returnStack & 0xFFFFFFFF
+                segments[2] = returnSS
+                if returnSS & 0xFFF8 != 0, let ssCache = try? descriptorCache(selector: returnSS) {
+                    segmentCaches[2] = ssCache
+                }
+            }
         case 0xCC: // INT 3
             try executeInterrupt(vector: 3, startIP: startIP)
         case 0xCD: // INT imm8
@@ -1611,31 +1895,50 @@ final class X86CPU {
         case 0xCE: // INTO
             if flag(Self.flagOverflow) { try executeInterrupt(vector: 4, startIP: startIP) }
         case 0xCF: // IRET / IRETQ
-            if inLongMode && operandSize == 8 {
+            if longModeActive {
+                let cplBeforeReturn = currentPrivilegeLevel
                 let returnIP = try pop(size: 8)
                 let newSegment = UInt16(try pop(size: 8) & 0xFFFF)
                 let newFlags = try pop(size: 8)
                 let newStack = try pop(size: 8)
                 let newSS = UInt16(try pop(size: 8) & 0xFFFF)
-                try loadCodeSegment(newSegment)
+                try loadCodeSegmentForTransfer(newSegment, isReturn: true)
                 if newSS & 0xFFF8 != 0 {
                     segmentCaches[2] = try descriptorCache(selector: newSS)
                 }
                 segments[2] = newSS
                 registers[4] = newStack
-                flags = (UInt32(newFlags & 0xFFFFFFFF) & 0x0FD5) | 0x0002
+                flags = flagsAfterRestore(newFlags, keepHighHalf: false, cpl: cplBeforeReturn)
                 instructionPointer = returnIP
             } else {
+                if flags & 0x4000 != 0 && tssPresent {
+                    // NT セット時の IRET はバックリンク先のタスクへ戻る
+                    let backLink = UInt16(try readMemoryValue(at: Int(tssBase), size: 2) & 0xFFFF)
+                    try switchTask(toTSSSelector: backLink, kind: .iretReturn, returnIP: instructionPointer)
+                    return
+                }
                 let size = stackOperandSize(operandSize)
+                let cplBeforeReturn = currentPrivilegeLevel
                 let returnIP = try pop(size: size)
                 let newSegment = UInt16(try pop(size: size) & 0xFFFF)
                 let value = try pop(size: size)
-                try loadCodeSegment(newSegment)
+                // 外側の特権レベルへ戻る場合は ESP / SS もポップして切り替える
+                var returnStack: UInt64?
+                var returnSS: UInt16 = 0
+                if let target = try? descriptorCache(selector: newSegment),
+                   !target.conforming, target.dpl > currentPrivilegeLevel {
+                    returnStack = try pop(size: size)
+                    returnSS = UInt16(try pop(size: size) & 0xFFFF)
+                }
+                try loadCodeSegmentForTransfer(newSegment, isReturn: true)
                 instructionPointer = returnIP & ipMask
-                if size == 2 {
-                    flags = (UInt32(value & 0xFFFF) & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
-                } else {
-                    flags = UInt32(value & 0xFFFFFFFF) | 0x0002
+                flags = flagsAfterRestore(value, keepHighHalf: size == 2, cpl: cplBeforeReturn)
+                if let returnStack {
+                    registers[4] = size == 2 ? (registers[4] & ~0xFFFF) | (returnStack & 0xFFFF) : returnStack & 0xFFFFFFFF
+                    segments[2] = returnSS
+                    if returnSS & 0xFFF8 != 0, let ssCache = try? descriptorCache(selector: returnSS) {
+                        segmentCaches[2] = ssCache
+                    }
                 }
             }
         case 0xD0, 0xD1, 0xD2, 0xD3: // シフト（1 / CL）
@@ -1653,14 +1956,16 @@ final class X86CPU {
                     try writeOperand(modRM, size: 2, 0)
                 }
             }
-        case 0xD4: // AAM
+        case 0xD4: // AAM（64 ビットモードでは #UD）
+            guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let base = UInt64(try fetch8())
             guard base != 0 else { throw divideFault(address: address) }
             let al = UInt64(register8(0))
             setRegister8(4, UInt8(al / base))
             setRegister8(0, UInt8(al % base))
             setSignZeroParity(UInt64(register8(0)), size: 1)
-        case 0xD5: // AAD
+        case 0xD5: // AAD（64 ビットモードでは #UD）
+            guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let base = UInt64(try fetch8())
             let result = (UInt64(register8(4)) * base + UInt64(register8(0))) & 0xFF
             setRegister8(0, UInt8(result))
@@ -1668,7 +1973,7 @@ final class X86CPU {
             setSignZeroParity(result, size: 1)
         case 0xD7: // XLAT
             let base = registerValue(3, size: decodeAddressSize)
-            let value = try readGuest(segmentIndex: decodeSegmentOverride ?? 3, offset: base &+ UInt64(register8(0)), size: 1)
+            let value = try readGuest(segmentIndex: decodeSegmentOverride ?? 3, offset: (base &+ UInt64(register8(0))) & decodeAddressMask, size: 1)
             setRegister8(0, UInt8(value & 0xFF))
         case 0xE0, 0xE1, 0xE2, 0xE3: // LOOP 系
             let displacement = Int8(bitPattern: try fetch8())
@@ -1691,7 +1996,8 @@ final class X86CPU {
             let port = UInt16(try fetch8())
             let size = opcode == 0xE4 ? 1 : operandSize
             setRegisterValue(0, size: size, UInt64(portIn(port, size: size)))
-        case 0xE6, 0xE7: // OUT imm8, AL / eAX
+        case 0xE6, 0xE7: // OUT imm8, AL / eAX（IOPL 検査）
+            try requireIOPL()
             let port = UInt16(try fetch8())
             let size = opcode == 0xE6 ? 1 : operandSize
             portOut(port, value: UInt32(registerValue(0, size: size) & 0xFFFFFFFF), size: size)
@@ -1702,10 +2008,15 @@ final class X86CPU {
         case 0xE9: // JMP rel
             let displacement = operandSize == 2 ? Int64(Int16(bitPattern: try fetch16())) : Int64(Int32(bitPattern: try fetch32()))
             instructionPointer = (instructionPointer &+ UInt64(bitPattern: displacement)) & ipMask
-        case 0xEA: // JMP far
+        case 0xEA: // JMP far（64 ビットモードでは #UD）
+            guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let offset = try fetchImmediate(operandSize)
             let newSegment = try fetch16()
-            try loadCodeSegment(newSegment)
+            if let tssSelector = try taskGateOrTSS(selector: newSegment) {
+                try switchTask(toTSSSelector: tssSelector, kind: .jump, returnIP: instructionPointer)
+                return
+            }
+            try loadCodeSegmentForTransfer(newSegment, isReturn: false)
             instructionPointer = offset & ipMask
         case 0xEB: // JMP rel8
             let displacement = Int8(bitPattern: try fetch8())
@@ -1741,8 +2052,9 @@ final class X86CPU {
             interruptInhibit = 2
         case 0xFC: setFlag(Self.flagDirection, false)
         case 0xFD: setFlag(Self.flagDirection, true)
-        case 0xFE: // グループ4（INC / DEC byte）
+        case 0xFE: // グループ4（INC / DEC byte。それ以外は #UD）
             let modRM = try decodeModRM()
+            guard modRM.reg <= 1 else { throw opcodeFault(opcode, address: address) }
             let value = try readOperand(modRM, size: 1)
             let result = incrementWithFlags(value, size: 1, decrement: modRM.reg == 1)
             try writeOperand(modRM, size: 1, result)
@@ -1860,6 +2172,18 @@ final class X86CPU {
                 let selector = UInt16(try readOperand(modRM, size: 2) & 0xFFFF)
                 taskRegister = selector
                 if selector & 0xFFF8 != 0 {
+                    // ディスクリプタ種別が TSS であることを検証し、ビジーを立てる
+                    let ltrTableBase = selector & 0x0004 != 0 ? ldtrCache.base : gdtrBase
+                    let ltrDescriptorAddress = Int(ltrTableBase + UInt64(selector & 0xFFF8))
+                    let access = try readMemoryValue(at: ltrDescriptorAddress + 5, size: 1)
+                    let descriptorType = access & 0xF
+                    let validTypes: [UInt64] = longModeActive ? [0x9, 0xB] : [0x1, 0x3, 0x9, 0xB]
+                    guard access & 0x10 == 0, validTypes.contains(descriptorType) else {
+                        throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+                    }
+                    if descriptorType == 0x9 || descriptorType == 0x1 {
+                        try writeMemoryValue(at: ltrDescriptorAddress + 5, size: 1, access | 0x2)
+                    }
                     var cache = try descriptorCache(selector: selector)
                     if longModeActive {
                         // 64 ビット TSS は 16 バイトディスクリプタ（上位ベース）
@@ -1891,7 +2215,7 @@ final class X86CPU {
                 guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
                 let offset = resolvedOffset(modRM)
                 let limit = try readGuest(segmentIndex: modRM.segmentIndex, offset: offset, size: 2)
-                let base = try readGuest(segmentIndex: modRM.segmentIndex, offset: offset &+ 2, size: operandSize == 8 ? 8 : 4)
+                let base = try readGuest(segmentIndex: modRM.segmentIndex, offset: offset &+ 2, size: (longModeActive || operandSize == 8) ? 8 : 4)
                 if modRM.reg == 2 {
                     gdtrBase = base
                     gdtrLimit = UInt16(limit & 0xFFFF)
@@ -1903,11 +2227,19 @@ final class X86CPU {
                 try writeOperand(modRM, size: 2, controlRegisters[0] & 0xFFFF)
             case 6: // LMSW
                 try requireCPL0()
-                let value = try readOperand(modRM, size: 2) & 0xFFFF
-                var newValue = (controlRegisters[0] & 0xFFFF0000) | value
+                let value = try readOperand(modRM, size: 2) & 0xF // LMSW が書けるのは下位 4 ビットのみ
+                var newValue = (controlRegisters[0] & ~0xF) | value
                 if controlRegisters[0] & 1 != 0 { newValue |= 1 } // PE は落とせない
                 controlRegisters[0] = newValue
-            case 7: // INVLPG（TLB は持たないため何もしない）
+            case 7: // INVLPG（TLB は持たないため何もしない）/ SWAPGS（0F 01 F8）
+                if modRM.isRegister {
+                    guard modRM.registerIndex == 0 else { throw opcodeFault(opcode, address: address) }
+                    try requireCPL0()
+                    let currentGSBase = segmentCaches[5].base
+                    segmentCaches[5].base = kernelGSBase
+                    kernelGSBase = currentGSBase
+                    break
+                }
                 try requireCPL0()
                 break
             default:
@@ -1932,7 +2264,7 @@ final class X86CPU {
             segmentCaches[2] = SegmentCache(base: 0, limit: 0xFFFFFFFF, defaultSize32: true, present: true, isCode: false, isExpandDown: false, permitsRead: true, permitsWrite: true, dpl: 3)
             segments[1] = (userBase &+ 16) | 3
             segmentCaches[1] = SegmentCache(base: 0, limit: 0xFFFFFFFF, defaultSize32: operandSize != 8, longMode: operandSize == 8, present: true, isCode: true, isExpandDown: false, permitsRead: true, permitsWrite: false, dpl: 3)
-            flags = (UInt32(registers[11] & 0xFFFFFFFF) & 0x0FD5) | 0x0002
+            flags = (UInt32(registers[11] & 0xFFFFFFFF) & 0x3FD5) | 0x0002
             instructionPointer = operandSize == 8 ? registers[1] : (registers[1] & 0xFFFFFFFF)
         case 0x06: // CLTS
             try requireCPL0()
@@ -2022,7 +2354,7 @@ final class X86CPU {
             case 1:
                 registers[0] = 0x00000611
                 registers[3] = 0
-                registers[1] = 0x00000001 // ECX: x87 / APIC あり（最小限）
+                registers[1] = 0 // ECX: SSE3 等は未実装のため広告しない
                 registers[2] = 0x00000179 // FPU / PSE / TSC / MSR / PAE / CX8 / APIC
             case 0x80000000:
                 registers[0] = 0x80000008
@@ -2131,9 +2463,13 @@ final class X86CPU {
         decodeAddressSize == 2 ? 0xFFFF : (decodeAddressSize == 4 ? 0xFFFFFFFF : UInt64.max)
     }
 
-    private func executeStringOperation(opcode: UInt8, operandSize: Int, repeatPrefix: UInt8) throws {
+    /// REP 付き文字列命令は 1 回の step で最大 8192 反復まで実行し、
+    /// 残りは命令先頭から再実行して継続する（割り込みを受け付けるため）。
+    private func executeStringOperation(opcode: UInt8, operandSize: Int, repeatPrefix: UInt8, startIP: UInt64) throws {
+        if opcode >= 0x6C && opcode <= 0x6F { try requireIOPL() } // INS / OUTS
         let size = opcode & 1 == 0 ? 1 : operandSize
         let isRepeated = repeatPrefix == 0xF3 || repeatPrefix == 0xF2
+        var iterations = 0
         while true {
             if isRepeated {
                 if (registers[1] & decodeAddressMask) == 0 { return }
@@ -2141,6 +2477,11 @@ final class X86CPU {
             }
             try singleStringStep(opcode: opcode, size: size)
             if !isRepeated { return }
+            iterations += 1
+            if iterations >= 8192 {
+                instructionPointer = startIP // 割り込み配送のため再実行させる
+                return
+            }
             if opcode == 0xA6 || opcode == 0xA7 || opcode == 0xAE || opcode == 0xAF {
                 if repeatPrefix == 0xF3 && !flag(Self.flagZero) { return }
                 if repeatPrefix == 0xF2 && flag(Self.flagZero) { return }
@@ -2194,9 +2535,9 @@ final class X86CPU {
         let size = opcode == 0xF6 ? 1 : operandSize
         let modRM = try decodeModRM()
         switch modRM.reg {
-        case 0: // TEST imm
-            let operand = try readOperand(modRM, size: size)
+        case 0: // TEST imm（RIP 相対の基準を合わせるため即値を先に読む）
             let immediate = try fetchSignExtendedImmediate(size)
+            let operand = try readOperand(modRM, size: size)
             _ = logicFlags(operand & immediate, size: size)
         case 2: // NOT
             let operand = try readOperand(modRM, size: size)
@@ -2239,7 +2580,10 @@ final class X86CPU {
                 let full = Int64(bitPattern: registers[0]).multipliedFullWidth(by: Int64(bitPattern: operand))
                 registers[0] = full.low
                 registers[2] = UInt64(bitPattern: full.high)
-                break
+                let signExtended: Int64 = full.low >> 63 != 0 ? -1 : 0
+                let overflow = full.high != signExtended
+                setFlag(Self.flagCarry, overflow); setFlag(Self.flagOverflow, overflow)
+                return
             }
             let full = multiplySigned(registerValue(0, size: size), operand, size: size)
             let bits = UInt64(bitPattern: full)
@@ -2277,10 +2621,10 @@ final class X86CPU {
                 if signed {
                     let dividend = Int32(bitPattern: UInt32(dividendBits & 0xFFFFFFFF))
                     let d = Int32(Int16(bitPattern: UInt16(divisor & 0xFFFF)))
-                    let quotient = dividend / d
+                    let quotient = Int64(dividend) / Int64(d) // Int64 で計算し Int32.min / -1 のトラップを避ける
                     guard quotient >= -32768 && quotient <= 32767 else { throw divideFault(address: address) }
                     setRegister16(0, UInt16(bitPattern: Int16(quotient)))
-                    setRegister16(2, UInt16(bitPattern: Int16(dividend % d)))
+                    setRegister16(2, UInt16(bitPattern: Int16(Int64(dividend) % Int64(d))))
                 } else {
                     let quotient = dividendBits / divisor
                     guard quotient <= 0xFFFF else { throw divideFault(address: address) }
@@ -2292,6 +2636,7 @@ final class X86CPU {
                 if signed {
                     let dividend = Int64(bitPattern: dividendBits)
                     let d = Int64(Int32(bitPattern: UInt32(divisor & 0xFFFFFFFF)))
+                    guard !(dividend == Int64.min && d == -1) else { throw divideFault(address: address) }
                     let quotient = dividend / d
                     guard quotient >= Int64(Int32.min) && quotient <= Int64(Int32.max) else { throw divideFault(address: address) }
                     setRegister32(0, UInt32(bitPattern: Int32(quotient)))
@@ -2314,7 +2659,7 @@ final class X86CPU {
                         magnitudeHigh = ~high &+ (low == 0 ? 1 : 0)
                     }
                     let divisorSigned = Int64(bitPattern: divisor)
-                    let divisorMagnitude = divisorSigned < 0 ? UInt64(bitPattern: -divisorSigned) : divisor
+                    let divisorMagnitude = divisorSigned.magnitude // Int64.min でもトラップしない
                     guard magnitudeHigh < divisorMagnitude else { throw divideFault(address: address) }
                     let result = divisorMagnitude.dividingFullWidth((high: magnitudeHigh, low: magnitudeLow))
                     let negativeQuotient = negativeDividend != (divisorSigned < 0)
@@ -2364,10 +2709,14 @@ final class X86CPU {
             let base = resolvedOffset(modRM)
             let offset = try readGuest(segmentIndex: modRM.segmentIndex, offset: base, size: pointerSize)
             let newSegment = try readGuest(segmentIndex: modRM.segmentIndex, offset: base &+ UInt64(pointerSize), size: 2)
+            if let tssSelector = try taskGateOrTSS(selector: UInt16(newSegment & 0xFFFF)) {
+                try switchTask(toTSSSelector: tssSelector, kind: .nested, returnIP: instructionPointer)
+                return
+            }
             let size = stackOperandSize(operandSize)
             try push(UInt64(segments[1]), size: size)
             try push(instructionPointer, size: size)
-            try loadCodeSegment(UInt16(newSegment & 0xFFFF))
+            try loadCodeSegmentForTransfer(UInt16(newSegment & 0xFFFF), isReturn: false)
             instructionPointer = offset & ipMask
         case 4: // JMP near indirect
             let target = try readOperand(modRM, size: inLongMode ? 8 : operandSize)
@@ -2378,7 +2727,11 @@ final class X86CPU {
             let base = resolvedOffset(modRM)
             let offset = try readGuest(segmentIndex: modRM.segmentIndex, offset: base, size: pointerSize)
             let newSegment = try readGuest(segmentIndex: modRM.segmentIndex, offset: base &+ UInt64(pointerSize), size: 2)
-            try loadCodeSegment(UInt16(newSegment & 0xFFFF))
+            if let tssSelector = try taskGateOrTSS(selector: UInt16(newSegment & 0xFFFF)) {
+                try switchTask(toTSSSelector: tssSelector, kind: .jump, returnIP: instructionPointer)
+                return
+            }
+            try loadCodeSegmentForTransfer(UInt16(newSegment & 0xFFFF), isReturn: false)
             instructionPointer = offset & ipMask
         case 6: // PUSH r/m
             let size = stackOperandSize(operandSize)

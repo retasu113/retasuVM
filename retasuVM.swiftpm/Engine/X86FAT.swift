@@ -43,6 +43,8 @@ final class FATVolume {
     let rootStart: Int       // FAT12/16 のルート領域（バイト）
     let dataStart: Int       // データ領域（バイト）
     let totalClusters: Int
+    /// データ領域の実クラスタ数（FAT 種別判定と走査範囲に使う）。
+    let dataClusterCount: Int
     let rootCluster: Int     // FAT32 のルートクラスタ
     let volumeLabelText: String
 
@@ -70,12 +72,15 @@ final class FATVolume {
         if spf == 0 { spf = u32(36) }
         sectorsPerFAT = spf
         guard total > 0, spf > 0 else { throw FATError.notFAT }
+        guard reserved > 0, d[13] > 0, Int(d[13]) & (Int(d[13]) - 1) == 0 else { throw FATError.notFAT }
         fatStart = reserved * bps
         rootStart = fatStart + fatCount * spf * bps
         let rootBytes = rootEntryCount * 32
         dataStart = rootStart + rootBytes
         let dataSectors = total - (dataStart / bps)
-        totalClusters = dataSectors / sectorsPerCluster + 2
+        guard dataSectors > 0, dataStart <= d.count else { throw FATError.notFAT }
+        dataClusterCount = dataSectors / sectorsPerCluster
+        totalClusters = dataClusterCount + 2
         // ボリュームラベル（BPB の拡張領域）
         let labelOffset = rootEntryCount == 0 ? 71 : 43
         var label = ""
@@ -98,8 +103,8 @@ final class FATVolume {
 
     private enum FATKind { case fat12, fat16, fat32 }
     private var fatKind: FATKind {
-        if totalClusters < 4085 { return .fat12 }
-        if totalClusters < 65525 { return .fat16 }
+        if dataClusterCount < 4085 { return .fat12 }
+        if dataClusterCount < 65525 { return .fat16 }
         return .fat32
     }
 
@@ -173,7 +178,7 @@ final class FATVolume {
     func clusterChain(_ start: Int) -> [Int] {
         var chain: [Int] = []
         var cluster = start
-        while cluster >= 2, cluster < endOfChain, chain.count < totalClusters {
+        while cluster >= 2, cluster < endOfChain - 1, chain.count < totalClusters {
             chain.append(cluster)
             cluster = fatEntry(cluster)
         }
@@ -205,7 +210,8 @@ final class FATVolume {
                 return (readChain(rootCluster), false)
             }
             let end = min(rootStart + rootEntryCount * 32, storage.data.count)
-            return ([UInt8](storage.data[rootStart..<end]), true)
+            let start = min(rootStart, end)
+            return ([UInt8](storage.data[start..<end]), true)
         }
         return (readChain(cluster), false)
     }
@@ -215,14 +221,25 @@ final class FATVolume {
         let (bytes, _) = directoryBytes(cluster: cluster)
         var entries: [Entry] = []
         var longName: String?
+        var longNameChecksum: UInt8?
+        var longNameBroken = false
         var index = 0
         while index + 32 <= bytes.count {
             let entry = [UInt8](bytes[index..<(index + 32)])
             let first = entry[0]
             if first == 0x00 { break }
-            if first == 0xE5 { longName = nil; index += 32; continue }
+            if first == 0xE5 { longName = nil; longNameChecksum = nil; longNameBroken = false; index += 32; continue }
             let attributes = entry[11]
             if attributes == 0x0F {
+                // LFN のチェックサムが SFN と一致しなければ採用しない
+                if longNameBroken { index += 32; continue }
+                if let expected = longNameChecksum, entry[13] != expected {
+                    longName = nil
+                    longNameBroken = true
+                    index += 32
+                    continue
+                }
+                longNameChecksum = entry[13]
                 // LFN エントリ: シーケンス番号の下位で位置を決める
                 let sequence = Int(entry[0] & 0x1F)
                 var chars: [UInt16] = []
@@ -251,7 +268,12 @@ final class FATVolume {
                 continue
             }
             let shortName = [UInt8](entry[0..<11])
-            let display = longName ?? Self.displayName(shortName: shortName)
+            let display: String
+            if let longName, let checksum = longNameChecksum, checksum == Self.shortNameChecksum(shortName) {
+                display = longName
+            } else {
+                display = Self.displayName(shortName: shortName)
+            }
             let cluster = Int(entry[26]) | (Int(entry[27]) << 8) | (isFAT32 ? (Int(entry[20]) | (Int(entry[21]) << 8)) << 16 : 0)
             let size = (0..<4).reduce(0) { $0 | (Int(entry[28 + $1]) << (8 * $1)) }
             entries.append(Entry(
@@ -263,6 +285,8 @@ final class FATVolume {
                 size: size
             ))
             longName = nil
+            longNameChecksum = nil
+            longNameBroken = false
             index += 32
         }
         return entries
@@ -280,24 +304,47 @@ final class FATVolume {
         return ext.isEmpty ? base : base + "." + ext
     }
 
-    /// 名前から 8.3 生バイトを作る（大文字化、無効文字は除去）。
+    /// 名前から 8.3 生バイトを作る。最初のドットで分割し、無効文字と
+    /// 非 ASCII は '_' に置換する。必ず 11 バイトちょうどを返す。
     static func shortNameBytes(for name: String) -> [UInt8] {
         let upper = name.uppercased()
-        let parts = upper.split(separator: ".", omittingEmptySubsequences: false)
-        func clean(_ text: Substring, _ length: Int) -> String {
-            var result = ""
+        let dot = upper.firstIndex(of: ".")
+        let basePart: Substring = dot.map { upper[..<$0] } ?? Substring(upper)
+        let extPart: Substring = dot.map { upper[upper.index(after: $0)...] } ?? ""
+        func clean(_ text: Substring, _ length: Int) -> [UInt8] {
+            var bytes: [UInt8] = []
             for character in text {
-                if character.isLetter || character.isNumber || "_-$#@!%(){}".contains(character) {
-                    result.append(character)
+                if bytes.count >= length { break }
+                if let ascii = character.asciiValue, isValidShortNameByte(ascii) {
+                    bytes.append(ascii)
+                } else {
+                    bytes.append(0x5F) // '_'
                 }
-                if result.count >= length { break }
             }
-            while result.count < length { result.append(" ") }
-            return result
+            while bytes.count < length { bytes.append(0x20) }
+            return bytes
         }
-        let base = clean(parts.first ?? "", 8)
-        let ext = parts.count > 1 ? clean(parts[1], 3) : "   "
-        return [UInt8]((base + ext).utf8)
+        return clean(basePart, 8) + clean(extPart, 3)
+    }
+
+    /// 8.3 ファイル名に使えるバイトかどうか。
+    static func isValidShortNameByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x30...0x39, 0x41...0x5A: // 0-9, A-Z
+            return true
+        default:
+            return "$%'-_@~`!(){}^#&".utf8.contains(byte)
+        }
+    }
+
+    /// LFN エントリ用の SFN チェックサム。
+    static func shortNameChecksum(_ shortName: [UInt8]) -> UInt8 {
+        var sum: UInt8 = 0
+        for byte in shortName {
+            sum = ((sum & 1) << 7) | (sum >> 1)
+            sum = sum &+ byte
+        }
+        return sum
     }
 
     /// パス要素でエントリを探す（大文字小文字を区別しない）。
@@ -333,7 +380,7 @@ final class FATVolume {
 
     /// 空きクラスタを 1 つ割り当てる。
     private func allocateCluster() -> Int? {
-        for cluster in 2..<(totalClusters + 2) {
+        for cluster in 2..<(dataClusterCount + 2) {
             if fatEntry(cluster) == 0 { return cluster }
         }
         return nil
@@ -345,55 +392,157 @@ final class FATVolume {
         }
     }
 
-    /// ディレクトリ領域へ 32 バイトエントリを書く位置を探し、書き込む。
-    /// 戻り値: 書き込めたかどうか。
-    private func writeDirectoryEntry(directoryCluster: Int, shortName: [UInt8], make: ([UInt8]) -> [UInt8]) throws {
+    /// ディレクトリ内の全スロットのストレージオフセット（列挙順）。
+    private func directorySlotOffsets(directoryCluster: Int) -> [Int] {
         if directoryCluster == 0, !isFAT32 {
-            // ルート領域（固定長）: 空きスロットを探す
-            var offset = rootStart
-            let end = rootStart + rootEntryCount * 32
-            var target: Int?
-            while offset + 32 <= end, offset + 32 <= storage.data.count {
-                let first = storage.data[offset]
-                let existing = [UInt8](storage.data[offset..<(offset + 11)])
-                if existing == shortName, storage.data[offset + 11] != 0x0F {
-                    target = offset
-                    break
-                }
-                if (first == 0x00 || first == 0xE5), target == nil { target = offset }
-                if first == 0x00 { break }
-                offset += 32
-            }
-            guard let slot = target else { throw FATError.directoryFull }
-            let entry = make([UInt8](storage.data[slot..<(slot + 32)]))
-            storage.data.replaceSubrange(slot..<(slot + 32), with: entry)
-            return
+            return (0..<rootEntryCount)
+                .map { rootStart + $0 * 32 }
+                .filter { $0 + 32 <= storage.data.count }
         }
-        // クラスタチェーン上のディレクトリ
         let chain = clusterChain(directoryCluster == 0 ? rootCluster : directoryCluster)
+        var offsets: [Int] = []
         for cluster in chain {
             let base = clusterOffset(cluster)
             var offset = base
             while offset + 32 <= base + clusterBytes, offset + 32 <= storage.data.count {
-                let first = storage.data[offset]
-                let existing = [UInt8](storage.data[offset..<(offset + 11)])
-                if existing == shortName, storage.data[offset + 11] != 0x0F {
-                    let entry = make([UInt8](storage.data[offset..<(offset + 32)]))
-                    storage.data.replaceSubrange(offset..<(offset + 32), with: entry)
-                    return
-                }
-                if first == 0x00 || first == 0xE5 {
-                    let entry = make([UInt8](repeating: 0, count: 32))
-                    storage.data.replaceSubrange(offset..<(offset + 32), with: entry)
-                    return
-                }
+                offsets.append(offset)
                 offset += 32
             }
         }
-        throw FATError.directoryFull
+        return offsets
+    }
+
+    /// SFN エントリと、その直前に連なる LFN エントリ群を削除済みに
+    /// する。見つからなければ何もしない。
+    private func markEntryDeleted(directoryCluster: Int, shortName: [UInt8]) {
+        let slots = directorySlotOffsets(directoryCluster: directoryCluster)
+        var longNameRun: [Int] = []
+        for offset in slots {
+            let first = storage.data[offset]
+            if first == 0x00 { break }
+            if first == 0xE5 { longNameRun = []; continue }
+            if storage.data[offset + 11] == 0x0F { longNameRun.append(offset); continue }
+            let existing = [UInt8](storage.data[offset..<(offset + 11)])
+            if existing == shortName {
+                for runOffset in longNameRun { storage.data[runOffset] = 0xE5 }
+                storage.data[offset] = 0xE5
+                return
+            }
+            longNameRun = []
+        }
+    }
+
+    /// 連続した空きスロット（0x00 / 0xE5）の開始インデックスを探す。
+    private func freeRunStart(slots: [Int], needed: Int) -> Int? {
+        var run = 0
+        var start = 0
+        for (index, offset) in slots.enumerated() {
+            let first = storage.data[offset]
+            if first == 0x00 || first == 0xE5 {
+                if run == 0 { start = index }
+                run += 1
+                if run >= needed { return start }
+            } else {
+                run = 0
+            }
+        }
+        return nil
+    }
+
+    /// チェーン型ディレクトリの末尾に空クラスタを 1 つ連結する。
+    private func extendDirectory(directoryCluster: Int) -> Bool {
+        if directoryCluster == 0, !isFAT32 { return false }
+        let chain = clusterChain(directoryCluster == 0 ? rootCluster : directoryCluster)
+        guard let last = chain.last, let newCluster = allocateCluster() else { return false }
+        let offset = clusterOffset(newCluster)
+        guard offset + clusterBytes <= storage.data.count else { return false }
+        storage.data.replaceSubrange(offset..<(offset + clusterBytes), with: [UInt8](repeating: 0, count: clusterBytes))
+        setFATEntry(last, newCluster)
+        setFATEntry(newCluster, eocValue)
+        return true
+    }
+
+    /// LFN エントリ群を作る（物理順は末尾チャンクが先で、最終チャンクに
+    /// 0x40 フラグが立つ）。名前が 13 文字の倍数のときは終端だけの
+    /// エントリが 1 つ増える。
+    static func longNameEntries(name: String, shortName: [UInt8]) -> [[UInt8]] {
+        var units = [UInt16](name.utf16)
+        units.append(0) // 終端
+        while units.count % 13 != 0 { units.append(0xFFFF) }
+        let chunkCount = units.count / 13
+        let checksum = shortNameChecksum(shortName)
+        var entries: [[UInt8]] = []
+        for chunkIndex in stride(from: chunkCount - 1, through: 0, by: -1) {
+            var entry = [UInt8](repeating: 0, count: 32)
+            entry[0] = UInt8(chunkIndex + 1) | (chunkIndex == chunkCount - 1 ? 0x40 : 0)
+            entry[11] = 0x0F
+            entry[13] = checksum
+            var unitIndex = chunkIndex * 13
+            for range in [(1, 11), (14, 26), (28, 32)] {
+                var offset = range.0
+                while offset < range.1 {
+                    let unit = units[unitIndex]
+                    unitIndex += 1
+                    entry[offset] = UInt8(unit & 0xFF)
+                    entry[offset + 1] = UInt8(unit >> 8)
+                    offset += 2
+                }
+            }
+            entries.append(entry)
+        }
+        return entries
+    }
+
+    /// SFN でエントリを探す。
+    private func entry(forShortName shortName: [UInt8], directoryCluster: Int) -> Entry? {
+        listDirectory(cluster: directoryCluster).first { $0.shortName == shortName && !$0.isVolumeLabel }
+    }
+
+    /// 既存エントリと重ならない SFN を作る（必要なら ~n を付ける）。
+    private func uniqueShortName(for name: String, directoryCluster: Int) -> [UInt8] {
+        let base = Self.shortNameBytes(for: name)
+        if entry(forShortName: base, directoryCluster: directoryCluster) == nil { return base }
+        let baseText = String(bytes: base[0..<8], encoding: .ascii) ?? ""
+        let trimmedBase = baseText.trimmingCharacters(in: .whitespaces)
+        for number in 1...99 {
+            let suffix = "~\(number)"
+            var candidate = base
+            let head = String(trimmedBase.prefix(8 - suffix.count)) + suffix
+            let headBytes = [UInt8](head.utf8)
+            for index in 0..<8 {
+                candidate[index] = index < headBytes.count ? headBytes[index] : 0x20
+            }
+            if entry(forShortName: candidate, directoryCluster: directoryCluster) == nil { return candidate }
+        }
+        return base
+    }
+
+    /// ディレクトリへエントリ（必要なら LFN つき）を書く。同 SFN の
+    /// 既存エントリは先に削除扱いにして二重化を防ぐ。
+    private func writeDirectoryEntry(directoryCluster: Int, shortName: [UInt8], longName: String?, make: ([UInt8]) -> [UInt8]) throws {
+        markEntryDeleted(directoryCluster: directoryCluster, shortName: shortName)
+        let lfnEntries = longName.map { Self.longNameEntries(name: $0, shortName: shortName) } ?? []
+        let needed = lfnEntries.count + 1
+        var slots = directorySlotOffsets(directoryCluster: directoryCluster)
+        var start = freeRunStart(slots: slots, needed: needed)
+        if start == nil, extendDirectory(directoryCluster: directoryCluster) {
+            slots = directorySlotOffsets(directoryCluster: directoryCluster)
+            start = freeRunStart(slots: slots, needed: needed)
+        }
+        guard let start else { throw FATError.directoryFull }
+        for (index, lfnEntry) in lfnEntries.enumerated() {
+            let offset = slots[start + index]
+            storage.data.replaceSubrange(offset..<(offset + 32), with: lfnEntry)
+        }
+        let offset = slots[start + lfnEntries.count]
+        let entry = make([UInt8](storage.data[offset..<(offset + 32)]))
+        storage.data.replaceSubrange(offset..<(offset + 32), with: entry)
     }
 
     /// ファイルを作成 / 置換する（ディレクトリはパス要素列、名前は最終要素）。
+    /// 新しいチェーンを先に割り当ててから旧チェーンを解放するため、
+    /// 途中で失敗しても既存ファイルは壊れない。SFN で表せない名前には
+    /// LFN エントリを付ける。
     func writeFile(directoryPath: [String], name: String, contents: [UInt8]) throws {
         var directoryCluster = isFAT32 ? rootCluster : 0
         if !directoryPath.isEmpty {
@@ -402,47 +551,60 @@ final class FATVolume {
             }
             directoryCluster = directory.firstCluster
         }
-        let shortName = Self.shortNameBytes(for: name)
-        // 既存エントリがあればチェーンを解放する
-        if let existing = findEntry(directoryCluster: directoryCluster, name: name), !existing.isDirectory {
-            freeChain(existing.firstCluster)
-        }
-        // クラスタチェーンを割り当てて内容を書く
+        let existing = findEntry(directoryCluster: directoryCluster, name: name).flatMap { $0.isDirectory ? nil : $0 }
+        // 既存ファイルはその SFN を引き継ぎ、新規は重ならない SFN を作る
+        let shortName = existing?.shortName ?? uniqueShortName(for: name, directoryCluster: directoryCluster)
+        // クラスタチェーンを割り当てて内容を書く（旧チェーンはまだ残す）
         var firstCluster = 0
-        if !contents.isEmpty {
-            let needed = (contents.count + clusterBytes - 1) / clusterBytes
-            var clusters: [Int] = []
-            for _ in 0..<needed {
-                guard let cluster = allocateCluster() else { throw FATError.diskFull }
-                clusters.append(cluster)
-                setFATEntry(cluster, eocValue) // 仮に終端を書いてから連結する
+        var allocated: [Int] = []
+        do {
+            if !contents.isEmpty {
+                let needed = (contents.count + clusterBytes - 1) / clusterBytes
+                for _ in 0..<needed {
+                    guard let cluster = allocateCluster() else { throw FATError.diskFull }
+                    allocated.append(cluster)
+                    setFATEntry(cluster, eocValue) // 仮に終端を書いてから連結する
+                }
+                for index in allocated.indices {
+                    let next = index + 1 < allocated.count ? allocated[index + 1] : eocValue
+                    setFATEntry(allocated[index], next)
+                    let offset = clusterOffset(allocated[index])
+                    guard offset + clusterBytes <= storage.data.count else { throw FATError.diskFull }
+                    let start = index * clusterBytes
+                    let chunk = contents[start..<min(start + clusterBytes, contents.count)]
+                    var padded = [UInt8](chunk)
+                    while padded.count < clusterBytes { padded.append(0) }
+                    storage.data.replaceSubrange(offset..<(offset + clusterBytes), with: padded)
+                }
+                firstCluster = allocated.first ?? 0
             }
-            for index in clusters.indices {
-                let next = index + 1 < clusters.count ? clusters[index + 1] : eocValue
-                setFATEntry(clusters[index], next)
-                let offset = clusterOffset(clusters[index])
-                let start = index * clusterBytes
-                let chunk = contents[start..<min(start + clusterBytes, contents.count)]
-                var padded = [UInt8](chunk)
-                while padded.count < clusterBytes { padded.append(0) }
-                guard offset + clusterBytes <= storage.data.count else { throw FATError.diskFull }
-                storage.data.replaceSubrange(offset..<(offset + clusterBytes), with: padded)
-            }
-            firstCluster = clusters.first ?? 0
+        } catch {
+            for cluster in allocated { setFATEntry(cluster, 0) }
+            throw error
         }
-        // ディレクトリエントリを書く
-        try writeDirectoryEntry(directoryCluster: directoryCluster, shortName: shortName) { _ in
-            var entry = [UInt8](repeating: 0, count: 32)
-            entry.replaceSubrange(0..<11, with: shortName)
-            entry[11] = 0x20 // アーカイブ
-            entry[26] = UInt8(firstCluster & 0xFF)
-            entry[27] = UInt8((firstCluster >> 8) & 0xFF)
-            if isFAT32 {
-                entry[20] = UInt8((firstCluster >> 16) & 0xFF)
-                entry[21] = UInt8((firstCluster >> 24) & 0xFF)
+        // ディレクトリエントリを書く（SFN で表せない名前には LFN を付ける）
+        let longName = Self.displayName(shortName: shortName) != name ? name : nil
+        do {
+            try writeDirectoryEntry(directoryCluster: directoryCluster, shortName: shortName, longName: longName) { _ in
+                var entry = [UInt8](repeating: 0, count: 32)
+                entry.replaceSubrange(0..<11, with: shortName)
+                entry[11] = 0x20 // アーカイブ
+                entry[26] = UInt8(firstCluster & 0xFF)
+                entry[27] = UInt8((firstCluster >> 8) & 0xFF)
+                if isFAT32 {
+                    entry[20] = UInt8((firstCluster >> 16) & 0xFF)
+                    entry[21] = UInt8((firstCluster >> 24) & 0xFF)
+                }
+                for i in 0..<4 { entry[28 + i] = UInt8((contents.count >> (8 * i)) & 0xFF) }
+                return entry
             }
-            for i in 0..<4 { entry[28 + i] = UInt8((contents.count >> (8 * i)) & 0xFF) }
-            return entry
+        } catch {
+            for cluster in allocated { setFATEntry(cluster, 0) }
+            throw error
+        }
+        // ここまで成功してから旧チェーンを解放する
+        if let existing {
+            freeChain(existing.firstCluster)
         }
     }
 
@@ -460,18 +622,13 @@ final class FATVolume {
         }
         if existing.isDirectory { throw FATError.isDirectory }
         freeChain(existing.firstCluster)
-        let shortName = existing.shortName
-        try writeDirectoryEntry(directoryCluster: directoryCluster, shortName: shortName) { entry in
-            var entry = entry
-            entry[0] = 0xE5
-            return entry
-        }
+        markEntryDeleted(directoryCluster: directoryCluster, shortName: existing.shortName)
     }
 
     /// 使用中バイト数の概算（空き容量計算用）。
     var usedBytes: Int {
         var used = 0
-        for cluster in 2..<(totalClusters + 2) where fatEntry(cluster) != 0 {
+        for cluster in 2..<(dataClusterCount + 2) where fatEntry(cluster) != 0 {
             used += clusterBytes
         }
         return dataStart + used

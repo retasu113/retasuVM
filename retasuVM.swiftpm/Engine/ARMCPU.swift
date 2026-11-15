@@ -42,6 +42,7 @@ final class ARMCPU {
 
     private var programCounter: UInt32 = 0
     private var inputQueue: [UInt8] = []
+    private let inputLock = NSLock()
     private var randomState: UInt32 = 0x2545F491
 
     var onChar: ((UInt8) -> Void)?
@@ -62,8 +63,10 @@ final class ARMCPU {
     }
 
     func provideInput(_ bytes: [UInt8]) {
+        inputLock.lock()
         inputQueue.append(contentsOf: bytes)
         if !bytes.isEmpty { waitingForInput = false }
+        inputLock.unlock()
     }
 
     func setRandomSeed(_ seed: UInt32) {
@@ -442,10 +445,13 @@ final class ARMCPU {
                 safety += 1
             }
         case 4: // getchar
+            inputLock.lock()
             if let byte = inputQueue.first {
                 inputQueue.removeFirst()
+                inputLock.unlock()
                 registers[0] = UInt32(byte)
             } else {
+                inputLock.unlock()
                 programCounter = instructionAddress
                 waitingForInput = true
             }

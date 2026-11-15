@@ -144,7 +144,7 @@ do_fib:
     mv s4, a0
     li t0, 0
     blt s4, t0, do_fib_usage
-    li t0, 60
+    li t0, 46
     bgt s4, t0, do_fib_usage
     li t0, 0
     li t1, 1
@@ -307,14 +307,14 @@ parse_int_pos:
     .data
 str_banner: .asciiz "========================================\\n  retasuOS 0.1.0 for retasuVM\\n  RISC-V RV32I virtual machine\\n========================================\\nType 'help' for commands.\\n"
 str_prompt: .asciiz "retasuOS> "
-str_help: .asciiz "Available commands:\\n  help        show this help\\n  echo <text> print text\\n  fib <n>     compute the n-th Fibonacci number (0-60)\\n  about       about retasuOS\\n  ver         show version\\n  clear       clear the console\\n  halt        power off\\n"
+str_help: .asciiz "Available commands:\\n  help        show this help\\n  echo <text> print text\\n  fib <n>     compute the n-th Fibonacci number (0-46)\\n  about       about retasuOS\\n  ver         show version\\n  clear       clear the console\\n  halt        power off\\n"
 str_about: .asciiz "retasuOS is a tiny guest OS running on the retasuVM RISC-V (RV32I) emulator. The CPU, the assembler and this OS all run inside the app.\\n"
 str_ver: .asciiz "retasuOS version 0.1.0 (RISC-V RV32I)\\n"
 str_unknown: .asciiz "Unknown command. Type 'help'.\\n"
 str_bye: .asciiz "retasuOS halted. Bye.\\n"
 str_fib_pre: .asciiz "fib("
 str_fib_mid: .asciiz ") = "
-str_fib_usage: .asciiz "Usage: fib <n>  (0 <= n <= 60)\\n"
+str_fib_usage: .asciiz "Usage: fib <n>  (0 <= n <= 46)\\n"
 cmd_help: .asciiz "help"
 cmd_echo: .asciiz "echo"
 cmd_fib: .asciiz "fib"

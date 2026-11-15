@@ -8,10 +8,14 @@ import Foundation
 /// サービス関数はスタブアドレスを CPU の preExecuteHook で横取りし、
 /// Swift 側でネイティブ実行する（ゲストコードは実行されない）。
 ///
-/// 提供するサービスはコンソール出力と基本的なブートサービスのみ。
-/// Block I/O やファイルシステム、変数サービスは未提供のため、
-/// Windows Boot Manager や GRUB のような本格的なブートローダは
-/// まだ起動できない（README / リリースノートに明記）。
+/// 提供するサービス: コンソール出力、ブートサービス一式
+/// （メモリ確保、プロトコル DB、LoadImage / StartImage / Exit、
+/// イベント / タイマ、GetMemoryMap 等）、Block I/O、Simple File
+/// System（FAT）、GOP（フレームバッファ）、変数サービス、
+/// ランタイムサービス（時刻・変数・リセット）。
+/// ただしドライバモデルや通知関数の呼び出しは簡略化しており、
+/// Windows Boot Manager や GRUB のような本格的なブートローダの
+/// 起動はまだ保証できない（README / リリースノートに明記）。
 enum X86UEFI {
     enum UEFIError: LocalizedError {
         case notUEFIApplication
@@ -50,12 +54,27 @@ enum X86UEFI {
     static let blockIOMediaAddress = 0x300980
     static let sfsAddress = 0x300A00
     static let devicePathAddress = 0x300A80
+    static let loadedImageAddress = 0x300B00
+    static let gopAddress = 0x300C00
+    static let gopModeAddress = 0x300C40
+    static let gopInfoAddress = 0x300C80
+    /// LoadImage で配置するイメージの領域（RAM 末尾 1 MiB）
+    static let loadRegionStart = 0xF00000
+    static let loadRegionEnd = 0x1000000
     static let protocolArenaStart = 0x305000
     static let protocolArenaEnd = 0x310000
     static let returnTrapAddress = 0x3FF000
     static let stackTop = 0x400000
     static let heapStart = 0x500000
     static let heapEnd = 0xF00000
+
+    /// UEFI 変数 1 件（永続化のためにセッションと受け渡す）。
+    struct Variable: Equatable {
+        var guid: [UInt8]
+        var name: String
+        var attributes: UInt32
+        var data: [UInt8]
+    }
 
     /// PE ヘッダだけを見て UEFI アプリケーションかどうかを判定する。
     static func isUEFIApplication(_ data: [UInt8]) -> Bool {
@@ -111,7 +130,7 @@ enum X86UEFI {
         }
         return PEInfo(
             machine: machine,
-            subsystem: read32(data, optional + 68),
+            subsystem: UInt32(read16(data, optional + 68)), // Subsystem は 2 バイト
             imageBase: read64(data, optional + 24),
             entryRVA: read32(data, optional + 16),
             sizeOfImage: read32(data, optional + 56),
@@ -124,7 +143,11 @@ enum X86UEFI {
     }
 
     /// UEFI アプリケーションを起動する。CPU はロングモードで開始する。
-    static func boot(cpu: X86CPU, imageData: [UInt8]) throws {
+    /// - initialVariables: 前回セッションから引き継ぐ変数（永続化用）。
+    /// - onVariablesChanged: 変数が変更されるたびに現在の全変数を渡す。
+    static func boot(cpu: X86CPU, imageData: [UInt8],
+                     initialVariables: [Variable] = [],
+                     onVariablesChanged: (([Variable]) -> Void)? = nil) throws {
         guard let info = parsePE(imageData) else { throw UEFIError.notUEFIApplication }
         guard info.machine == 0x8664 else { throw UEFIError.unsupportedMachine(info.machine) }
         let imageBase = Int(info.imageBase)
@@ -132,7 +155,10 @@ enum X86UEFI {
             throw UEFIError.imageTooLarge
         }
 
-        let firmware = Firmware(cpu: cpu, imageBase: info.imageBase, sizeOfImage: Int(info.sizeOfImage))
+        let firmware = Firmware(cpu: cpu, imageBase: info.imageBase,
+                                sizeOfImage: Int(info.sizeOfImage),
+                                initialVariables: initialVariables,
+                                onVariablesChanged: onVariablesChanged)
 
         // ヘッダとセクションを配置
         var image = [UInt8](repeating: 0, count: Int(info.sizeOfImage))
@@ -152,7 +178,7 @@ enum X86UEFI {
                                   with: imageData[rawPointer..<(rawPointer + copyCount)])
         }
         cpu.loadData(image, at: imageBase)
-        // イメージは常に ImageBase へ配置するため再配置は不要
+        // 起動イメージは常に ImageBase へ配置するため再配置は不要
 
         firmware.installStructures()
         // Firmware はフックのクロージャが強参照で保持する
@@ -179,6 +205,56 @@ enum X86UEFI {
         )
     }
 
+    /// PE イメージを `base` へ配置する（ヘッダ + セクション）。
+    /// ImageBase と異なる場所へ置く場合は DIR64 再配置を適用する。
+    /// 再配置情報が無くベースが異なる場合は false を返す。
+    private static func stageImage(cpu: X86CPU, data: [UInt8], info: PEInfo, base: Int) -> Bool {
+        var image = [UInt8](repeating: 0, count: Int(info.sizeOfImage))
+        let headerCount = min(Int(info.sizeOfHeaders), data.count, image.count)
+        image.replaceSubrange(0..<headerCount, with: data[0..<headerCount])
+        for index in 0..<info.sectionCount {
+            let section = info.sectionTableOffset + index * 40
+            guard section + 40 <= data.count else { break }
+            let virtualSize = Int(read32(data, section + 8))
+            let virtualAddress = Int(read32(data, section + 12))
+            let rawSize = Int(read32(data, section + 16))
+            let rawPointer = Int(read32(data, section + 20))
+            let wanted = min(rawSize, virtualSize == 0 ? rawSize : virtualSize)
+            let copyCount = min(wanted, image.count - virtualAddress, data.count - rawPointer)
+            guard copyCount > 0 else { continue }
+            image.replaceSubrange(virtualAddress..<(virtualAddress + copyCount),
+                                  with: data[rawPointer..<(rawPointer + copyCount)])
+        }
+        let delta = Int64(base) - Int64(info.imageBase)
+        if delta != 0 {
+            guard info.relocationSize >= 8 else { return false }
+            var offset = Int(info.relocationRVA)
+            let end = offset + Int(info.relocationSize)
+            while offset + 8 <= end, offset + 8 <= image.count {
+                let pageRVA = Int(read32(image, offset))
+                let blockSize = Int(read32(image, offset + 4))
+                guard blockSize >= 8, offset + blockSize <= image.count else { break }
+                var entryOffset = offset + 8
+                while entryOffset + 2 <= offset + blockSize {
+                    let entry = read16(image, entryOffset)
+                    if entry >> 12 == 10 { // IMAGE_REL_BASED_DIR64
+                        let target = pageRVA + Int(entry & 0xFFF)
+                        guard target + 8 <= image.count else { return false }
+                        let value = read64(image, target)
+                        let adjusted = UInt64(bitPattern: Int64(bitPattern: value) + delta)
+                        for i in 0..<8 {
+                            image[target + i] = UInt8((adjusted >> (8 * i)) & 0xFF)
+                        }
+                    }
+                    entryOffset += 2
+                }
+                offset += blockSize
+            }
+        }
+        cpu.loadData(image, at: base)
+        return true
+    }
+
     // MARK: - ファームウェア本体
 
     /// サービスの識別子（スタブの並び順）。
@@ -199,6 +275,18 @@ enum X86UEFI {
              fileSetPosition, fileGetInfo, fileSetInfo, fileFlush
         case unsupported = 63
         case rsGetVariable = 70, rsGetNextVariableName, rsSetVariable, rsQueryVariableInfo
+        case bsCreateEvent = 80, bsSetTimer, bsWaitForEvent, bsSignalEvent, bsCloseEvent,
+             bsCheckEvent, bsLoadImage, bsStartImage, bsExit, bsUnloadImage,
+             bsLocateHandle, bsLocateDevicePath, bsReinstallProtocolInterface,
+             bsInstallMultipleProtocolInterfaces, bsUninstallMultipleProtocolInterfaces,
+             bsOpenProtocolInformation, bsConnectController, bsDisconnectController,
+             bsRegisterProtocolNotify, bsCreateEventEx
+        case gopQueryMode = 100, gopSetMode, gopBlt
+        case rsGetTime = 110, rsSetTime, rsGetWakeupTime, rsSetWakeupTime,
+             rsSetVirtualAddressMap, rsConvertPointer, rsGetNextHighMonotonicCount,
+             rsUpdateCapsule, rsQueryCapsuleCapabilities
+        /// StartImage で起動したイメージの戻り先（どの表にも載せない内部用）
+        case imageReturnTrap = 120
     }
 
     private final class Firmware {
@@ -219,7 +307,20 @@ enum X86UEFI {
         private var fatVolume: FATVolume?
         private var fileObjects: [UInt64: FileObject] = [:]
         // UEFI 変数（挿入順を保持）
-        private var variables: [(guid: [UInt8], name: String, attributes: UInt32, data: [UInt8])] = []
+        private var variables: [X86UEFI.Variable]
+        private let onVariablesChanged: (([X86UEFI.Variable]) -> Void)?
+        // イベント / タイマ
+        private var events: [UInt64: EventObject] = [:]
+        // LoadImage で読み込んだイメージ
+        private var loadedImages: [UInt64: LoadedImageInfo] = [:]
+        private var nextImageAddress = X86UEFI.loadRegionStart
+        // StartImage の呼び出しフレーム（戻り先の復元用）
+        private var imageCallStack: [ImageCallFrame] = []
+        // GOP フレームバッファ
+        private var framebufferBase = 0
+        private let framebufferWidth = 640
+        private let framebufferHeight = 400
+        private var highMonotonicCount: UInt64 = 0
         // 構成テーブル（初期値は ACPI 2.0 → RSDP）
         private var configEntries: [(guid: [UInt8], table: UInt64)] = [
             ([0x71, 0xE8, 0x68, 0x88, 0xF1, 0xE4, 0xD3, 0x11,
@@ -234,7 +335,39 @@ enum X86UEFI {
         private let guidFileInfo: [UInt8] = [0x92, 0x6E, 0x57, 0x09, 0x3F, 0x6D, 0xD2, 0x11, 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
         private let guidFileSystemInfo: [UInt8] = [0x93, 0x6E, 0x57, 0x09, 0x3F, 0x6D, 0xD2, 0x11, 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
         private let guidVolumeLabel: [UInt8] = [0xD3, 0xD7, 0x47, 0xDB, 0x81, 0xFE, 0xD3, 0x11, 0x86, 0xA1, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
+        private let guidLoadedImage: [UInt8] = [0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
+        private let guidGOP: [UInt8] = [0xDE, 0xA9, 0x42, 0x90, 0xDC, 0x23, 0x38, 0x4A, 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A]
         private let deviceError: UInt64 = 0x8000000000000007
+
+        /// EFI_EVENT の Swift 側の状態。
+        private final class EventObject {
+            var type: UInt32 = 0
+            var notifyFunction: UInt64 = 0
+            var notifyContext: UInt64 = 0
+            var signaled = false
+            /// タイマ種別（0 = 停止、1 = 周期、2 = 相対）
+            var timerType: UInt64 = 0
+            var timerPeriod100ns: UInt64 = 0
+            var timerDue: Date?
+        }
+
+        /// LoadImage で配置したイメージの情報。
+        private struct LoadedImageInfo {
+            var base: UInt64
+            var size: Int
+            var entry: UInt64
+            var parentHandle: UInt64
+            var loadedImageStruct: UInt64
+        }
+
+        /// StartImage 実行中の呼び出しフレーム。
+        private struct ImageCallFrame {
+            var handle: UInt64
+            var savedRegisters: [UInt64]
+            var savedStackPointer: UInt64
+            var exitDataSizeAddress: UInt64
+            var exitDataAddress: UInt64
+        }
 
         /// EFI_FILE_PROTOCOL の Swift 側の状態。
         private final class FileObject {
@@ -254,13 +387,18 @@ enum X86UEFI {
         private let invalidParameter: UInt64 = 0x8000000000000002
         private let unsupportedStatus: UInt64 = 0x8000000000000003
         private let bufferTooSmall: UInt64 = 0x8000000000000005
+        private let notReady: UInt64 = 0x8000000000000006
         private let outOfResources: UInt64 = 0x8000000000000009
         private let notFound: UInt64 = 0x800000000000000E
 
-        init(cpu: X86CPU, imageBase: UInt64, sizeOfImage: Int) {
+        init(cpu: X86CPU, imageBase: UInt64, sizeOfImage: Int,
+             initialVariables: [X86UEFI.Variable],
+             onVariablesChanged: (([X86UEFI.Variable]) -> Void)?) {
             self.cpu = cpu
             self.imageBase = imageBase
             self.sizeOfImage = sizeOfImage
+            self.variables = initialVariables
+            self.onVariablesChanged = onVariablesChanged
         }
 
         // MARK: メモリアクセス（アイデンティティマップ前提）
@@ -280,6 +418,10 @@ enum X86UEFI {
         // MARK: 構造体の配置
 
         func installStructures() {
+            // GOP フレームバッファをヒープ先頭に予約する
+            let framebufferSize = framebufferWidth * framebufferHeight * 4
+            framebufferBase = heapPointer
+            heapPointer += (framebufferSize + 4095) & ~4095
             installPageTablesAndGDT()
             installIDT()
             installSystemTable()
@@ -385,6 +527,20 @@ enum X86UEFI {
             put64(&services, 56, stubAddress(.bsGetMemoryMap))
             put64(&services, 64, stubAddress(.bsAllocatePool))
             put64(&services, 72, stubAddress(.bsFreePool))
+            put64(&services, 80, stubAddress(.bsCreateEvent))
+            put64(&services, 88, stubAddress(.bsSetTimer))
+            put64(&services, 96, stubAddress(.bsWaitForEvent))
+            put64(&services, 104, stubAddress(.bsSignalEvent))
+            put64(&services, 112, stubAddress(.bsCloseEvent))
+            put64(&services, 120, stubAddress(.bsCheckEvent))
+            put64(&services, 136, stubAddress(.bsReinstallProtocolInterface))
+            put64(&services, 168, stubAddress(.bsRegisterProtocolNotify))
+            put64(&services, 176, stubAddress(.bsLocateHandle))
+            put64(&services, 184, stubAddress(.bsLocateDevicePath))
+            put64(&services, 200, stubAddress(.bsLoadImage))
+            put64(&services, 208, stubAddress(.bsStartImage))
+            put64(&services, 216, stubAddress(.bsExit))
+            put64(&services, 224, stubAddress(.bsUnloadImage))
             put64(&services, 232, stubAddress(.bsExitBootServices))
             put64(&services, 240, stubAddress(.bsGetNextMonotonicCount))
             put64(&services, 248, stubAddress(.bsStall))
@@ -398,7 +554,13 @@ enum X86UEFI {
             put64(&services, 304, stubAddress(.bsProtocolsPerHandle))
             put64(&services, 312, stubAddress(.bsLocateHandleBuffer))
             put64(&services, 320, stubAddress(.bsLocateProtocol))
+            put64(&services, 264, stubAddress(.bsConnectController))
+            put64(&services, 272, stubAddress(.bsDisconnectController))
+            put64(&services, 296, stubAddress(.bsOpenProtocolInformation))
+            put64(&services, 328, stubAddress(.bsInstallMultipleProtocolInterfaces))
+            put64(&services, 336, stubAddress(.bsUninstallMultipleProtocolInterfaces))
             put64(&services, 344, stubAddress(.bsCalculateCrc32))
+            put64(&services, 368, stubAddress(.bsCreateEventEx))
             put64(&services, 352, stubAddress(.bsCopyMem))
             put64(&services, 360, stubAddress(.bsSetMem))
             let crc = X86UEFI.crc32(services)
@@ -415,10 +577,19 @@ enum X86UEFI {
             for offset in stride(from: 24, to: 136, by: 8) {
                 put64(&services, offset, generic)
             }
+            put64(&services, 24, stubAddress(.rsGetTime))
+            put64(&services, 32, stubAddress(.rsSetTime))
+            put64(&services, 40, stubAddress(.rsGetWakeupTime))
+            put64(&services, 48, stubAddress(.rsSetWakeupTime))
+            put64(&services, 56, stubAddress(.rsSetVirtualAddressMap))
+            put64(&services, 64, stubAddress(.rsConvertPointer))
             put64(&services, 72, stubAddress(.rsGetVariable))
             put64(&services, 80, stubAddress(.rsGetNextVariableName))
             put64(&services, 88, stubAddress(.rsSetVariable))
             put64(&services, 104, stubAddress(.rsResetSystem)) // ResetSystem
+            put64(&services, 96, stubAddress(.rsGetNextHighMonotonicCount))
+            put64(&services, 112, stubAddress(.rsUpdateCapsule))
+            put64(&services, 120, stubAddress(.rsQueryCapsuleCapabilities))
             put64(&services, 128, stubAddress(.rsQueryVariableInfo))
             let crc = X86UEFI.crc32(services)
             put32(&services, 16, crc)
@@ -433,18 +604,118 @@ enum X86UEFI {
             guard address >= base, address < base + 0x2000 else { return false }
             let index = Int((address - base) / 16)
             guard let service = Service(rawValue: index) else { return false }
+            // 制御を移すサービスは通常の「戻り」処理をしない
+            if service == .bsStartImage { return startImageCall() }
+            if service == .bsExit { return exitImageCall() }
+            if service == .imageReturnTrap {
+                return finishImageCall(exitStatus: cpu.register64(0))
+            }
             let result = perform(service)
             if service == .rsResetSystem { return true } // 停止済み
-            // 戻りアドレスをポップして RIP を戻す
+            return returnToCaller(status: result)
+        }
+
+        /// 呼び出し側へ戻る共通処理（戻りアドレスをポップし RAX に結果を入れる）。
+        private func returnToCaller(status: UInt64) -> Bool {
             let stackPointer = cpu.register64(4)
             let returnAddress = read(stackPointer, size: 8)
             cpu.setRegister64(4, stackPointer + 8)
             cpu.redirectExecution(to: returnAddress)
-            cpu.setRegister64(0, result)
+            cpu.setRegister64(0, status)
             return true
         }
 
+        /// StartImage: レジスタを保存し、子イメージのエントリへ制御を移す。
+        /// 子が RET すると戻りトラップ（imageReturnTrap）が復元する。
+        private func startImageCall() -> Bool {
+            let handle = cpu.register64(1)
+            guard let info = loadedImages[handle] else {
+                return returnToCaller(status: invalidParameter)
+            }
+            let stackSize = 0x10000
+            guard heapPointer + stackSize <= X86UEFI.heapEnd else {
+                return returnToCaller(status: outOfResources)
+            }
+            let frame = ImageCallFrame(
+                handle: handle,
+                savedRegisters: (0..<16).map { cpu.register64($0) },
+                savedStackPointer: cpu.register64(4),
+                exitDataSizeAddress: cpu.register64(2),
+                exitDataAddress: cpu.register64(8))
+            imageCallStack.append(frame)
+            let childStackTop = heapPointer + stackSize
+            heapPointer += stackSize
+            write(UInt64(childStackTop - 8), stubAddress(.imageReturnTrap), size: 8)
+            cpu.setRegister64(4, UInt64(childStackTop - 8))
+            cpu.setRegister64(1, handle) // ImageHandle
+            cpu.setRegister64(2, UInt64(X86UEFI.systemTableAddress)) // SystemTable
+            cpu.redirectExecution(to: info.entry)
+            return true
+        }
+
+        /// Exit: 対応する StartImage フレームまで巻き戻す。
+        /// 起動イメージの Exit は CPU 停止として扱う。
+        private func exitImageCall() -> Bool {
+            let handle = cpu.register64(1)
+            let exitStatus = cpu.register64(2)
+            if let index = imageCallStack.lastIndex(where: { $0.handle == handle }) {
+                while imageCallStack.count > index + 1 { imageCallStack.removeLast() }
+                return finishImageCall(exitStatus: exitStatus)
+            }
+            if handle == imageBase {
+                cpu.halt(exitCode: Int32(exitStatus & 0xFFFF_FFFF))
+                return true
+            }
+            return returnToCaller(status: invalidParameter)
+        }
+
+        /// 子イメージから戻ってきたときの復元処理。
+        private func finishImageCall(exitStatus: UInt64) -> Bool {
+            guard let frame = imageCallStack.popLast() else {
+                cpu.halt(exitCode: Int32(exitStatus & 0xFFFF_FFFF))
+                return true
+            }
+            if frame.exitDataSizeAddress != 0 { write(frame.exitDataSizeAddress, 0, size: 8) }
+            if frame.exitDataAddress != 0 { write(frame.exitDataAddress, 0, size: 8) }
+            for index in 0..<16 where index != 0 && index != 4 {
+                cpu.setRegister64(index, frame.savedRegisters[index])
+            }
+            cpu.setRegister64(4, frame.savedStackPointer)
+            return returnToCaller(status: exitStatus)
+        }
+
+        /// ブートサービス（ExitBootServices 後に無効化する対象）かどうか。
+        private func isBootService(_ service: Service) -> Bool {
+            switch service {
+            case .bsRaiseTPL, .bsRestoreTPL, .bsAllocatePages, .bsFreePages,
+                 .bsGetMemoryMap, .bsAllocatePool, .bsFreePool, .bsExitBootServices,
+                 .bsStall, .bsSetWatchdogTimer, .bsCopyMem, .bsSetMem,
+                 .bsCalculateCrc32, .bsLocateProtocol, .bsGetNextMonotonicCount,
+                 .bsInstallProtocolInterface, .bsUninstallProtocolInterface,
+                 .bsHandleProtocol, .bsOpenProtocol, .bsCloseProtocol,
+                 .bsProtocolsPerHandle, .bsLocateHandleBuffer,
+                 .bsInstallConfigurationTable, .bsCreateEvent, .bsSetTimer,
+                 .bsWaitForEvent, .bsSignalEvent, .bsCloseEvent, .bsCheckEvent,
+                 .bsLoadImage, .bsUnloadImage, .bsLocateHandle, .bsLocateDevicePath,
+                 .bsReinstallProtocolInterface,
+                 .bsInstallMultipleProtocolInterfaces,
+                 .bsUninstallMultipleProtocolInterfaces,
+                 .bsOpenProtocolInformation, .bsConnectController,
+                 .bsDisconnectController, .bsRegisterProtocolNotify, .bsCreateEventEx,
+                 .bioReset, .bioReadBlocks, .bioWriteBlocks, .bioFlushBlocks,
+                 .sfsOpenVolume, .fileOpen, .fileClose, .fileDelete, .fileRead,
+                 .fileWrite, .fileGetPosition, .fileSetPosition, .fileGetInfo,
+                 .fileSetInfo, .fileFlush:
+                return true
+            default:
+                return false
+            }
+        }
+
         private func perform(_ service: Service) -> UInt64 {
+            // ExitBootServices の後はブートサービスを無効化する
+            // （ランタイムサービスとコンソール / GOP は使い続けられる）
+            if exitedBootServices, isBootService(service) { return notReady }
             let rcx = cpu.register64(1)
             let rdx = cpu.register64(2)
             let r8 = cpu.register64(8)
@@ -473,7 +744,14 @@ enum X86UEFI {
             // BootServices
             case .bsRaiseTPL:
                 return 0
-            case .bsRestoreTPL, .bsFreePages, .bsFreePool, .bsStall, .bsSetWatchdogTimer:
+            case .bsRestoreTPL, .bsFreePages, .bsFreePool, .bsSetWatchdogTimer:
+                return success
+            case .bsStall:
+                // RCX = Microseconds。実際に待つ（1 回あたり最大 1 秒）。
+                let microseconds = min(rcx, 1_000_000)
+                if microseconds > 0 {
+                    Thread.sleep(forTimeInterval: Double(microseconds) / 1_000_000)
+                }
                 return success
             case .bsAllocatePages:
                 // RCX=Type, RDX=MemoryType, R8=Pages, R9=*Memory
@@ -489,8 +767,9 @@ enum X86UEFI {
                 exitedBootServices = true
                 return success
             case .bsGetNextMonotonicCount:
+                // 引数は RCX = OUT UINT64 *Count
                 monotonicCount += 1
-                write(rdx, monotonicCount, size: 8)
+                write(rcx, monotonicCount, size: 8)
                 return success
             case .bsCopyMem:
                 copyMemory(destination: rcx, source: rdx, length: r8)
@@ -512,8 +791,13 @@ enum X86UEFI {
                 return installProtocolInterface(handlePointer: rcx, guidAddress: rdx, interface: r9)
             case .bsUninstallProtocolInterface:
                 let guid = readGUID(rdx)
-                guard protocolDB[rcx]?[guid] == r8 else { return notFound }
+                guard let installed = protocolDB[rcx]?[guid] else { return notFound }
+                guard installed == r8 else { return invalidParameter }
                 protocolDB[rcx]?[guid] = nil
+                if protocolDB[rcx]?.isEmpty == true {
+                    protocolDB[rcx] = nil
+                    handleOrder.removeAll { $0 == rcx }
+                }
                 return success
             case .bsHandleProtocol, .bsOpenProtocol:
                 return queryProtocol(handle: rcx, guidAddress: rdx, outAddress: r8)
@@ -532,11 +816,17 @@ enum X86UEFI {
                 return success
             case .bsLocateHandleBuffer:
                 // RCX=SearchType, RDX=*GUID, R8=SearchKey, R9=*Count, 引数5=**Buffer
+                guard rcx == 0 || rcx == 2 else {
+                    // ByRegisterNotify(1) は登録機構が無いため一致なし。
+                    // 未知の種別も含め、ここでは見つからなかったとして扱う。
+                    return rcx == 1 ? notFound : invalidParameter
+                }
                 var handles = handleOrder
                 if rcx == 2 {
                     let guid = readGUID(rdx)
                     handles = handles.filter { protocolDB[$0]?[guid] != nil }
                 }
+                guard !handles.isEmpty else { return notFound }
                 let buffer = arenaAlloc(max(8, handles.count * 8))
                 guard buffer != 0 else { return outOfResources }
                 for (index, handle) in handles.enumerated() {
@@ -564,11 +854,12 @@ enum X86UEFI {
             case .fileOpen:
                 return fileOpen(this: rcx, outAddress: rdx, nameAddress: r8, mode: r9)
             case .fileClose:
+                var status = success
                 if let object = fileObjects[rcx] {
-                    commitFile(object)
+                    status = commitFile(object)
                     fileObjects[rcx] = nil
                 }
-                return success
+                return status
             case .fileDelete:
                 guard let object = fileObjects[rcx], let volume = fatVolume,
                       let entry = object.entry else { return invalidParameter }
@@ -597,7 +888,7 @@ enum X86UEFI {
             case .fileSetInfo:
                 return success
             case .fileFlush:
-                if let object = fileObjects[rcx] { commitFile(object) }
+                if let object = fileObjects[rcx] { return commitFile(object) }
                 return success
             // 変数サービス
             case .rsGetVariable:
@@ -613,6 +904,100 @@ enum X86UEFI {
                 write(r8, 1024 * 1024, size: 8)
                 write(r9, 64 * 1024, size: 8)
                 return success
+            // イベント / タイマ
+            case .bsCreateEvent:
+                return createEvent(type: UInt32(rcx & 0xFFFFFFFF),
+                                   notifyFunction: r8, notifyContext: r9,
+                                   eventAddress: stackArgument(5))
+            case .bsCreateEventEx:
+                // 引数 5 は EventGroup GUID（無視）、引数 6 が *Event
+                return createEvent(type: UInt32(rcx & 0xFFFFFFFF),
+                                   notifyFunction: r8, notifyContext: r9,
+                                   eventAddress: stackArgument(6))
+            case .bsSetTimer:
+                return setTimer(event: rcx, type: rdx, triggerTime: r8)
+            case .bsSignalEvent:
+                guard let event = events[rcx] else { return invalidParameter }
+                event.signaled = true
+                return success
+            case .bsCloseEvent:
+                guard events.removeValue(forKey: rcx) != nil else { return invalidParameter }
+                return success
+            case .bsCheckEvent:
+                guard events[rcx] != nil else { return invalidParameter }
+                return checkEvent(rcx) ? success : notReady
+            case .bsWaitForEvent:
+                return waitForEvent(count: rcx, arrayAddress: rdx, indexAddress: r8)
+            // イメージ読み込み
+            case .bsLoadImage:
+                // RCX=BootPolicy, RDX=ParentHandle, R8=DevicePath,
+                // R9=SourceBuffer, 引数5=SourceSize, 引数6=*ImageHandle
+                return loadImage(parentHandle: rdx, sourceBuffer: r9,
+                                 sourceSize: stackArgument(5),
+                                 handleAddress: stackArgument(6))
+            case .bsUnloadImage:
+                return unloadImage(handle: rcx)
+            case .bsStartImage, .bsExit, .imageReturnTrap:
+                return unsupportedStatus // handleStub で処理される（到達しない）
+            // ハンドル検索 / プロトコル操作の残り
+            case .bsLocateHandle:
+                return locateHandle(searchType: rcx, guidAddress: rdx,
+                                    sizeAddress: r9, bufferAddress: stackArgument(5))
+            case .bsLocateDevicePath:
+                return locateDevicePath(guidAddress: rcx, pathAddress: rdx,
+                                        handleAddress: r8)
+            case .bsReinstallProtocolInterface:
+                return reinstallProtocolInterface(handle: rcx, guidAddress: rdx,
+                                                  oldInterface: r8, newInterface: r9)
+            case .bsInstallMultipleProtocolInterfaces:
+                return multipleProtocolInterfaces(firstValue: rcx, install: true)
+            case .bsUninstallMultipleProtocolInterfaces:
+                return multipleProtocolInterfaces(firstValue: rcx, install: false)
+            case .bsOpenProtocolInformation:
+                return openProtocolInformation(handle: rcx, guidAddress: rdx,
+                                               entriesAddress: r8, countAddress: r9)
+            case .bsConnectController, .bsDisconnectController:
+                return success // ドライバモデルは無いため即成功
+            case .bsRegisterProtocolNotify:
+                // 通知は発火しないが、登録トークンは返す
+                let token = arenaAlloc(8)
+                guard token != 0 else { return outOfResources }
+                write(r8, token, size: 8)
+                return success
+            // GOP
+            case .gopQueryMode:
+                return gopQueryMode(modeNumber: rdx, sizeAddress: r8, infoAddress: r9)
+            case .gopSetMode:
+                return gopSetMode(modeNumber: rdx)
+            case .gopBlt:
+                return gopBlt(buffer: rdx, operation: r8, sourceX: r9,
+                              sourceY: stackArgument(5),
+                              destinationX: stackArgument(6),
+                              destinationY: stackArgument(7),
+                              width: stackArgument(8), height: stackArgument(9),
+                              delta: stackArgument(10))
+            // ランタイムサービス（時刻・変換など）
+            case .rsGetTime:
+                return getTime(timeAddress: rcx, capabilitiesAddress: rdx)
+            case .rsSetTime:
+                return rcx == 0 ? invalidParameter : success // ホスト時計は変えない
+            case .rsGetWakeupTime:
+                if rcx != 0 { write(rcx, 0, size: 1) } // Enabled = FALSE
+                if rdx != 0 { write(rdx, 0, size: 1) } // Pending = FALSE
+                if r8 != 0 { writeBytes(r8, [UInt8](repeating: 0, count: 16)) }
+                return success
+            case .rsSetWakeupTime:
+                return success
+            case .rsSetVirtualAddressMap:
+                return success // アイデンティティマップのまま受理する
+            case .rsConvertPointer:
+                return success // ポインタは変換不要（同一アドレス）
+            case .rsGetNextHighMonotonicCount:
+                highMonotonicCount += 1
+                write(rcx, highMonotonicCount << 32, size: 8)
+                return success
+            case .rsUpdateCapsule, .rsQueryCapsuleCapabilities:
+                return unsupportedStatus
             case .rsResetSystem:
                 cpu.halt(exitCode: 0)
                 return success
@@ -679,8 +1064,6 @@ enum X86UEFI {
             let descriptorSize = 40
             let required = regions.count * descriptorSize
             let provided = Int(read(sizeAddress, size: 8))
-            mapKey += 1
-            write(keyAddress, mapKey, size: 8)
             write(descriptorSizeAddress, UInt64(descriptorSize), size: 8)
             // 5 番目の引数（DescriptorVersion へのポインタ）はスタック上
             let stackPointer = cpu.register64(4)
@@ -690,6 +1073,8 @@ enum X86UEFI {
                 write(sizeAddress, UInt64(required), size: 8)
                 return bufferTooSmall
             }
+            mapKey += 1
+            write(keyAddress, mapKey, size: 8)
             for (index, region) in regions.enumerated() {
                 let base = mapAddress + UInt64(index * descriptorSize)
                 write(base, UInt64(region.type), size: 4)
@@ -745,19 +1130,15 @@ enum X86UEFI {
         }
 
         private func readString16(_ address: UInt64) -> String {
-            var result = ""
+            var units: [UInt16] = []
             var pointer = address
             for _ in 0..<512 {
                 let unit = read(pointer, size: 2)
                 if unit == 0 { break }
-                if unit < 0x80 {
-                    result.append(Character(UnicodeScalar(UInt8(unit))))
-                } else {
-                    result.append("?")
-                }
+                units.append(UInt16(unit & 0xFFFF))
                 pointer += 2
             }
-            return result
+            return String(decoding: units, as: UTF16.self)
         }
 
         private func writeString16(_ address: UInt64, _ string: String) {
@@ -854,8 +1235,12 @@ enum X86UEFI {
 
         /// コンソール / ディスクのハンドルとプロトコルを登録する。
         private func installProtocols() {
-            // イメージハンドル（プロトコルなし）とコンソールハンドル
+            // イメージハンドルとコンソールハンドル
             registerHandle(imageBase)
+            installLoadedImage(handle: imageBase, parentHandle: 0,
+                               imageAddress: imageBase, imageSize: sizeOfImage,
+                               structAddress: UInt64(X86UEFI.loadedImageAddress))
+            installGOP()
             installProtocol(handle: UInt64(X86UEFI.consoleHandleAddress),
                             guid: guidConOut, interface: UInt64(X86UEFI.conOutAddress))
 
@@ -905,6 +1290,57 @@ enum X86UEFI {
             }
         }
 
+        /// EFI_LOADED_IMAGE_PROTOCOL を構築してハンドルへ登録する。
+        private func installLoadedImage(handle: UInt64, parentHandle: UInt64,
+                                        imageAddress: UInt64, imageSize: Int,
+                                        structAddress: UInt64) {
+            var loaded = [UInt8](repeating: 0, count: 104)
+            put32(&loaded, 0, 0x00001000) // Revision
+            put64(&loaded, 8, parentHandle)
+            put64(&loaded, 16, UInt64(X86UEFI.systemTableAddress))
+            put64(&loaded, 24, UInt64(X86UEFI.diskHandleAddress)) // DeviceHandle
+            put64(&loaded, 32, UInt64(X86UEFI.devicePathAddress)) // FilePath
+            put64(&loaded, 64, imageAddress) // ImageBase
+            put64(&loaded, 72, UInt64(imageSize)) // ImageSize
+            put64(&loaded, 80, 2) // ImageCodeType = LoaderCode
+            put64(&loaded, 88, 2) // ImageDataType = LoaderData
+            put64(&loaded, 96, stubAddress(.unsupported)) // Unload
+            cpu.loadData(loaded, at: Int(structAddress))
+            installProtocol(handle: handle, guid: guidLoadedImage, interface: structAddress)
+        }
+
+        /// GOP（Graphics Output Protocol）を構築してコンソールハンドルへ登録する。
+        private func installGOP() {
+            var info = [UInt8](repeating: 0, count: 36)
+            put32(&info, 4, UInt32(framebufferWidth))
+            put32(&info, 8, UInt32(framebufferHeight))
+            put32(&info, 12, 1) // PixelBlueGreenRedReserved8BitPerColor
+            put32(&info, 16, 0x00FF0000) // RedMask
+            put32(&info, 20, 0x0000FF00) // GreenMask
+            put32(&info, 24, 0x000000FF) // BlueMask
+            put32(&info, 28, 0xFF000000) // ReservedMask
+            put32(&info, 32, UInt32(framebufferWidth)) // PixelsPerScanLine
+            cpu.loadData(info, at: X86UEFI.gopInfoAddress)
+            let framebufferSize = framebufferWidth * framebufferHeight * 4
+            var mode = [UInt8](repeating: 0, count: 40)
+            put32(&mode, 0, 1) // MaxMode（モード 0 のみ）
+            put32(&mode, 4, 0) // Mode
+            put64(&mode, 8, UInt64(X86UEFI.gopInfoAddress))
+            put64(&mode, 16, 36) // SizeOfInfo
+            put64(&mode, 24, UInt64(framebufferBase))
+            put64(&mode, 32, UInt64(framebufferSize))
+            cpu.loadData(mode, at: X86UEFI.gopModeAddress)
+            // GOP 構造体は Revision を持たず QueryMode から始まる
+            var gop = [UInt8](repeating: 0, count: 32)
+            put64(&gop, 0, stubAddress(.gopQueryMode))
+            put64(&gop, 8, stubAddress(.gopSetMode))
+            put64(&gop, 16, stubAddress(.gopBlt))
+            put64(&gop, 24, UInt64(X86UEFI.gopModeAddress)) // Mode
+            cpu.loadData(gop, at: X86UEFI.gopAddress)
+            installProtocol(handle: UInt64(X86UEFI.consoleHandleAddress),
+                            guid: guidGOP, interface: UInt64(X86UEFI.gopAddress))
+        }
+
         /// 接続済みディスクへ書き戻す（Block I/O / FAT の変更を共有する）。
         private func syncDisk() {
             if let attached = cpu.attachedDisk, let storage = diskStorage {
@@ -917,9 +1353,14 @@ enum X86UEFI {
         private func blockIOTransfer(isRead: Bool, lba: UInt64, size: UInt64, buffer: UInt64) -> UInt64 {
             guard let storage = diskStorage else { return deviceError }
             guard size % 512 == 0 else { return invalidParameter }
-            let start = Int(lba) * 512
+            // 範囲検査は UInt64 のまま行う（Int へ変換してからだと
+            // 巨大な LBA でトラップ／溢れが起きる）
+            let (start64, multiplyOverflow) = lba.multipliedReportingOverflow(by: 512)
+            guard !multiplyOverflow else { return deviceError }
+            let total = UInt64(storage.data.count)
+            guard start64 <= total, size <= total - start64 else { return deviceError }
+            let start = Int(start64)
             let count = Int(size)
-            guard start >= 0, start + count <= storage.data.count else { return deviceError }
             if isRead {
                 writeBytes(buffer, [UInt8](storage.data[start..<(start + count)]))
             } else {
@@ -1078,15 +1519,21 @@ enum X86UEFI {
             return success
         }
 
-        private func commitFile(_ object: FileObject) {
-            guard let volume = fatVolume, let contents = object.writeContents else { return }
+        @discardableResult
+        private func commitFile(_ object: FileObject) -> UInt64 {
+            guard let volume = fatVolume, let contents = object.writeContents else { return success }
             let name = object.createName ?? object.entry?.name
-            guard let name else { return }
-            try? volume.writeFile(directoryPath: object.path, name: name, contents: contents)
+            guard let name else { return invalidParameter }
+            do {
+                try volume.writeFile(directoryPath: object.path, name: name, contents: contents)
+            } catch {
+                return deviceError
+            }
             object.writeContents = nil
             object.createName = nil
             object.entry = volume.resolve(path: object.path + [name])
             syncDisk()
+            return success
         }
 
         private func fileGetInfo(this: UInt64, guidAddress: UInt64, sizeAddress: UInt64, buffer: UInt64) -> UInt64 {
@@ -1097,7 +1544,7 @@ enum X86UEFI {
                 let entry = object.entry ?? FATVolume.Entry(
                     name: "\\", shortName: [], isDirectory: true,
                     isVolumeLabel: false, firstCluster: 0, size: 0)
-                let needed = 80 + (entry.name.count + 1) * 2
+                let needed = 80 + (entry.name.utf16.count + 1) * 2
                 guard capacity >= needed else {
                     write(sizeAddress, UInt64(needed), size: 8)
                     return bufferTooSmall
@@ -1108,7 +1555,7 @@ enum X86UEFI {
             }
             if guid == guidFileSystemInfo {
                 let label = volume.volumeLabelText
-                let needed = 36 + (label.count + 1) * 2
+                let needed = 36 + (label.utf16.count + 1) * 2
                 guard capacity >= needed else {
                     write(sizeAddress, UInt64(needed), size: 8)
                     return bufferTooSmall
@@ -1117,7 +1564,7 @@ enum X86UEFI {
                 put64(&info, 0, UInt64(needed))
                 put64(&info, 16, UInt64(volume.totalBytes))
                 put64(&info, 24, UInt64(max(0, volume.totalBytes - volume.usedBytes)))
-                put32(&info, 32, UInt32(volume.bytesPerSector))
+                put32(&info, 32, UInt32(volume.clusterBytes))
                 writeBytes(buffer, info)
                 writeString16(buffer + 36, label)
                 write(sizeAddress, UInt64(needed), size: 8)
@@ -1125,7 +1572,7 @@ enum X86UEFI {
             }
             if guid == guidVolumeLabel {
                 let label = volume.volumeLabelText
-                let needed = (label.count + 1) * 2
+                let needed = (label.utf16.count + 1) * 2
                 guard capacity >= needed else {
                     write(sizeAddress, UInt64(needed), size: 8)
                     return bufferTooSmall
@@ -1135,6 +1582,368 @@ enum X86UEFI {
                 return success
             }
             return unsupportedStatus
+        }
+
+        // MARK: イベント / タイマ
+
+        private func createEvent(type: UInt32, notifyFunction: UInt64,
+                                 notifyContext: UInt64, eventAddress: UInt64) -> UInt64 {
+            let handle = arenaAlloc(8)
+            guard handle != 0 else { return outOfResources }
+            let event = EventObject()
+            event.type = type
+            event.notifyFunction = notifyFunction
+            event.notifyContext = notifyContext
+            events[handle] = event
+            write(eventAddress, handle, size: 8)
+            return success
+        }
+
+        private func setTimer(event handle: UInt64, type: UInt64, triggerTime: UInt64) -> UInt64 {
+            guard let event = events[handle] else { return invalidParameter }
+            switch type {
+            case 0: // TimerCancel
+                event.timerType = 0
+                event.timerDue = nil
+                event.signaled = false
+            case 1, 2: // TimerPeriodic / TimerRelative
+                event.timerType = type
+                event.timerPeriod100ns = triggerTime
+                event.timerDue = Date().addingTimeInterval(Double(triggerTime) / 10_000_000)
+            default:
+                return invalidParameter
+            }
+            return success
+        }
+
+        /// タイマの期限到来をイベントへ反映し、シグナル状態を返す。
+        private func refreshEvent(_ event: EventObject) -> Bool {
+            if let due = event.timerDue, Date() >= due {
+                event.signaled = true
+                if event.timerType == 1, event.timerPeriod100ns > 0 {
+                    event.timerDue = due.addingTimeInterval(
+                        Double(event.timerPeriod100ns) / 10_000_000)
+                } else {
+                    event.timerDue = nil
+                    event.timerType = 0
+                }
+            }
+            return event.signaled
+        }
+
+        /// CheckEvent 用: シグナルされていれば消費して true。
+        private func checkEvent(_ handle: UInt64) -> Bool {
+            guard let event = events[handle] else { return false }
+            let signaled = refreshEvent(event)
+            if signaled { event.signaled = false }
+            return signaled
+        }
+
+        private func waitForEvent(count: UInt64, arrayAddress: UInt64,
+                                  indexAddress: UInt64) -> UInt64 {
+            guard count > 0, count <= 64 else { return invalidParameter }
+            let handles = (0..<Int(count)).map {
+                read(arrayAddress + UInt64($0 * 8), size: 8)
+            }
+            guard handles.allSatisfy({ events[$0] != nil }) else { return invalidParameter }
+            // 最大 30 秒ポーリングする。タイマのないイベントはこの場では
+            // 発火しようがないため、即座に EFI_NOT_READY を返す。
+            for _ in 0..<30_000 {
+                for (index, handle) in handles.enumerated() {
+                    if let event = events[handle], refreshEvent(event) {
+                        event.signaled = false
+                        write(indexAddress, UInt64(index), size: 8)
+                        return success
+                    }
+                }
+                guard handles.contains(where: { events[$0]?.timerDue != nil }) else {
+                    return notReady
+                }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return notReady
+        }
+
+        // MARK: イメージ読み込み
+
+        private func loadImage(parentHandle: UInt64, sourceBuffer: UInt64,
+                               sourceSize: UInt64, handleAddress: UInt64) -> UInt64 {
+            guard sourceBuffer != 0, sourceSize > 0,
+                  sourceSize <= 16 * 1024 * 1024 else { return invalidParameter }
+            let data = readBytes(sourceBuffer, count: Int(sourceSize))
+            guard let info = X86UEFI.parsePE(data),
+                  info.machine == 0x8664 else { return unsupportedStatus }
+            let size = (Int(info.sizeOfImage) + 0xFFF) & ~0xFFF
+            // 配置先: 希望 ImageBase が空いていればそこ、駄目なら読み込み領域
+            let preferred = Int(info.imageBase)
+            let loadBase: Int
+            if preferred >= 0x110000, preferred + size <= X86UEFI.loadRegionEnd,
+               !rangesOverlap(preferred, size) {
+                loadBase = preferred
+            } else if nextImageAddress + size <= X86UEFI.loadRegionEnd {
+                loadBase = nextImageAddress
+            } else {
+                return outOfResources
+            }
+            guard X86UEFI.stageImage(cpu: cpu, data: data, info: info, base: loadBase) else {
+                return unsupportedStatus // 再配置情報が無く希望ベースに置けない
+            }
+            if loadBase >= nextImageAddress { nextImageAddress = loadBase + size }
+            let handle = arenaAlloc(8)
+            let structAddress = arenaAlloc(104)
+            guard handle != 0, structAddress != 0 else { return outOfResources }
+            installLoadedImage(handle: handle, parentHandle: parentHandle,
+                               imageAddress: UInt64(loadBase),
+                               imageSize: Int(info.sizeOfImage),
+                               structAddress: structAddress)
+            loadedImages[handle] = LoadedImageInfo(
+                base: UInt64(loadBase), size: Int(info.sizeOfImage),
+                entry: UInt64(loadBase) + UInt64(info.entryRVA),
+                parentHandle: parentHandle, loadedImageStruct: structAddress)
+            write(handleAddress, handle, size: 8)
+            return success
+        }
+
+        /// [base, base+size) が既存の確保領域と重なるか。
+        private func rangesOverlap(_ base: Int, _ size: Int) -> Bool {
+            let end = base + size
+            let reserved: [(Int, Int)] = [
+                (0x100000, 0x400000), // ファームウェア構造 + スタック
+                (Int(imageBase), Int(imageBase) + sizeOfImage), // 起動イメージ
+                (X86UEFI.heapStart, heapPointer), // ヒープ確保済み
+                (X86UEFI.loadRegionStart, nextImageAddress), // 読み込み済み
+            ]
+            return reserved.contains { base < $0.1 && $0.0 < end }
+        }
+
+        private func unloadImage(handle: UInt64) -> UInt64 {
+            guard loadedImages.removeValue(forKey: handle) != nil else {
+                return invalidParameter
+            }
+            protocolDB[handle]?[guidLoadedImage] = nil
+            if protocolDB[handle]?.isEmpty == true {
+                protocolDB[handle] = nil
+                handleOrder.removeAll { $0 == handle }
+            }
+            return success
+        }
+
+        // MARK: ハンドル検索 / プロトコル操作
+
+        private func locateHandle(searchType: UInt64, guidAddress: UInt64,
+                                  sizeAddress: UInt64, bufferAddress: UInt64) -> UInt64 {
+            var handles = handleOrder
+            switch searchType {
+            case 0: // AllHandles
+                break
+            case 2: // ByProtocol
+                let guid = readGUID(guidAddress)
+                handles = handles.filter { protocolDB[$0]?[guid] != nil }
+            case 1: // ByRegisterNotify（登録機構がないため一致なし）
+                return notFound
+            default:
+                return invalidParameter
+            }
+            guard !handles.isEmpty else { return notFound }
+            let needed = handles.count * 8
+            let provided = Int(read(sizeAddress, size: 8))
+            guard bufferAddress != 0, provided >= needed else {
+                write(sizeAddress, UInt64(needed), size: 8)
+                return bufferTooSmall
+            }
+            for (index, handle) in handles.enumerated() {
+                write(bufferAddress + UInt64(index * 8), handle, size: 8)
+            }
+            write(sizeAddress, UInt64(needed), size: 8)
+            return success
+        }
+
+        private func locateDevicePath(guidAddress: UInt64, pathAddress: UInt64,
+                                      handleAddress: UInt64) -> UInt64 {
+            let guid = readGUID(guidAddress)
+            for handle in handleOrder {
+                guard protocolDB[handle]?[guid] != nil,
+                      let path = protocolDB[handle]?[guidDevicePath] else { continue }
+                write(pathAddress, path, size: 8)
+                write(handleAddress, handle, size: 8)
+                return success
+            }
+            return notFound
+        }
+
+        private func reinstallProtocolInterface(handle: UInt64, guidAddress: UInt64,
+                                                oldInterface: UInt64,
+                                                newInterface: UInt64) -> UInt64 {
+            let guid = readGUID(guidAddress)
+            guard let installed = protocolDB[handle]?[guid] else { return notFound }
+            guard installed == oldInterface else { return invalidParameter }
+            protocolDB[handle]?[guid] = newInterface
+            return success
+        }
+
+        /// Install / UninstallMultipleProtocolInterfaces。
+        /// (GUID*, Interface) の組が NULL 終端で続く。第 1 組は RDX / R8、
+        /// 以降はスタック引数 5, 6, 7, 8... に並ぶ。
+        /// Install の第 1 引数は *Handle、Uninstall は Handle そのもの。
+        private func multipleProtocolInterfaces(firstValue: UInt64, install: Bool) -> UInt64 {
+            var pairs: [(guidAddress: UInt64, interface: UInt64)] = []
+            let firstGUID = cpu.register64(2)
+            guard firstGUID != 0 else { return invalidParameter }
+            pairs.append((firstGUID, cpu.register64(8)))
+            var argument = 5
+            while argument + 1 <= 10 {
+                let guidAddress = stackArgument(argument)
+                if guidAddress == 0 { break }
+                pairs.append((guidAddress, stackArgument(argument + 1)))
+                argument += 2
+            }
+            if install {
+                var handle = read(firstValue, size: 8)
+                if handle == 0 {
+                    handle = arenaAlloc(8)
+                    guard handle != 0 else { return outOfResources }
+                    write(firstValue, handle, size: 8)
+                }
+                for pair in pairs {
+                    installProtocol(handle: handle, guid: readGUID(pair.guidAddress),
+                                    interface: pair.interface)
+                }
+                return success
+            }
+            let handle = firstValue
+            for pair in pairs {
+                let guid = readGUID(pair.guidAddress)
+                guard protocolDB[handle]?[guid] == pair.interface else { return notFound }
+                protocolDB[handle]?[guid] = nil
+            }
+            if protocolDB[handle]?.isEmpty == true {
+                protocolDB[handle] = nil
+                handleOrder.removeAll { $0 == handle }
+            }
+            return success
+        }
+
+        private func openProtocolInformation(handle: UInt64, guidAddress: UInt64,
+                                             entriesAddress: UInt64,
+                                             countAddress: UInt64) -> UInt64 {
+            let guid = readGUID(guidAddress)
+            guard protocolDB[handle]?[guid] != nil else { return notFound }
+            let entries = arenaAlloc(32)
+            guard entries != 0 else { return outOfResources }
+            var entry = [UInt8](repeating: 0, count: 32)
+            put64(&entry, 0, imageBase) // AgentHandle（起動イメージ）
+            put64(&entry, 8, handle) // ControllerHandle
+            put32(&entry, 16, 0x10) // Attributes: BY_HANDLE_PROTOCOL
+            put32(&entry, 20, 1) // OpenCount
+            cpu.loadData(entry, at: Int(entries))
+            write(entriesAddress, entries, size: 8)
+            write(countAddress, 1, size: 8)
+            return success
+        }
+
+        // MARK: GOP
+
+        private func gopQueryMode(modeNumber: UInt64, sizeAddress: UInt64,
+                                  infoAddress: UInt64) -> UInt64 {
+            guard modeNumber == 0 else { return invalidParameter }
+            let info = arenaAlloc(36)
+            guard info != 0 else { return outOfResources }
+            writeBytes(info, readBytes(UInt64(X86UEFI.gopInfoAddress), count: 36))
+            write(sizeAddress, 36, size: 8)
+            write(infoAddress, info, size: 8)
+            return success
+        }
+
+        private func gopSetMode(modeNumber: UInt64) -> UInt64 {
+            guard modeNumber == 0 else { return invalidParameter }
+            let size = framebufferWidth * framebufferHeight * 4
+            cpu.loadData([UInt8](repeating: 0, count: size), at: framebufferBase)
+            return success
+        }
+
+        /// Blt: VideoFill(0) / BltBufferToVideo(2) / VideoToBltBuffer(1) /
+        /// VideoToVideo(3) をフレームバッファ実メモリで実行する。
+        private func gopBlt(buffer: UInt64, operation: UInt64, sourceX: UInt64,
+                            sourceY: UInt64, destinationX: UInt64,
+                            destinationY: UInt64, width: UInt64, height: UInt64,
+                            delta: UInt64) -> UInt64 {
+            let framebuffer = UInt64(framebufferBase)
+            let pitch = framebufferWidth * 4
+            func videoOffset(_ x: UInt64, _ y: UInt64) -> UInt64 {
+                framebuffer + y * UInt64(pitch) + x * 4
+            }
+            switch operation {
+            case 0: // VideoFill: バッファ先頭の 1 ピクセルで矩形を塗る
+                let pixel = read(buffer, size: 4)
+                for row in 0..<height {
+                    for column in 0..<width {
+                        write(videoOffset(destinationX + column, destinationY + row),
+                              pixel, size: 4)
+                    }
+                }
+            case 2, 1: // BufferToVideo / VideoToBuffer
+                let stride = delta == 0 ? width * 4 : delta
+                for row in 0..<height {
+                    for column in 0..<width {
+                        if operation == 2 {
+                            let source = buffer + (sourceY + row) * stride + (sourceX + column) * 4
+                            write(videoOffset(destinationX + column, destinationY + row),
+                                  read(source, size: 4), size: 4)
+                        } else {
+                            let destination = buffer + (destinationY + row) * stride
+                                + (destinationX + column) * 4
+                            write(destination,
+                                  read(videoOffset(sourceX + column, sourceY + row), size: 4),
+                                  size: 4)
+                        }
+                    }
+                }
+            case 3: // VideoToVideo（一時バッファ経由で重なりに対応）
+                var pixels: [UInt32] = []
+                for row in 0..<height {
+                    for column in 0..<width {
+                        pixels.append(UInt32(read(videoOffset(sourceX + column, sourceY + row), size: 4)))
+                    }
+                }
+                var index = 0
+                for row in 0..<height {
+                    for column in 0..<width {
+                        write(videoOffset(destinationX + column, destinationY + row),
+                              UInt64(pixels[index]), size: 4)
+                        index += 1
+                    }
+                }
+            default:
+                return invalidParameter
+            }
+            return success
+        }
+
+        // MARK: ランタイムサービス（時刻）
+
+        private func getTime(timeAddress: UInt64, capabilitiesAddress: UInt64) -> UInt64 {
+            guard timeAddress != 0 else { return invalidParameter }
+            let now = Date()
+            let components = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second, .nanosecond], from: now)
+            var time = [UInt8](repeating: 0, count: 16)
+            put16(&time, 0, UInt16(components.year ?? 2026))
+            time[2] = UInt8(components.month ?? 1)
+            time[3] = UInt8(components.day ?? 1)
+            time[4] = UInt8(components.hour ?? 0)
+            time[5] = UInt8(components.minute ?? 0)
+            time[6] = UInt8(components.second ?? 0)
+            put32(&time, 8, UInt32(components.nanosecond ?? 0))
+            let offsetMinutes = Int16(TimeZone.current.secondsFromGMT(for: now) / 60)
+            put16(&time, 12, UInt16(bitPattern: offsetMinutes))
+            writeBytes(timeAddress, time)
+            if capabilitiesAddress != 0 {
+                var capabilities = [UInt8](repeating: 0, count: 12)
+                put32(&capabilities, 0, 1) // Resolution
+                put32(&capabilities, 4, 0) // Accuracy
+                writeBytes(capabilitiesAddress, capabilities)
+            }
+            return success
         }
 
         // MARK: 変数サービス
@@ -1165,16 +1974,19 @@ enum X86UEFI {
             let guid = readGUID(guidAddress)
             if dataSize == 0 {
                 variables.removeAll { $0.guid == guid && $0.name == name }
+                onVariablesChanged?(variables)
                 return success
             }
             let data = readBytes(dataAddress, count: Int(dataSize))
             if let index = variables.firstIndex(where: { $0.guid == guid && $0.name == name }) {
-                variables[index].attributes = UInt32(attributes & 0xFFFFFFFF)
+                variables[index].attributes = UInt32(attributes)
                 variables[index].data = data
             } else {
-                variables.append((guid: guid, name: name,
-                                  attributes: UInt32(attributes & 0xFFFFFFFF), data: data))
+                variables.append(X86UEFI.Variable(
+                    guid: guid, name: name,
+                    attributes: UInt32(attributes), data: data))
             }
+            onVariablesChanged?(variables)
             return success
         }
 

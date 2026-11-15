@@ -21,6 +21,11 @@ final class X86Session: GuestSession {
     private var outputBuffer = ""
     private let bufferLock = NSLock()
 
+    /// 起動時にファームウェアへ渡す UEFI 変数（永続化の復元用）。
+    var initialUEFIVariables: [X86UEFI.Variable] = []
+    /// 実行中に更新された UEFI 変数の最新状態（永続化の保存用）。
+    private(set) var uefiVariables: [X86UEFI.Variable] = []
+
     init() {
         bios = X86BIOS(cpu: cpu)
         cpu.interruptHandler = { [bios] vector in
@@ -41,6 +46,12 @@ final class X86Session: GuestSession {
     /// 置かれた KERNEL.ELF）は Multiboot ローダで、それ以外は BIOS
     /// ブート（El Torito / raw イメージ）で起動する。
     func boot(imageData: [UInt8]) throws {
+        // 二重に起動された場合は前の実行を止めてから始める
+        runTask?.cancel()
+        stateLock.lock()
+        terminatedFlag = false
+        pausedFlag = false
+        stateLock.unlock()
         X86ACPI.install(cpu: cpu)
         if Multiboot.isMultibootKernel(imageData) {
             try Multiboot.boot(cpu: cpu, imageData: imageData)
@@ -51,7 +62,15 @@ final class X86Session: GuestSession {
             try Multiboot.boot(cpu: cpu, imageData: kernel)
             attachRAMDiskIfNeeded()
         } else if X86UEFI.isUEFIApplication(imageData) {
-            try X86UEFI.boot(cpu: cpu, imageData: imageData)
+            uefiVariables = initialUEFIVariables
+            try X86UEFI.boot(cpu: cpu, imageData: imageData,
+                             initialVariables: initialUEFIVariables,
+                             onVariablesChanged: { [weak self] variables in
+                                 guard let self else { return }
+                                 self.stateLock.lock()
+                                 self.uefiVariables = variables
+                                 self.stateLock.unlock()
+                             })
         } else {
             try bios.boot(imageData: imageData)
         }
@@ -78,12 +97,12 @@ final class X86Session: GuestSession {
                 try cpu.run(maxInstructions: 50_000)
             } catch {
                 flushOutput()
-                onFault?((error as? X86Fault)?.description ?? error.localizedDescription)
+                if !isTerminated { onFault?((error as? X86Fault)?.description ?? error.localizedDescription) }
                 return
             }
             if cpu.halted {
                 flushOutput()
-                onHalt?(cpu.exitCode)
+                if !isTerminated { onHalt?(cpu.exitCode) }
                 return
             }
             if cpu.waitingForInterrupt {
@@ -93,11 +112,13 @@ final class X86Session: GuestSession {
                     _ = try cpu.pollInterrupts()
                 } catch {
                     flushOutput()
-                    onFault?((error as? X86Fault)?.description ?? error.localizedDescription)
+                    if !isTerminated { onFault?((error as? X86Fault)?.description ?? error.localizedDescription) }
                     return
                 }
             } else if cpu.waitingForInput {
                 try? await Task.sleep(nanoseconds: 20_000_000)
+            } else {
+                await Task.yield()
             }
         }
     }
