@@ -94,6 +94,14 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
 }
 
 /// 仮想マシンのハードウェア構成。
+/// 永続化する UEFI 変数 1 件（x86 UEFI セッションと受け渡す）。
+struct UEFIVariableRecord: Codable, Equatable {
+    var guid: [UInt8]
+    var name: String
+    var attributes: UInt32
+    var data: [UInt8]
+}
+
 struct VMConfiguration: Equatable {
     var cpuCount: Int = 2
     var memoryMB: Int = 4096
@@ -111,6 +119,8 @@ struct VMConfiguration: Equatable {
     var isoDisplayName: String? = nil
     var networkEnabled: Bool = true
     var sharedFolderEnabled: Bool = false
+    /// 永続化された UEFI 変数（x86 の UEFI 起動時に引き継ぐ）
+    var uefiVariables: [UEFIVariableRecord] = []
 
     var memoryText: String {
         if memoryMB >= 1024 {
@@ -166,23 +176,54 @@ extension VMConfiguration: Codable {
         case cpuCount, memoryMB, diskGB, architecture, guestOS, guestImage
         case useISO, isoFileName, isoDisplayName
         case networkEnabled, sharedFolderEnabled
+        case uefiVariables
     }
 
     /// 旧バージョンの保存データ（新しいキーが無い）も読み込めるよう、
-    /// 各キーを任意としてデコードする。
+    /// 各キーを任意としてデコードする。未知の enum 値や型の不一致が
+    /// あっても全体が読めなくならないよう、値を 1 つずつ寛容に解釈する。
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        cpuCount = try container.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 2
-        memoryMB = try container.decodeIfPresent(Int.self, forKey: .memoryMB) ?? 4096
-        diskGB = try container.decodeIfPresent(Int.self, forKey: .diskGB) ?? 32
-        architecture = try container.decodeIfPresent(CPUArchitecture.self, forKey: .architecture) ?? .riscv
-        guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
-        guestImage = try container.decodeIfPresent(GuestImage.self, forKey: .guestImage) ?? .retasuOS
-        useISO = try container.decodeIfPresent(Bool.self, forKey: .useISO) ?? false
-        isoFileName = try container.decodeIfPresent(String.self, forKey: .isoFileName)
-        isoDisplayName = try container.decodeIfPresent(String.self, forKey: .isoDisplayName)
-        networkEnabled = try container.decodeIfPresent(Bool.self, forKey: .networkEnabled) ?? true
-        sharedFolderEnabled = try container.decodeIfPresent(Bool.self, forKey: .sharedFolderEnabled) ?? false
+        cpuCount = Self.tolerantInt(container, .cpuCount) ?? 2
+        memoryMB = Self.tolerantInt(container, .memoryMB) ?? 4096
+        diskGB = Self.tolerantInt(container, .diskGB) ?? 32
+        architecture = Self.tolerantEnum(CPUArchitecture.self, container, .architecture) ?? .riscv
+        guestOS = Self.tolerantEnum(GuestOS.self, container, .guestOS) ?? .linux
+        guestImage = Self.tolerantEnum(GuestImage.self, container, .guestImage) ?? .retasuOS
+        useISO = Self.tolerantBool(container, .useISO) ?? false
+        isoFileName = Self.tolerantString(container, .isoFileName)
+        isoDisplayName = Self.tolerantString(container, .isoDisplayName)
+        networkEnabled = Self.tolerantBool(container, .networkEnabled) ?? true
+        sharedFolderEnabled = Self.tolerantBool(container, .sharedFolderEnabled) ?? false
+        uefiVariables = (try? container.decodeIfPresent([UEFIVariableRecord].self, forKey: .uefiVariables)) ?? nil ?? []
+    }
+
+    /// Int を寛容に読む（数値文字列も受け付ける）。
+    private static func tolerantInt(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Int? {
+        if let value = (try? container.decodeIfPresent(Int.self, forKey: key)) ?? nil { return value }
+        if let text = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil { return Int(text) }
+        return nil
+    }
+
+    /// Bool を寛容に読む（"true" / "false" 文字列も受け付ける）。
+    private static func tolerantBool(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Bool? {
+        if let value = (try? container.decodeIfPresent(Bool.self, forKey: key)) ?? nil { return value }
+        if let text = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil {
+            if text == "true" { return true }
+            if text == "false" { return false }
+        }
+        return nil
+    }
+
+    /// 文字列 enum を寛容に読む（未知の値は nil として扱い、既定値へ倒す）。
+    private static func tolerantEnum<T: RawRepresentable>(_ type: T.Type, _ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> T? where T.RawValue == String {
+        guard let raw = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil else { return nil }
+        return T(rawValue: raw)
+    }
+
+    /// String を寛容に読む（型が合わなければ nil）。
+    private static func tolerantString(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> String? {
+        (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -210,6 +251,52 @@ struct VirtualMachine: Identifiable, Codable, Equatable {
     var createdAt: Date
     var lastStartedAt: Date?
     var errorMessage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, configuration, state, createdAt, lastStartedAt, errorMessage
+    }
+
+    /// 保存データの一部が壊れていても VM 自体は復元できるよう、
+    /// フィールドごとに寛容にデコードする（未知の state は停止中へ）。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let decodedID = (try? container.decodeIfPresent(UUID.self, forKey: .id)) ?? nil {
+            id = decodedID
+        } else if let text = (try? container.decodeIfPresent(String.self, forKey: .id)) ?? nil,
+                  let parsed = UUID(uuidString: text) {
+            id = parsed
+        } else {
+            id = UUID()
+        }
+        name = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? nil ?? "VM"
+        configuration = (try? container.decodeIfPresent(VMConfiguration.self, forKey: .configuration)) ?? nil ?? VMConfiguration()
+        if let raw = (try? container.decodeIfPresent(String.self, forKey: .state)) ?? nil,
+           let parsed = VMState(rawValue: raw) {
+            state = parsed
+        } else {
+            state = .stopped
+        }
+        if let decodedDate = (try? container.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil {
+            createdAt = decodedDate
+        } else if let seconds = (try? container.decodeIfPresent(Double.self, forKey: .createdAt)) ?? nil {
+            createdAt = Date(timeIntervalSinceReferenceDate: seconds)
+        } else {
+            createdAt = Date()
+        }
+        lastStartedAt = (try? container.decodeIfPresent(Date.self, forKey: .lastStartedAt)) ?? nil
+        errorMessage = (try? container.decodeIfPresent(String.self, forKey: .errorMessage)) ?? nil
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(configuration, forKey: .configuration)
+        try container.encode(state, forKey: .state)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(lastStartedAt, forKey: .lastStartedAt)
+        try container.encodeIfPresent(errorMessage, forKey: .errorMessage)
+    }
 
     init(
         id: UUID = UUID(),

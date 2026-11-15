@@ -21,6 +21,8 @@ final class VMStore: ObservableObject {
     @Published private(set) var transitioning: Set<UUID> = []
 
     private var sessions: [UUID: any GuestSession] = [:]
+    /// セッションの世代番号。再起動をまたいだ古いコールバックを弾く。
+    private var sessionGenerations: [UUID: Int] = [:]
     private let fileURL: URL?
 
     init() {
@@ -61,6 +63,8 @@ final class VMStore: ObservableObject {
 
     func update(_ vm: VirtualMachine, name: String, configuration: VMConfiguration) {
         guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
+        // 実行中・一時停止中の VM は、稼働中セッションと構成が食い違うため編集しない
+        guard machines[index].state == .stopped || machines[index].state == .error else { return }
         machines[index].name = name
         machines[index].configuration = configuration
         save()
@@ -81,7 +85,7 @@ final class VMStore: ObservableObject {
     // MARK: - 状態遷移
 
     /// セッションのコールバックをストアへ接続する（全アーキテクチャ共通）。
-    private func wireCallbacks(session: any GuestSession, vmID: UUID) {
+    private func wireCallbacks(session: any GuestSession, vmID: UUID, generation: Int) {
         session.onOutput = { [weak self] text in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -95,12 +99,12 @@ final class VMStore: ObservableObject {
         }
         session.onHalt = { [weak self] exitCode in
             Task { @MainActor [weak self] in
-                self?.handleGuestHalt(vmID: vmID, exitCode: exitCode)
+                self?.handleGuestHalt(vmID: vmID, generation: generation, exitCode: exitCode)
             }
         }
         session.onFault = { [weak self] message in
             Task { @MainActor [weak self] in
-                self?.handleGuestFault(vmID: vmID, message: message)
+                self?.handleGuestFault(vmID: vmID, generation: generation, message: message)
             }
         }
     }
@@ -111,6 +115,9 @@ final class VMStore: ObservableObject {
         guard sessions[vm.id] == nil else { return }
         guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
 
+        let generation = (sessionGenerations[vm.id] ?? 0) + 1
+        sessionGenerations[vm.id] = generation
+        transitioning.insert(vm.id)
         consoleText[vm.id] = ""
         let session: any GuestSession
         let bootDescription: String
@@ -118,7 +125,7 @@ final class VMStore: ObservableObject {
         switch vm.configuration.architecture {
         case .riscv:
             let emulatorSession = EmulatorSession()
-            wireCallbacks(session: emulatorSession, vmID: vm.id)
+            wireCallbacks(session: emulatorSession, vmID: vm.id, generation: generation)
             if vm.configuration.useISO {
                 // ISO ブート: ISO 9660 を解析し、ルート直下の BOOT.BIN を起動する
                 guard let isoData = loadISOData(for: vm) else {
@@ -159,7 +166,11 @@ final class VMStore: ObservableObject {
                 return
             }
             let x86Session = X86Session()
-            wireCallbacks(session: x86Session, vmID: vm.id)
+            x86Session.initialUEFIVariables = vm.configuration.uefiVariables.map {
+                X86UEFI.Variable(guid: $0.guid, name: $0.name,
+                                 attributes: $0.attributes, data: $0.data)
+            }
+            wireCallbacks(session: x86Session, vmID: vm.id, generation: generation)
             do {
                 try x86Session.boot(imageData: imageData)
             } catch {
@@ -176,7 +187,7 @@ final class VMStore: ObservableObject {
             session = x86Session
         case .arm:
             let armSession = ARMSession()
-            wireCallbacks(session: armSession, vmID: vm.id)
+            wireCallbacks(session: armSession, vmID: vm.id, generation: generation)
             do {
                 try armSession.boot(source: ARMDemoOS.source)
             } catch {
@@ -188,6 +199,7 @@ final class VMStore: ObservableObject {
         }
 
         sessions[vm.id] = session
+        transitioning.remove(vm.id)
         machines[index].state = .running
         machines[index].errorMessage = nil
         machines[index].lastStartedAt = Date()
@@ -196,6 +208,7 @@ final class VMStore: ObservableObject {
     }
 
     private func failStart(index: Int, vm: VirtualMachine, message: String) {
+        transitioning.remove(vm.id)
         machines[index].state = .error
         machines[index].errorMessage = message
         consoleText[vm.id, default: ""] += "\n[retasuVM] 起動に失敗しました: \(message)\n"
@@ -277,6 +290,8 @@ final class VMStore: ObservableObject {
     /// 停止: セッションを終了する（電源断）。
     func stop(_ vm: VirtualMachine) {
         guard vm.state == .running || vm.state == .paused else { return }
+        transitioning.insert(vm.id)
+        defer { transitioning.remove(vm.id) }
         endSession(vmID: vm.id)
         setState(vmID: vm.id, .stopped)
         consoleText[vm.id, default: ""] += "\n[retasuVM] 停止しました\n"
@@ -315,6 +330,8 @@ final class VMStore: ObservableObject {
     /// 強制停止。実行中・一時停止中どちらからでも停止状態へ移す。
     func forceStop(_ vm: VirtualMachine) {
         guard vm.state == .running || vm.state == .paused else { return }
+        transitioning.insert(vm.id)
+        defer { transitioning.remove(vm.id) }
         endSession(vmID: vm.id)
         setState(vmID: vm.id, .stopped)
         consoleText[vm.id, default: ""] += "\n[retasuVM] 強制停止しました\n"
@@ -331,8 +348,9 @@ final class VMStore: ObservableObject {
 
     // MARK: - セッション終了イベント
 
-    private func handleGuestHalt(vmID: UUID, exitCode: Int32) {
-        guard sessions[vmID] != nil else { return }
+    private func handleGuestHalt(vmID: UUID, generation: Int, exitCode: Int32) {
+        guard sessions[vmID] != nil, sessionGenerations[vmID] == generation else { return }
+        harvestUEFIVariables(vmID: vmID)
         sessions[vmID] = nil
         setState(vmID: vmID, .stopped)
         consoleText[vmID, default: ""] += "\n[retasuVM] ゲスト OS が終了しました（終了コード \(exitCode)）\n"
@@ -342,8 +360,9 @@ final class VMStore: ObservableObject {
         save()
     }
 
-    private func handleGuestFault(vmID: UUID, message: String) {
-        guard sessions[vmID] != nil else { return }
+    private func handleGuestFault(vmID: UUID, generation: Int, message: String) {
+        guard sessions[vmID] != nil, sessionGenerations[vmID] == generation else { return }
+        harvestUEFIVariables(vmID: vmID)
         sessions[vmID] = nil
         if let index = machines.firstIndex(where: { $0.id == vmID }) {
             machines[index].state = .error
@@ -355,8 +374,19 @@ final class VMStore: ObservableObject {
     }
 
     private func endSession(vmID: UUID) {
+        harvestUEFIVariables(vmID: vmID)
         sessions[vmID]?.terminate()
         sessions[vmID] = nil
+    }
+
+    /// x86 セッションから UEFI 変数を回収し、VM の構成へ反映する（永続化）。
+    private func harvestUEFIVariables(vmID: UUID) {
+        guard let session = sessions[vmID] as? X86Session,
+              let index = machines.firstIndex(where: { $0.id == vmID }) else { return }
+        machines[index].configuration.uefiVariables = session.uefiVariables.map {
+            UEFIVariableRecord(guid: $0.guid, name: $0.name,
+                               attributes: $0.attributes, data: $0.data)
+        }
     }
 
     private func setState(vmID: UUID, _ state: VMState) {
@@ -379,18 +409,22 @@ final class VMStore: ObservableObject {
     // MARK: - 永続化
 
     private func load() {
-        if let fileURL,
-           let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([VirtualMachine].self, from: data) {
-            // 前回終了時に実行中だった VM は、再起動後は停止中として扱う。
-            machines = decoded.map { vm in
-                var vm = vm
-                if vm.state == .running || vm.state == .paused {
-                    vm.state = .stopped
+        if let fileURL, let data = try? Data(contentsOf: fileURL) {
+            if let decoded = try? JSONDecoder().decode([VirtualMachine].self, from: data) {
+                // 前回終了時に実行中だった VM は、再起動後は停止中として扱う。
+                machines = decoded.map { vm in
+                    var vm = vm
+                    if vm.state == .running || vm.state == .paused {
+                        vm.state = .stopped
+                    }
+                    return vm
                 }
-                return vm
+                return
             }
-            return
+            // デコードできない保存ファイルは、次の保存で失わないよう退避する
+            let backupURL = fileURL.deletingPathExtension()
+                .appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.copyItem(at: fileURL, to: backupURL)
         }
         machines = Self.sampleData
     }
