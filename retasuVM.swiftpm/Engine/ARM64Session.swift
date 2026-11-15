@@ -5,7 +5,7 @@ import Foundation
 /// `ARM64Assembler` でゲストを機械語へ変換し、`ARM64CPU` 上で実行する。
 /// 仕組みは `ARMSession` と同じ。
 final class ARM64Session: GuestSession {
-    let cpu = ARM64CPU()
+    let cpu: ARM64CPU
 
     var onOutput: ((String) -> Void)?
     var onClear: (() -> Void)?
@@ -19,7 +19,8 @@ final class ARM64Session: GuestSession {
     private var outputBuffer = ""
     private let bufferLock = NSLock()
 
-    init() {
+    init(memorySize: Int = 64 * 1024 * 1024) {
+        cpu = ARM64CPU(memorySize: memorySize)
         cpu.onChar = { [weak self] byte in
             self?.appendOutput(byte)
         }
@@ -40,6 +41,24 @@ final class ARM64Session: GuestSession {
         let program = try assembler.assemble(source)
         cpu.setRandomSeed(UInt32(Date().timeIntervalSince1970) &* 2654435761 | 1)
         cpu.loadProgram(program.bytes, at: program.entry)
+        runTask = Task { [weak self] in
+            await self?.runLoop()
+        }
+    }
+
+    /// Mac プラットフォーム方式でゲストを起動する（ADT を配置し、X0 = ADT で開始）。
+    func bootMac(source: String) throws {
+        runTask?.cancel()
+        stateLock.lock()
+        terminatedFlag = false
+        pausedFlag = false
+        stateLock.unlock()
+        var assembler = ARM64Assembler()
+        let program = try assembler.assemble(source)
+        cpu.loadProgram(program.bytes, at: program.entry)
+        MacPlatform.installDeviceTree(cpu: cpu)
+        cpu.setBootArgument(MacPlatform.adtAddress)
+        cpu.attachNVMeDisk([UInt8](repeating: 0, count: 32 * 1024 * 1024))
         runTask = Task { [weak self] in
             await self?.runLoop()
         }

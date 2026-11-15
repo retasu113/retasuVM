@@ -378,6 +378,8 @@ struct ARM64Assembler {
         case "svc":
             let imm = try parseImmediate(operands[0], lineNumber: lineNumber)
             return 0xD400_0001 | (UInt32(imm & 0xFFFF) << 5)
+        case "mrs", "msr":
+            return try encodeSystemRegister(mnemonic: mnemonic, operands: operands, lineNumber: lineNumber)
         case "b", "bl":
             let target = try evaluate(operands[0], lineNumber: lineNumber)
             let offset = target &- Int64(bitPattern: address)
@@ -450,6 +452,66 @@ struct ARM64Assembler {
             return word
         }
         throw ARM64AssemblerError.unknownMnemonic(line: lineNumber, mnemonic: mnemonic)
+    }
+
+    // MARK: システムレジスタ（MRS / MSR）
+
+    /// システムレジスタ名 → (op0, op1, CRn, CRm, op2)。ARM64CPU のキー表と一致させる。
+    private static let systemRegisters: [String: (UInt32, UInt32, UInt32, UInt32, UInt32)] = [
+        "sctlr_el1": (3, 0, 1, 0, 0),
+        "ttbr0_el1": (3, 0, 2, 0, 0),
+        "ttbr1_el1": (3, 0, 2, 0, 1),
+        "tcr_el1": (3, 0, 2, 0, 2),
+        "mair_el1": (3, 0, 10, 2, 0),
+        "vbar_el1": (3, 0, 12, 0, 0),
+        "spsr_el1": (3, 0, 4, 0, 0),
+        "elr_el1": (3, 0, 4, 0, 1),
+        "esr_el1": (3, 0, 5, 2, 0),
+        "far_el1": (3, 0, 6, 0, 0),
+        "sp_el0": (3, 0, 4, 1, 0),
+        "sp_el1": (3, 1, 4, 1, 0),
+        "currentel": (3, 0, 4, 2, 2),
+        "nzcv": (3, 3, 4, 2, 0),
+        "daif": (3, 3, 4, 2, 1),
+        "midr_el1": (3, 0, 0, 0, 0),
+        "mpidr_el1": (3, 0, 0, 0, 5),
+        "id_aa64mmfr0_el1": (3, 0, 0, 7, 0),
+        "cntfrq_el0": (3, 3, 14, 0, 0),
+        "cntpct_el0": (3, 3, 14, 0, 1),
+        "cntvct_el0": (3, 3, 14, 0, 2),
+        "cntp_tval_el0": (3, 3, 14, 2, 0),
+        "cntp_ctl_el0": (3, 3, 14, 2, 1),
+        "cntp_cval_el0": (3, 3, 14, 2, 2),
+        "cntv_tval_el0": (3, 3, 14, 5, 0),
+        "cntv_ctl_el0": (3, 3, 14, 5, 1),
+        "cntv_cval_el0": (3, 3, 14, 5, 2),
+    ]
+
+    private func encodeSystemRegister(mnemonic: String, operands: [String], lineNumber: Int) throws -> UInt32 {
+        guard operands.count == 2 else {
+            throw ARM64AssemblerError.syntax(line: lineNumber, message: "mrs / msr には 2 つのオペランドが必要です")
+        }
+        let isMRS = mnemonic == "mrs"
+        let nameOperand = isMRS ? operands[1] : operands[0]
+        let regOperand = isMRS ? operands[0] : operands[1]
+        let name = nameOperand.lowercased()
+        // 即値形式（PSTATE）: msr daifset / daifclr / spsel, #imm
+        if !isMRS && regOperand.hasPrefix("#") {
+            let pstateFields: [String: (UInt32, UInt32)] = ["spsel": (0, 5), "daifset": (3, 6), "daifclr": (3, 7)]
+            guard let (op1, op2) = pstateFields[name] else {
+                throw ARM64AssemblerError.syntax(line: lineNumber, message: "即値形式に対応しないレジスタ '\(nameOperand)'")
+            }
+            let imm = try parseImmediate(regOperand, lineNumber: lineNumber)
+            return 0xD500_0000 | (op1 << 16) | (4 << 12) | (UInt32(imm & 0xF) << 8) | (op2 << 5) | 0x1F
+        }
+        guard let reg = parseRegister(regOperand) else {
+            throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタが必要です")
+        }
+        guard let (op0, op1, crn, crm, op2) = Self.systemRegisters[name] else {
+            throw ARM64AssemblerError.syntax(line: lineNumber, message: "未知のシステムレジスタ '\(nameOperand)'")
+        }
+        let base: UInt32 = isMRS ? 0xD520_0000 : 0xD500_0000
+        return base | (op0 << 19) | (op1 << 16) | (crn << 12) | (crm << 8) | (op2 << 5) | UInt32(reg.number)
     }
 
     // MARK: ロード / ストアのエンコード

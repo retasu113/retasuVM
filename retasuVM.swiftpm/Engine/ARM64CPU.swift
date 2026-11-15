@@ -41,8 +41,21 @@ final class ARM64CPU {
     static let gicDistBase: UInt64 = 0x0800_0000
     static let gicCPUBase: UInt64 = 0x0801_0000
     static let controlBase: UInt64 = 0x0A00_0000
+    static let aicBase: UInt64 = 0x0B00_0000
+    static let nvmeBase: UInt64 = 0x0C00_0000
     static let timerINTID: UInt64 = 30
     static let uartINTID: UInt64 = 33
+    /// Apple Silicon プラットフォームでの AIC 割り込み番号（自プラットフォームの ADT で定義）
+    static let aicUARTIRQ = 1
+    static let aicNVMeIRQ = 2
+
+    /// 割り込み配送方式。gic = デモプラットフォーム（GIC ライト + IRQ）、
+    /// appleSilicon = Mac プラットフォーム（AIC + タイマを FIQ で配送）。
+    enum Platform {
+        case gic
+        case appleSilicon
+    }
+    var platform: Platform = .gic
 
     // MARK: - 状態
 
@@ -86,6 +99,21 @@ final class ARM64CPU {
     private var gicPriorityMask: UInt64 = 0xFF
     private var timerAcked = false                        // IAR で応答済み（EOI まで再通知しない）
 
+    // Apple Interrupt Controller（AIC v1 ライト、Mac プラットフォーム用）
+    static let aicIRQCount = 256
+    private var aicMask = [Bool](repeating: true, count: aicIRQCount)     // true = マスク中
+    private var aicTarget = [UInt32](repeating: 0, count: aicIRQCount)    // 対象 CPU ビットマップ
+    private var aicSW = [Bool](repeating: false, count: aicIRQCount)      // ソフトウェア生成状態
+    private var aicIPIotherPending = false
+    private var aicIPIselfPending = false
+    private var aicIPIotherMasked = true
+    private var aicIPIselfMasked = true
+    private var nvmeIRQLine = false                                       // NVMe 完了割り込みライン（AIC IRQ 2）
+
+    /// NVMe コントローラ（Mac プラットフォーム用）。RAM アクセスは初回アクセス時に結線する。
+    let nvme = ARM64NVMe()
+    private var nvmeWired = false
+
     // 入力キューと排他モニタ
     private var inputQueue: [UInt8] = []
     private let inputLock = NSLock()
@@ -106,6 +134,7 @@ final class ARM64CPU {
     var currentEL: Int { Int((pstate >> 2) & 0x3) }
     private var spSel: Bool { pstate & 0x1 != 0 }
     private var irqMasked: Bool { pstate & (1 << 7) != 0 }
+    private var fiqMasked: Bool { pstate & (1 << 6) != 0 }
 
     private var flagN: Bool { pstate & (1 << 31) != 0 }
     private var flagZ: Bool { pstate & (1 << 30) != 0 }
@@ -201,6 +230,17 @@ final class ARM64CPU {
         return entry
     }
 
+    /// ブート時の X0 を設定する（Mac ブートでは ADT のアドレスを渡す）。
+    /// PC とスタックは loadProgram / loadELF64 が設定済みの前提。
+    func setBootArgument(_ value: UInt64) {
+        registers[0] = value
+    }
+
+    /// NVMe ディスクイメージを取り付ける（512 バイトセクタ単位に切り捨て）。
+    func attachNVMeDisk(_ data: [UInt8]) {
+        nvme.attachDisk(data)
+    }
+
     func setRandomSeed(_ seed: UInt32) {
         randomState = seed == 0 ? 0x12345678 : seed
     }
@@ -220,7 +260,9 @@ final class ARM64CPU {
         while !halted && !waitingForInput && count < maxInstructions {
             if idle {
                 // WFI 中: 割り込みが来たら復帰し、来ていなければ呼び出しを返す
-                if interruptPending && !irqMasked { idle = false } else { break }
+                if platform == .appleSilicon {
+                    if fiqPending && !fiqMasked { idle = false } else { break }
+                } else if interruptPending && !irqMasked { idle = false } else { break }
             }
             try step()
             count += 1
@@ -257,7 +299,11 @@ final class ARM64CPU {
 
     private func step() throws {
         // 割り込みは命令境界で受け付ける（ELR は次に実行する命令を指す）
-        if interruptPending && !irqMasked {
+        if platform == .appleSilicon {
+            if fiqPending && !fiqMasked {
+                enterException(vectorOffset: fiqVectorOffset(), elr: pc, esr: 0)
+            }
+        } else if interruptPending && !irqMasked {
             enterException(vectorOffset: irqVectorOffset(), elr: pc, esr: 0)
         }
         let instructionPC = pc
@@ -292,6 +338,129 @@ final class ARM64CPU {
     private func irqVectorOffset() -> UInt64 {
         if currentEL == 0 { return 0x480 }
         return spSel ? 0x280 : 0x080
+    }
+
+    private func fiqVectorOffset() -> UInt64 {
+        if currentEL == 0 { return 0x500 }
+        return spSel ? 0x300 : 0x100
+    }
+
+    // MARK: - Apple Silicon プラットフォーム（AIC / FIQ）
+
+    /// FIQ 保留: ジェネリックタイマ期限切れ（IMASK でマスク可）または AIC イベント。
+    private var fiqPending: Bool {
+        if timerExpired && (cntpCtl & 0x2) == 0 { return true }
+        return aicEventPending
+    }
+
+    /// AIC に CPU0 向けの未配送イベントがあるか。
+    private var aicEventPending: Bool {
+        if !aicIPIselfMasked && aicIPIselfPending { return true }
+        if !aicIPIotherMasked && aicIPIotherPending { return true }
+        for irq in 0..<Self.aicIRQCount {
+            if !aicMask[irq] && (aicTarget[irq] & 1) != 0 && aicIRQAsserted(irq) { return true }
+        }
+        return false
+    }
+
+    /// ハードウェア割り込みライン（またはソフトウェア生成）の状態。
+    private func aicIRQAsserted(_ irq: Int) -> Bool {
+        if aicSW[irq] { return true }
+        switch irq {
+        case Self.aicUARTIRQ: return !inputQueueEmpty
+        case Self.aicNVMeIRQ: return nvmeIRQLine
+        default: return false
+        }
+    }
+
+    /// AIC_EVENT の読み取り: 最優先イベントを返し、その IRQ を自動マスクする。
+    /// ハードウェア割り込み（タイプ 1）を IPI（タイプ 4）より先に配送する。
+    private func aicReadEvent() -> UInt64 {
+        for irq in 0..<Self.aicIRQCount {
+            if !aicMask[irq] && (aicTarget[irq] & 1) != 0 && aicIRQAsserted(irq) {
+                aicMask[irq] = true            // 配送時の自動マスク（実機と同じ）
+                aicSW[irq] = false
+                if irq == Self.aicNVMeIRQ { nvmeIRQLine = false }
+                return (1 << 16) | UInt64(irq)
+            }
+        }
+        if !aicIPIotherMasked && aicIPIotherPending { return (4 << 16) | 1 }
+        if !aicIPIselfMasked && aicIPIselfPending { return (4 << 16) | 2 }
+        return 0
+    }
+
+    private func aicRead(offset: UInt64) -> UInt64 {
+        switch offset {
+        case 0x0004: return UInt64(Self.aicIRQCount)              // INFO: NR_IRQ
+        case 0x2000: return 0                                     // WHOAMI: CPU 0
+        case 0x2004: return aicReadEvent()                        // EVENT
+        case 0x2024, 0x2028:                                      // IPI マスク状態
+            return (aicIPIotherMasked ? UInt64(1) : 0) | (aicIPIselfMasked ? UInt64(1) << 31 : 0)
+        default:
+            if offset >= 0x3000 && offset < 0x3000 + UInt64(Self.aicIRQCount) * 4 {
+                return UInt64(aicTarget[Int((offset - 0x3000) / 4)])
+            }
+            if offset >= 0x4000 && offset < 0x4280 {
+                // バンク領域: 0=SW_SET 1=SW_CLR 2=MASK_SET 3=MASK_CLR 4=HW_STATE（128 バイトごと）
+                let region = (offset - 0x4000) >> 7
+                let bank = Int((offset & 0x7F) / 4)
+                var bits: UInt32 = 0
+                for i in 0..<32 {
+                    let irq = bank * 32 + i
+                    if irq >= Self.aicIRQCount { break }
+                    let on: Bool
+                    switch region {
+                    case 0, 1: on = aicSW[irq]
+                    case 2, 3: on = aicMask[irq]
+                    case 4: on = aicIRQAsserted(irq)
+                    default: on = false
+                    }
+                    if on { bits |= UInt32(1) << i }
+                }
+                return UInt64(bits)
+            }
+            return 0
+        }
+    }
+
+    private func aicWrite(offset: UInt64, value: UInt64) {
+        let v = UInt32(truncatingIfNeeded: value)
+        switch offset {
+        case 0x2008:  // IPI_SEND: bit31 = 自分宛て、その他ビット = 対象 CPU（0 のみ存在）
+            if v & (1 << 31) != 0 { aicIPIselfPending = true }
+            if v & 1 != 0 { aicIPIotherPending = true }
+        case 0x200C:  // IPI_ACK
+            if v & 1 != 0 { aicIPIotherPending = false }
+            if v & (1 << 31) != 0 { aicIPIselfPending = false }
+        case 0x2024:  // IPI_MASK_SET
+            if v & 1 != 0 { aicIPIotherMasked = true }
+            if v & (1 << 31) != 0 { aicIPIselfMasked = true }
+        case 0x2028:  // IPI_MASK_CLR
+            if v & 1 != 0 { aicIPIotherMasked = false }
+            if v & (1 << 31) != 0 { aicIPIselfMasked = false }
+        default:
+            if offset >= 0x3000 && offset < 0x3000 + UInt64(Self.aicIRQCount) * 4 {
+                aicTarget[Int((offset - 0x3000) / 4)] = v
+                return
+            }
+            if offset >= 0x4000 && offset < 0x4280 {
+                // バンク領域: 0=SW_SET 1=SW_CLR 2=MASK_SET 3=MASK_CLR 4=HW_STATE（書込無効）
+                let region = (offset - 0x4000) >> 7
+                let bank = Int((offset & 0x7F) / 4)
+                for i in 0..<32 {
+                    let irq = bank * 32 + i
+                    if irq >= Self.aicIRQCount { break }
+                    if v & (UInt32(1) << i) == 0 { continue }
+                    switch region {
+                    case 0: aicSW[irq] = true
+                    case 1: aicSW[irq] = false
+                    case 2: aicMask[irq] = true
+                    case 3: aicMask[irq] = false
+                    default: break
+                    }
+                }
+            }
+        }
     }
 
     /// 例外を EL1 へ配送する（ELR / ESR を設定し、SPSR へ現在の PSTATE を退避）。
@@ -475,6 +644,13 @@ final class ARM64CPU {
         if pa >= Self.controlBase && pa < Self.controlBase + 0x1000 {
             return 0xAE64
         }
+        if pa >= Self.aicBase && pa < Self.aicBase + 0x8000 {
+            return aicRead(offset: pa - Self.aicBase)
+        }
+        if pa >= Self.nvmeBase && pa < Self.nvmeBase + 0x10000 {
+            ensureNVMeWiring()
+            return nvme.readRegister(offset: pa - Self.nvmeBase)
+        }
         throw ARM64Fault.memoryOutOfBounds(address: pa)
     }
 
@@ -496,7 +672,41 @@ final class ARM64CPU {
             exitCode = Int32(truncatingIfNeeded: value)
             return
         }
+        if pa >= Self.aicBase && pa < Self.aicBase + 0x8000 {
+            aicWrite(offset: pa - Self.aicBase, value: value)
+            return
+        }
+        if pa >= Self.nvmeBase && pa < Self.nvmeBase + 0x10000 {
+            ensureNVMeWiring()
+            nvme.writeRegister(offset: pa - Self.nvmeBase, value: value, size: size)
+            return
+        }
         throw ARM64Fault.memoryOutOfBounds(address: pa)
+    }
+
+    /// NVMe コントローラへ RAM アクセスと割り込みラインを結線する（初回アクセス時）。
+    private func ensureNVMeWiring() {
+        if nvmeWired { return }
+        nvmeWired = true
+        nvme.readRAM = { [weak self] address, count in
+            guard let self, address >= Self.ramBase else { return [UInt8](repeating: 0, count: count) }
+            let start = Int(address - Self.ramBase)
+            guard start >= 0, start < self.memory.count else { return [UInt8](repeating: 0, count: count) }
+            let end = min(start + count, self.memory.count)
+            var bytes = [UInt8](self.memory[start..<end])
+            if bytes.count < count { bytes += [UInt8](repeating: 0, count: count - bytes.count) }
+            return bytes
+        }
+        nvme.writeRAM = { [weak self] address, bytes in
+            guard let self, address >= Self.ramBase else { return }
+            let start = Int(address - Self.ramBase)
+            guard start >= 0, start < self.memory.count else { return }
+            let end = min(start + bytes.count, self.memory.count)
+            self.memory.replaceSubrange(start..<end, with: bytes[..<(end - start)])
+        }
+        nvme.onIRQ = { [weak self] in
+            self?.nvmeIRQLine = true
+        }
     }
 
     // MARK: UART（PL011 ライト）
