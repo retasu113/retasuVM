@@ -100,7 +100,7 @@ struct VMRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: vm.configuration.useISO ? "opticaldisc" : vm.configuration.guestImage.systemImage)
+            Image(systemName: vm.configuration.bootSystemImage)
                 .font(.title3)
                 .foregroundStyle(.tint)
                 .frame(width: 28)
@@ -110,7 +110,7 @@ struct VMRowView: View {
                 Text(vm.name)
                     .font(.headline)
                     .lineLimit(1)
-                Text(vm.configuration.summary)
+                Text("\(vm.configuration.architecture.label) / \(vm.configuration.summary)")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -122,6 +122,6 @@ struct VMRowView: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(vm.name)、\(vm.configuration.useISO ? (vm.configuration.isoDisplayName ?? "ISO ファイル") : vm.configuration.guestImage.displayName)、\(vm.configuration.summary)、状態は\(vm.state.label)")
+        .accessibilityLabel("\(vm.name)、\(vm.configuration.architecture.label)、\(vm.configuration.bootTargetName)、\(vm.configuration.summary)、状態は\(vm.state.label)")
     }
 }

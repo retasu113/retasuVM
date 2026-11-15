@@ -88,16 +88,14 @@ struct VMDetailView: View {
         Section {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 12) {
-                    Image(systemName: vm.configuration.useISO ? "opticaldisc" : vm.configuration.guestImage.systemImage)
+                    Image(systemName: vm.configuration.bootSystemImage)
                         .font(.largeTitle)
                         .foregroundStyle(.tint)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(vm.name)
                             .font(.title3.weight(.semibold))
-                        Text(vm.configuration.useISO
-                             ? (vm.configuration.isoDisplayName ?? "ISO ファイル")
-                             : vm.configuration.guestImage.displayName)
+                        Text("\(vm.configuration.architecture.label) / \(vm.configuration.bootTargetName)")
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -177,11 +175,20 @@ struct VMDetailView: View {
 
     private func configurationSection(for vm: VirtualMachine) -> some View {
         Section("構成") {
-            LabeledContent("起動方法", value: vm.configuration.useISO ? "ISO ファイル" : "ゲストイメージ")
-            if vm.configuration.useISO {
-                LabeledContent("ISO", value: vm.configuration.isoDisplayName ?? "未選択")
-            } else {
-                LabeledContent("ゲストイメージ", value: vm.configuration.guestImage.displayName)
+            LabeledContent("CPU アーキテクチャ", value: "\(vm.configuration.architecture.label)（\(vm.configuration.architecture.detail)）")
+            switch vm.configuration.architecture {
+            case .riscv:
+                LabeledContent("起動方法", value: vm.configuration.useISO ? "ISO ファイル" : "ゲストイメージ")
+                if vm.configuration.useISO {
+                    LabeledContent("ISO", value: vm.configuration.isoDisplayName ?? "未選択")
+                } else {
+                    LabeledContent("ゲストイメージ", value: vm.configuration.guestImage.displayName)
+                }
+            case .x86:
+                LabeledContent("起動方法", value: "BIOS（ISO / イメージ）")
+                LabeledContent("イメージ", value: vm.configuration.isoDisplayName ?? "未選択")
+            case .arm:
+                LabeledContent("ゲスト", value: "ArmDemoOS")
             }
             LabeledContent("CPU", value: "\(vm.configuration.cpuCount) コア")
             LabeledContent("メモリ", value: vm.configuration.memoryText)
@@ -203,7 +210,7 @@ struct VMDetailView: View {
                 .split(separator: "\n", omittingEmptySubsequences: true)
                 .suffix(4)
             if tail.isEmpty {
-                Text("コンソール出力はまだありません。起動するとゲスト OS（\(vm.configuration.useISO ? (vm.configuration.isoDisplayName ?? "ISO") : vm.configuration.guestImage.displayName)）を操作できます。")
+                Text("コンソール出力はまだありません。起動するとゲスト OS（\(vm.configuration.bootTargetName)）を操作できます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {

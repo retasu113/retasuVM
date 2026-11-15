@@ -69,7 +69,7 @@ struct VMConsoleView: View {
 
     private var quickCommands: some View {
         HStack(spacing: 8) {
-            ForEach(vm.map { $0.configuration.useISO ? ["info", "help"] : $0.configuration.guestImage.quickCommands } ?? [], id: \.self) { command in
+            ForEach(vm?.configuration.quickCommands ?? [], id: \.self) { command in
                 Button(command) {
                     send(command + "\n")
                 }

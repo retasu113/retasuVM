@@ -6,11 +6,13 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("retasuVM について") {
-                    LabeledContent("バージョン", value: "0.4.0")
+                    LabeledContent("バージョン", value: "0.5.0")
                     LabeledContent("対応 OS", value: "iOS 17 / iPadOS 17 以降")
-                    LabeledContent("エミュレータ", value: "RISC-V RV32IM（メモリ 1 MiB）")
-                    LabeledContent("ISO 起動", value: "ISO 9660（BOOT.BIN 形式）対応")
-                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。実行エンジンは RISC-V CPU のソフトウェアエミュレータで、ゲスト OS「retasuOS」が実際に動作します。iOS ではハードウェア仮想化が使えないため、Linux や Windows のような一般の OS は実行できません。")
+                    LabeledContent("RISC-V", value: "RV32IM（メモリ 1 MiB）")
+                    LabeledContent("x86", value: "リアルモード + 自作 BIOS")
+                    LabeledContent("ARM", value: "ARMv7-A サブセット（メモリ 4 MiB）")
+                    LabeledContent("ISO 起動", value: "BOOT.BIN 形式 / El Torito 対応")
+                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。実行エンジンはすべて自作のソフトウェアエミュレータ（RISC-V / x86 / ARM）で、ゲストが実際に動作します。iOS ではハードウェア仮想化が使えないため、Windows や現在の Linux のような一般の OS は実行できません。x86 はリアルモードのブートプログラムが対象です。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
