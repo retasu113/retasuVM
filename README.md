@@ -3,7 +3,7 @@
 retasuVM は、iPhone と iPad で仮想マシンを管理するための SwiftUI アプリです。
 Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgrounds でそのまま開けるプロジェクト形式（`.swiftpm`）で配布します。
 
-> **現在の実行エンジンについて**: v0.7.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 自作 BIOS + 周辺デバイス群）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、割り込み・タイマ・ディスクなどのデバイスを使う OS が動作します。iOS / iPadOS ではハードウェア仮想化がアプリに提供されないため、Windows や現在の Linux のような一般の OS は実行できません（UEFI / ロングモードなどが別途必要です）。
+> **現在の実行エンジンについて**: v0.8.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード + 自作 BIOS / 最小 UEFI + 周辺デバイス群）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、ロングモードへの移行、APIC 割り込み、ACPI テーブルの読み取り、UEFI アプリケーション（.efi）の実行が可能です。ただし UEFI は最小実装（コンソール出力と基本ブートサービスのみ）で、Block I/O やファイルシステム、変数サービスがないため、Windows や現在の Linux のような一般の OS はまだ実行できません。
 
 ## 主な機能
 
@@ -17,13 +17,16 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
   - PlayOS: 数当てゲームとサイコロ（guess / dice / help / quit）
   - CalcOS: スタック式（RPN）計算機（+ - * / % / dup / drop / swap / p など）
 - ISO ファイルからの起動（ISO 9660 を解析し BOOT.BIN を実行。ISO 全体はディスクとしてゲストから読み取り可能）
-- x86 エミュレータ（リアルモード + 32 ビット プロテクトモード CPU + 自作 BIOS サービス）
+- x86 エミュレータ（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード CPU + 自作 BIOS / 最小 UEFI）
   - El Torito 対応 ISO から BIOS ブート（フロッピー / ハードディスク エミュレーション）
   - ブートセクタ付き raw イメージ（.img）からもブート可能
-  - BIOS コール対応: INT 10h（画面）/ INT 13h（ディスク、CHS・LBA）/ INT 16h（キーボード）/ INT 12h / INT 1Ah / INT 15h
+  - BIOS コール対応: INT 10h（画面）/ INT 13h（ディスク、CHS・LBA）/ INT 16h（キーボード）/ INT 12h / INT 1Ah / INT 15h（E820 メモリマップ含む）
   - 32 ビット プロテクトモード対応（GDT / LDT、IDT 割り込み・例外配送、ページング、CPUID）
+  - 64 ビット ロングモード対応（REX プリフィクス、4 階層ページング、EFER、IRETQ、RIP 相対アドレッシング、FS/GS ベース MSR、CR8 = LAPIC TPR）
   - Multiboot ブートローダ内蔵: Multiboot 対応 ELF32 カーネルを直接起動（ISO 内の KERNEL.ELF も自動検出）
-  - 周辺デバイス再現: 割り込みコントローラ（8259A PIC ×2）、タイマ（8254 PIT）、キーボードコントローラ（8042、スキャンコード + IRQ1）、PCI ホストブリッジ（ホスト / ISA / IDE / VGA の 4 デバイスを列挙可能）、IDE（ATA）ディスク（PIO、BIOS とイメージ共有）、RTC / CMOS、シリアル（16550 相当、割り込み対応）
+  - 最小 UEFI ファームウェア: PE32+（x86-64）アプリケーション（.efi）をロングモードで起動。コンソール出力（ConOut）と基本ブートサービス（メモリマップ取得、メモリ確保、ExitBootServices など）を提供し、SystemTable の ConfigurationTable から ACPI RSDP を参照可能
+  - ACPI テーブル生成: RSDP / XSDT / RSDT / FADT / DSDT / MADT（チェックサム付き）を BIOS 領域に配置
+  - 周辺デバイス再現: 割り込みコントローラ（8259A PIC ×2、LAPIC タイマ、IOAPIC）、タイマ（8254 PIT）、キーボードコントローラ（8042、スキャンコード + IRQ1）、PCI ホストブリッジ（ホスト / ISA / IDE / VGA の 4 デバイスを列挙可能）、IDE（ATA）ディスク（PIO、BIOS とイメージ共有）、RTC / CMOS、シリアル（16550 相当、割り込み対応）
   - HLT での割り込み待ち（アイドル）と、タイマ割り込みによる復帰に対応
   - シリアルポート（COM1）とポート 0xE9 デバッグコンソールをコンソールに接続
 - ARM エミュレータ（ARMv7-A、A32 命令サブセット + 自作アセンブラ）
@@ -73,7 +76,7 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
 2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にして、ダウンロードした .iso を選びます。
 3. VM を起動すると、内蔵 BIOS が El Torito ブートイメージ（1.44 MB フロッピー）からブートセクタを読み込んで実行します。デモはブートドライブ番号の表示、INT 13h でのセクタ読み取り、キーエコー（ESC で停止）を行います。
 
-x86 で起動できるのは、El Torito 対応 ISO（フロッピー / ハードディスク エミュレーション、エミュレーションなし）と、ブートセクタ（55 AA）付きの raw イメージです。ゲストは 16 ビット リアルモードで動作し、BIOS コール（INT 10h / 13h / 16h など）とシリアルポート（COM1）が使えます。ブートセクタから GDT を設定して 32 ビット プロテクトモードへ移行する OS も動作します（ページング、IDT 割り込み対応）。Windows や現在の Linux は、ブート方式と周辺デバイスの再現が別途必要なため起動できません。
+x86 で起動できるのは、El Torito 対応 ISO（フロッピー / ハードディスク エミュレーション、エミュレーションなし）と、ブートセクタ（55 AA）付きの raw イメージです。ゲストは 16 ビット リアルモードで動作し、BIOS コール（INT 10h / 13h / 16h など）とシリアルポート（COM1）が使えます。ブートセクタから GDT を設定して 32 ビット プロテクトモードへ移行する OS も動作します（ページング、IDT 割り込み対応）。さらに 4 階層ページングと EFER を設定すれば 64 ビット ロングモードへ移行できます（動作確認用カーネル `retasuVM-sample-lm.elf` が Release にあります。起動すると ACPI テーブルの走査、ロングモード移行、LAPIC タイマ、IOAPIC 経由キーボード割り込みを順に確認します）。
 
 ### x86（Multiboot カーネル）
 
@@ -85,8 +88,17 @@ x86 で起動できるのは、El Torito 対応 ISO（フロッピー / ハー�
 
 Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます（内容は VM の停止で消えます）。PIC / PIT / キーボード / PCI / IDE / RTC などのデバイスが使えます。動作をまとめて確認できる試作用カーネル `retasuVM-sample-devices.elf` も Release にあります。起動してコンソール入力で「A」と送ると、TIMER / KBD / PCI / IDE / RTC の確認結果が順に表示されます。
 
+### x86（UEFI アプリケーション）
+
+1. Release から `retasuVM-sample-uefi.efi`（試作用サンプル）をダウンロードします。
+2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にして、ダウンロードした .efi を選びます。
+3. VM を起動すると、最小 UEFI ファームウェアが PE32+ イメージを読み込み、ロングモードでエントリポイントを呼びます（RCX = ImageHandle、RDX = SystemTable）。サンプルは ConOut へ挨拶を表示し、GetMemoryMap と ExitBootServices を呼んだあと、シリアルポートへ直接出力して停止します。
+
+自作 UEFI アプリの条件: x86-64 の PE32+ イメージ（サブシステム: EFI アプリケーション / ブートサービスドライバ / ランタイムドライバ）。ImageBase は 16 MiB の RAM 内に収まる必要があります。使えるサービスは ConOut（OutputString など）と基本ブートサービス（AllocatePages / AllocatePool / GetMemoryMap / ExitBootServices / Stall / CopyMem / SetMem / CalculateCrc32 など）に限ります。Block I/O、Simple File System、変数サービス、プロトコル検索（LocateProtocol は常に未発見を返します）は未提供のため、Windows Boot Manager や GRUB のような本格的なブートローダは起動できません。
+
 ## 現在の開発状況
 
+- v0.8.0: x86 に 64 ビット ロングモード（REX / 4 階層ページング / EFER）、LAPIC / IOAPIC、ACPI テーブル（RSDP〜MADT）、最小 UEFI ファームウェア（PE32+ ローダ + ConOut + 基本ブートサービス）を追加。ロングモード検証カーネルと UEFI サンプルアプリで実行テストを実施済み。
 - v0.7.0: x86 に PC 周辺デバイス（PIC / PIT / キーボード / PCI / IDE / RTC / シリアル）を追加。割り込みで動く OS らしいカーネルが動作するようになった。デバイス検証カーネルと全エンジンの実行テストを実施済み。
 - v0.6.0: x86 に 32 ビット プロテクトモード（GDT / IDT / ページング）と Multiboot ブートローダを追加。Multiboot 対応カーネルが起動できるようになった。サンプルカーネルと、全エンジンの実行テストを実施済み。
 - v0.5.0: x86（リアルモード CPU + 自作 BIOS + El Torito ブート）と ARM（ARMv7-A サブセット + 自作アセンブラ + ArmDemoOS）の 2 エンジンを追加。アーキテクチャは VM ごとに選択可能。全 Swift ファイルの文法チェックと、3 エンジンすべての実行テストを実施済み。
@@ -99,8 +111,8 @@ Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます�
 
 ## 既知の制約
 
-- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）です。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（ブート方式と周辺デバイスのエミュレーションが別途必要なため）。
-- x86 のプロテクトモードはリング 0 のみで、タスクスイッチとユーザーモード、UEFI は未実装です（ファームウェア相当は自作 BIOS サービス層が担います）。IDE は PIO 転送のみ（DMA なし）、VGA はレジスタとテキストメモリの保持のみで画面描画はしません。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。
+- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード / ロングモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）、最小 UEFI で動く PE32+ アプリケーション（.efi）です。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（UEFI が最小実装で、Block I/O やファイルシステム、変数サービスなどが未提供のため）。
+- x86 のプロテクトモード / ロングモードはリング 0 のみで、タスクスイッチとユーザーモードは未実装です。SYSCALL / SYSRET 命令も未実装です。UEFI ランタイムサービスはほぼ未提供（ResetSystem のみ）で、ExitBootServices 後もブートサービスを完全には無効化しません。IDE は PIO 転送のみ（DMA なし）、VGA はレジスタとテキストメモリの保持のみで画面描画はしません。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。
 - エミュレータは固定スペック（RISC-V: RV32IM / 1 MiB、x86: リアルモード / 16 MiB、ARM: ARMv7-A サブセット / 4 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
 - ゲスト画面はテキストコンソールのみです（グラフィカル表示はありません）。
 - VM の設定データは端末内にのみ保存されます（同期機能はありません）。

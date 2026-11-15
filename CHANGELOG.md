@@ -2,6 +2,79 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.8.0] - 2026-11-15
+
+### 追加
+
+- x86 CPU に 64 ビット ロングモードを追加した。
+  - レジスタ群を 64 ビット化（R8〜R15 追加）、REX プリフィクス
+    （W / R / X / B）、64 ビット オペランド、RIP 相対アドレッシング。
+  - 4 階層ページング（PML4 / PDPT / PD / PT、2 MiB・1 GiB ラージ
+    ページ、NX ビット、正準アドレス検査）と PAE ページング。
+  - EFER MSR（LME / LMA / NXE / SCE の保持）、FS / GS ベース MSR、
+    KernelGSBase、MOVSXD、IRETQ、16 バイト IDT ゲート配送、
+    CR8（= LAPIC TPR）アクセス。
+  - CPUID を更新（PAE / APIC ビット、ロングモード / NX 対応の
+    拡張リーフ、48 ビット アドレス幅）。
+- LAPIC / IOAPIC を MMIO デバイスとして追加した
+  （`Engine/X86Devices.swift`）。
+  - LAPIC: タイマ（ワンショット / 周期、割り込みベクタ配送）、
+    SVR / TPR / PPR / EOI、IRR / ISR による優先度制御、CR8 連携。
+  - IOAPIC: 24 本のリダイレクションエントリ、エッジ / レベル
+    トリガ、PIT（IRQ0→GSI 2）・キーボード・シリアル・IDE の配線。
+- ACPI テーブルを生成するようにした（`Engine/X86ACPI.swift`）。
+  RSDP（ACPI 2.0、チェックサム 2 種）、XSDT / RSDT、FADT
+  （DSDT ポインタ、リセットレジスタ宣言）、最小 DSDT（AML）、
+  MADT（LAPIC / IOAPIC / ISA 割り込みオーバーライド）を
+  BIOS 領域（0xE0000〜）に配置する。BIOS に INT 15h E820
+  メモリマップと E801 も追加した。
+- 最小 UEFI ファームウェアを追加した（`Engine/X86UEFI.swift`）。
+  - PE32+（x86-64）ローダ: セクション配置を行い、ロングモードで
+    エントリを呼ぶ（RCX = ImageHandle、RDX = SystemTable）。
+  - ConOut プロトコル（OutputString / ClearScreen / QueryMode など）。
+  - ブートサービス: AllocatePages / AllocatePool / GetMemoryMap
+    （MapKey 検証付き ExitBootServices）/ Stall / CopyMem /
+    SetMem / CalculateCrc32 / GetNextMonotonicCount など。
+    サービスはスタブアドレスを CPU フックで横取りして実行する。
+  - SystemTable の ConfigurationTable に ACPI 2.0 の GUID で
+    RSDP へのポインタを登録。ランタイムサービスは ResetSystem のみ。
+- 試作用サンプルを Release に添付: ロングモード検証カーネル
+  （retasuVM-sample-lm.elf、ACPI 走査 + 64 ビット移行 + LAPIC /
+  IOAPIC 検証）と UEFI サンプルアプリ（retasuVM-sample-uefi.efi）。
+- アプリ側: x86 のイメージファイルとして .efi を選択・検証できる
+  ようにし、起動方式の表示に「UEFI」を追加。設定画面と編集画面の
+  説明を更新した。
+
+### 検証
+
+- Swift 5.10 コンパイラで全 Swift ファイル（35 件）の文法チェック
+  を実施し、エラーなし。エンジン全体 + モデルの型チェックも通過。
+- ロングモード検証カーネルの end-to-end テスト: 32 ビットでの
+  ACPI 走査（RSDP チェックサム、XSDT→FACP→DSDT、MADT の LAPIC
+  アドレス）→ 4 階層ページング + EFER で 64 ビット移行 →
+  64 ビット演算・MUL / DIV・MOVSXD・CPUID・RDMSR の確認 →
+  LAPIC タイマ割り込み（IRETQ 復帰）→ IOAPIC 経由キーボード
+  割り込み、すべて成功。
+- UEFI サンプルアプリの end-to-end テスト: ConOut 表示、
+  GetMemoryMap、ExitBootServices、終了後のシリアル直接出力と
+  正常停止を確認。
+- 回帰テスト: BIOS ブート（El Torito ISO）、Multiboot カーネル、
+  デバイス検証カーネル（TIMER / KBD / PCI / IDE / RTC）、
+  RISC-V（retasuOS）、ARM（ArmDemoOS）すべて従来どおり動作。
+  ※ デバイス検証カーネルの IDE READ チェックは、アプリ内蔵の
+  空 RAM ディスクではパターン不一致のため NG 表示になる
+  （読み取り自体は成功。検証用パターン入りディスクを接続した
+  ハーネスでは v0.7.0 時点で確認済み）。
+
+### 既知の制限
+
+- UEFI は最小実装のため、Windows Boot Manager や GRUB は起動
+  できない（Block I/O、Simple File System、変数サービス、
+  プロトコル検索が未提供）。一般の OS（Windows / 現在の Linux）
+  は引き続き実行できない。
+- SYSCALL / SYSRET は未実装。リング 0 のみ（ユーザーモードなし）。
+- 実機の Swift Playgrounds での動作検証は未実施。
+
 ## [0.7.0] - 2026-11-15
 
 ### 追加
