@@ -10,6 +10,8 @@ final class X86Session: GuestSession {
     let bios: X86BIOS
 
     var onOutput: ((String) -> Void)?
+    var onScreenChange: (() -> Void)?
+    private var lastScreenChecksum: UInt64 = 0
     var onClear: (() -> Void)?
     var onHalt: ((Int32) -> Void)?
     var onFault: ((String) -> Void)?
@@ -106,6 +108,11 @@ final class X86Session: GuestSession {
                 return
             }
             X86UEFI.deliverPendingNotifications(cpu: cpu)
+            let screenChecksum = currentScreenChecksum()
+            if screenChecksum != lastScreenChecksum {
+                lastScreenChecksum = screenChecksum
+                onScreenChange?()
+            }
             if cpu.waitingForInterrupt {
                 // OS のアイドル状態: 割り込み（タイマ・キーボード等）を待つ
                 try? await Task.sleep(nanoseconds: 5_000_000)
@@ -173,6 +180,34 @@ final class X86Session: GuestSession {
 
     /// 画面スナップショット: UEFI 起動時は GOP フレームバッファ、
     /// それ以外は VGA テキストメモリ（0xB8000、80×25）を読む。
+    /// 画面の変化検出用チェックサム（FNV-1a、サンプリング）。
+    private func currentScreenChecksum() -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ byte: UInt8) { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        if let gop = X86UEFI.gopFramebufferInfo(cpu: cpu) {
+            mix(UInt8(gop.width & 0xFF))
+            mix(UInt8(gop.height & 0xFF))
+            let total = gop.width * gop.height * 4
+            var offset = 0
+            while offset < total {
+                mix(UInt8((try? cpu.readMemoryValue(at: gop.base + offset, size: 1)) ?? 0))
+                offset += 4093
+            }
+            return hash
+        }
+        if cpu.devices.biosVideoMode == 0x13 || cpu.devices.vgaChain4Graphics {
+            for offset in stride(from: 0, to: 0xFA00, by: 251) {
+                mix(UInt8((try? cpu.readMemoryValue(at: 0xA0000 + offset, size: 1)) ?? 0))
+            }
+            for byte in cpu.devices.vgaPalette { mix(byte) }
+            return hash
+        }
+        for offset in 0..<4000 {
+            mix(UInt8((try? cpu.readMemoryValue(at: 0xB8000 + offset, size: 1)) ?? 0))
+        }
+        return hash
+    }
+
     func screenSnapshot() -> GuestScreenSnapshot? {
         if let gop = X86UEFI.gopFramebufferInfo(cpu: cpu) {
             let count = gop.width * gop.height * 4
@@ -185,6 +220,9 @@ final class X86Session: GuestSession {
                 offset += 8
             }
             return .framebuffer(width: gop.width, height: gop.height, bgra: pixels)
+        }
+        if let vga = cpu.vgaMode13hFrame() {
+            return .framebuffer(width: vga.width, height: vga.height, bgra: vga.bgra)
         }
         var lines: [String] = []
         for row in 0..<25 {

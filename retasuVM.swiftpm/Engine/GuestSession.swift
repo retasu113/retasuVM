@@ -15,6 +15,8 @@ protocol GuestSession: AnyObject {
     var onHalt: ((Int32) -> Void)? { get set }
     /// ゲストがエラーで停止した（引数はメッセージ）
     var onFault: ((String) -> Void)? { get set }
+    /// ゲストの画面内容が変化した（画面を持つセッションのみ）
+    var onScreenChange: (() -> Void)? { get set }
 
     func setPaused(_ paused: Bool)
     func terminate()
@@ -34,4 +36,9 @@ enum GuestScreenSnapshot {
 
 extension GuestSession {
     func screenSnapshot() -> GuestScreenSnapshot? { nil }
+
+    var onScreenChange: (() -> Void)? {
+        get { nil }
+        set { }
+    }
 }

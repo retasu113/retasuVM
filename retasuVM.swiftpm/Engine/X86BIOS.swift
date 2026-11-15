@@ -113,7 +113,12 @@ final class X86BIOS {
         guard let cpu else { return .handled }
         let ah = cpu.register8(4)
         switch ah {
-        case 0x00: // モード設定（テキストモードとして画面クリア）
+        case 0x00: // モード設定（レジスタ表を読み込み、画面をクリア）
+            let mode = cpu.register8(0)
+            cpu.devices.loadVideoModeRegisters(mode)
+            if mode & 0x7F == 0x13, mode & 0x80 == 0 {
+                cpu.loadData([UInt8](repeating: 0, count: 0x10000), at: 0xA0000)
+            }
             cpu.onClearScreen?()
         case 0x0E: // テレタイプ出力
             let byte = cpu.register8(0)
@@ -139,7 +144,7 @@ final class X86BIOS {
         case 0x06, 0x07: // スクロール（全消去のみ対応）
             if cpu.register8(0) == 0 { cpu.onClearScreen?() }
         case 0x0F: // 現在のモード取得
-            cpu.setRegister8(0, 3)  // AL: モード 3
+            cpu.setRegister8(0, cpu.devices.biosVideoMode) // AL: 現在のモード
             cpu.setRegister8(4, 80) // AH: 桁数
             cpu.setRegister8(7, 0)  // BH: ページ
         case 0x03: // カーソル位置取得

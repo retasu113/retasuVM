@@ -53,6 +53,72 @@ final class X86DeviceBus {
     private var vgaAttributeIndex = 0
     private var vgaAttributeFlipFlop = false
     private var vgaMiscOutput: UInt8 = 0x67
+    // DAC パレット（256 色 × RGB、各 6 ビット）と読み書きインデックス
+    private var vgaDACPalette = [UInt8](repeating: 0, count: 256 * 3)
+    private var vgaDACWriteIndex = 0
+    private var vgaDACWriteComponent = 0
+    private var vgaDACReadIndex = 0
+    private var vgaDACReadComponent = 0
+    /// BIOS で最後に設定されたビデオモード。
+    private(set) var biosVideoMode: UInt8 = 0x03
+    /// チェーン 4 グラフィックス（モード 13h 相当のメモリ配置）かどうか。
+    var vgaChain4Graphics: Bool {
+        vgaSequencer[4] & 0x08 != 0 && vgaAttribute[0x10] & 0x01 != 0
+    }
+    var vgaPalette: [UInt8] { vgaDACPalette }
+
+    /// BIOS モード設定: 標準レジスタ表を読み込み、モード 13h では
+    /// 既定パレット（16 色 + カラーキューブ + グレースケール）も設定する。
+    func loadVideoModeRegisters(_ mode: UInt8) {
+        let selected = mode & 0x7F
+        biosVideoMode = selected
+        let tables: [UInt8: (misc: UInt8, seq: [UInt8], crtc: [UInt8], gfx: [UInt8], attr: [UInt8])] = [
+            0x03: (0x67, [0x03, 0x00, 0x03, 0x00, 0x02],
+                   [0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0x00, 0x4F, 0x0D, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3, 0xFF],
+                   [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF],
+                   [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x0C, 0x00, 0x0F, 0x08, 0x00]),
+            0x12: (0xE3, [0x03, 0x01, 0x0F, 0x00, 0x06],
+                   [0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF],
+                   [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0F, 0xFF],
+                   [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x01, 0x00, 0x0F, 0x00, 0x00]),
+            0x13: (0x63, [0x03, 0x01, 0x0F, 0x00, 0x0E],
+                   [0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF],
+                   [0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0F, 0xFF],
+                   [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x41, 0x00, 0x0F, 0x00, 0x00]),
+        ]
+        guard let table = tables[selected] ?? tables[0x03] else { return }
+        vgaMiscOutput = table.misc
+        vgaSequencer = table.seq
+        vgaCRTC = table.crtc
+        vgaGraphics = table.gfx
+        vgaAttribute = table.attr
+        vgaAttributeFlipFlop = false
+        if selected == 0x13 {
+            let base16: [(UInt8, UInt8, UInt8)] = [
+                (0, 0, 0), (0, 0, 42), (0, 42, 0), (0, 42, 42), (42, 0, 0), (42, 0, 42), (42, 21, 0), (42, 42, 42),
+                (21, 21, 21), (21, 21, 63), (21, 63, 21), (21, 63, 63), (63, 21, 21), (63, 21, 63), (63, 63, 21), (63, 63, 63),
+            ]
+            for (index, rgb) in base16.enumerated() {
+                vgaDACPalette[index * 3] = rgb.0
+                vgaDACPalette[index * 3 + 1] = rgb.1
+                vgaDACPalette[index * 3 + 2] = rgb.2
+            }
+            let levels: [UInt8] = [0, 23, 33, 43, 53, 63] // 8 ビット値 0/95/135/175/215/255 の 6 ビット換算
+            var index = 16
+            for red in levels { for green in levels { for blue in levels {
+                vgaDACPalette[index * 3] = red
+                vgaDACPalette[index * 3 + 1] = green
+                vgaDACPalette[index * 3 + 2] = blue
+                index += 1
+            } } }
+            for step in 0..<24 {
+                let gray = UInt8(2 + step * 2) // 8 ビット値 8〜238（10 刻み）の 6 ビット換算近似
+                vgaDACPalette[(232 + step) * 3] = gray
+                vgaDACPalette[(232 + step) * 3 + 1] = gray
+                vgaDACPalette[(232 + step) * 3 + 2] = gray
+            }
+        }
+    }
 
     init() {
         ide.bus = self
@@ -212,6 +278,18 @@ final class X86DeviceBus {
             return vgaSequencerIndex
         case 0x3C5:
             return vgaSequencer[Int(vgaSequencerIndex) % vgaSequencer.count]
+        case 0x3C7:
+            return UInt8(vgaDACReadIndex)
+        case 0x3C8:
+            return UInt8(vgaDACWriteIndex)
+        case 0x3C9: // DAC データ（読み出し）
+            let value = vgaDACPalette[vgaDACReadIndex * 3 + vgaDACReadComponent]
+            vgaDACReadComponent += 1
+            if vgaDACReadComponent == 3 {
+                vgaDACReadComponent = 0
+                vgaDACReadIndex = (vgaDACReadIndex + 1) & 0xFF
+            }
+            return value
         case 0x3CC:
             return vgaMiscOutput
         case 0x3CE:
@@ -299,6 +377,19 @@ final class X86DeviceBus {
             vgaAttributeFlipFlop.toggle()
         case 0x3C2:
             vgaMiscOutput = value
+        case 0x3C7: // DAC 読み出しインデックス設定
+            vgaDACReadIndex = Int(value)
+            vgaDACReadComponent = 0
+        case 0x3C8: // DAC 書き込みインデックス設定
+            vgaDACWriteIndex = Int(value)
+            vgaDACWriteComponent = 0
+        case 0x3C9: // DAC データ書き込み
+            vgaDACPalette[vgaDACWriteIndex * 3 + vgaDACWriteComponent] = value & 0x3F
+            vgaDACWriteComponent += 1
+            if vgaDACWriteComponent == 3 {
+                vgaDACWriteComponent = 0
+                vgaDACWriteIndex = (vgaDACWriteIndex + 1) & 0xFF
+            }
         case 0x3C4:
             vgaSequencerIndex = value
         case 0x3C5:

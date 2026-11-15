@@ -1028,6 +1028,12 @@ final class X86CPU {
     /// XMM レジスタ（16 本 × 16 バイト）と MXCSR。
     var xmmRegisters = [[UInt8]](repeating: [UInt8](repeating: 0, count: 16), count: 16)
     var mxcsr: UInt32 = 0x1F80
+    var mmRegisters = [UInt64](repeating: 0, count: 8) // MMX レジスタ（x87 とは別保持のサブセット実装）
+    var xcr0: UInt64 = 1 // XCR0（bit0 = x87 は常時有効）
+    var tscAux: UInt32 = 0 // IA32_TSC_AUX（RDTSCP 用）
+    var fpuLastInstructionPointer: UInt64 = 0 // FLDENV / FNSTENV / FNSAVE 用
+    var fpuLastDataPointer: UInt64 = 0
+    var fpuLastOpcode: UInt16 = 0
 
     private struct ModRM {
         var reg: Int
@@ -1969,7 +1975,7 @@ final class X86CPU {
             let value = try readOperand(modRM, size: size)
             try writeOperand(modRM, size: size, shift(modRM.reg, value, count, size: size))
         case 0xD8...0xDF: // x87 FPU
-            try executeX87(opcode: opcode, address: startIP)
+            try executeX87(opcode: opcode, operandSize: operandSize, address: startIP)
         case 0xD4: // AAM（64 ビットモードでは #UD）
             guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let base = UInt64(try fetch8())
@@ -2216,6 +2222,27 @@ final class X86CPU {
             }
         case 0x01: // グループ7（SGDT / SIDT / LGDT / LIDT / SMSW / LMSW / INVLPG）
             let modRM = try decodeModRM()
+            if modRM.isRegister, modRM.reg == 2, modRM.registerIndex == 0 { // XGETBV（0F 01 D0）
+                guard register32(1) == 0 else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+                registers[0] = xcr0 & 0xFFFFFFFF
+                registers[2] = xcr0 >> 32
+                break
+            }
+            if modRM.isRegister, modRM.reg == 2, modRM.registerIndex == 1 { // XSETBV（0F 01 D1）
+                try requireCPL0()
+                guard register32(1) == 0 else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+                let value = (registers[2] << 32) | (registers[0] & 0xFFFFFFFF)
+                guard value & 1 != 0, value & ~0x3 == 0 else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+                xcr0 = value
+                break
+            }
+            if modRM.isRegister, modRM.reg == 7, modRM.registerIndex == 1 { // RDTSCP（0F 01 F9）
+                if controlRegisters[4] & 0x4 != 0, currentPrivilegeLevel != 0 { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+                registers[0] = instructionsExecuted & 0xFFFFFFFF
+                registers[2] = instructionsExecuted >> 32
+                registers[1] = UInt64(tscAux)
+                break
+            }
             switch modRM.reg {
             case 0, 1: // SGDT / SIDT
                 guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
@@ -2282,7 +2309,7 @@ final class X86CPU {
             instructionPointer = operandSize == 8 ? registers[1] : (registers[1] & 0xFFFFFFFF)
         case 0x06: // CLTS
             try requireCPL0()
-            break
+            controlRegisters[0] &= ~0x8 // CR0.TS をクリア
         case 0x08, 0x09: // INVD / WBINVD（キャッシュを持たないため何もしない）
             break
         case 0x0B: // UD2
@@ -2318,6 +2345,7 @@ final class X86CPU {
             case 0xC0000100: segmentCaches[4].base = value // FS.base
             case 0xC0000101: segmentCaches[5].base = value // GS.base
             case 0xC0000102: kernelGSBase = value
+            case 0xC0000103: tscAux = UInt32(value & 0xFFFFFFFF)
             case 0xC0000081: starMSR = value
             case 0xC0000082: lstarMSR = value
             case 0xC0000083: cstarMSR = value
@@ -2334,6 +2362,7 @@ final class X86CPU {
             case 0xC0000100: value = segmentCaches[4].base
             case 0xC0000101: value = segmentCaches[5].base
             case 0xC0000102: value = kernelGSBase
+            case 0xC0000103: value = UInt64(tscAux)
             case 0xC0000081: value = starMSR
             case 0xC0000082: value = lstarMSR
             case 0xC0000083: value = cstarMSR
@@ -2342,6 +2371,52 @@ final class X86CPU {
             }
             registers[0] = value & 0xFFFFFFFF
             registers[2] = value >> 32
+        case 0x31: // RDTSC
+            if controlRegisters[4] & 0x4 != 0, currentPrivilegeLevel != 0 { throw CPUTrap.exception(vector: 13, errorCode: 0) } // CR4.TSD
+            registers[0] = instructionsExecuted & 0xFFFFFFFF
+            registers[2] = instructionsExecuted >> 32
+        case 0x38: // 3 バイトマップ（SSSE3 / SSE4.1 / MOVBE）
+            try executeSSE38(operandSize: operandSize, address: address)
+        case 0x3A: // 3 バイトマップ（SSE4.1 即値形式）
+            try executeSSE3A(operandSize: operandSize, address: address)
+        case 0x77: // EMMS（x87 タグをすべて空にする）
+            if controlRegisters[0] & 0x4 != 0 || controlRegisters[0] & 0x8 != 0 { throw CPUTrap.exception(vector: 7, errorCode: nil) }
+            for i in 0..<8 { fpuValid[i] = false }
+        case 0xB8: // POPCNT（F3 プリフィクス必須）
+            guard decodeRepeatPrefix == 0xF3 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            let value = try readOperand(modRM, size: operandSize)
+            let result = UInt64(value.nonzeroBitCount)
+            setRegisterValue(modRM.reg, size: operandSize, result)
+            flags = (flags & ~0x8D5) | (result == 0 ? 0x40 : 0) // CF/OF/SF/PF/AF = 0、ZF のみ結果依存
+        case 0xC7: // グループ9（CMPXCHG8B / CMPXCHG16B は /1）
+            let modRM = try decodeModRM()
+            guard modRM.reg == 1, !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            if operandSize == 8 { // CMPXCHG16B
+                let low = try readOperand(modRM, size: 8)
+                let offset = resolvedOffset(modRM)
+                let high = try readGuest(segmentIndex: modRM.segmentIndex, offset: offset &+ 8, size: 8)
+                if registers[0] == low, registers[2] == high {
+                    try writeOperand(modRM, size: 8, registers[3])
+                    try writeGuest(segmentIndex: modRM.segmentIndex, offset: offset &+ 8, size: 8, registers[1])
+                    setFlag(Self.flagZero, true)
+                } else {
+                    registers[0] = low
+                    registers[2] = high
+                    setFlag(Self.flagZero, false)
+                }
+            } else { // CMPXCHG8B
+                let value = try readOperand(modRM, size: 8)
+                let accumulator = (registers[2] << 32) | (registers[0] & 0xFFFFFFFF)
+                if accumulator == value {
+                    try writeOperand(modRM, size: 8, (registers[1] << 32) | (registers[3] & 0xFFFFFFFF))
+                    setFlag(Self.flagZero, true)
+                } else {
+                    registers[0] = value & 0xFFFFFFFF
+                    registers[2] = value >> 32
+                    setFlag(Self.flagZero, false)
+                }
+            }
         case 0x40...0x4F: // CMOVcc
             let modRM = try decodeModRM()
             if condition(Int(opcode & 0x0F)) {
@@ -2361,15 +2436,20 @@ final class X86CPU {
         case 0xA2: // CPUID
             switch registers[0] {
             case 0:
-                registers[0] = 1
+                registers[0] = 7
                 registers[3] = 0x61746552 // EBX: "Reta"
                 registers[2] = 0x4D567573 // EDX: "suVM"
                 registers[1] = 0x20363878 // ECX: "x86 "
             case 1:
                 registers[0] = 0x00000611
                 registers[3] = 0
-                registers[1] = 0 // ECX: SSE3 等は未実装のため広告しない
+                registers[1] = 0x0CC82201 // ECX: SSE3 / SSSE3 / CMPXCHG16B / SSE4.1 / MOVBE / POPCNT / XSAVE / OSXSAVE
                 registers[2] = 0x07000379 // FPU / PSE / TSC / MSR / PAE / CX8 / APIC / FXSR / SSE / SSE2
+            case 7:
+                registers[0] = 0 // サブリーフ 0: 申告する機能なし
+                registers[3] = 0
+                registers[1] = 0
+                registers[2] = 0
             case 0x80000000:
                 registers[0] = 0x80000008
                 registers[3] = 0
@@ -2379,7 +2459,7 @@ final class X86CPU {
                 registers[0] = 0
                 registers[3] = 0
                 registers[1] = 0x00000001 // ECX: LAHF / SAHF（64 ビット）
-                registers[2] = 0x20100000 // EDX: NX / ロングモード
+                registers[2] = 0x28100000 // EDX: NX / RDTSCP / ロングモード
             case 0x80000008:
                 registers[0] = 0x00003030 // 物理 / リニアとも 48 ビット
                 registers[3] = 0
@@ -2412,9 +2492,9 @@ final class X86CPU {
         case 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E, 0x2F, 0x50,
              0x51, 0x52, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5C, 0x5D, 0x5E, 0x5F,
              0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
-             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x7E, 0x7F, 0xAE, 0xC2, 0xC4, 0xC5, 0xC6, 0xD1, 0xD2, 0xD3,
-             0xD4, 0xD5, 0xD6, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6,
-             0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6,
+             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x7C, 0x7D, 0x7E, 0x7F, 0xAE, 0xC2, 0xC4, 0xC5, 0xC6, 0xD0, 0xD1, 0xD2, 0xD3,
+             0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6,
+             0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6,
              0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE: // SSE / SSE2
             try executeSSE(opcode: opcode, operandSize: operandSize, address: address)
         default:
@@ -2893,8 +2973,8 @@ final class X86CPU {
         }
     }
 
-    private func fpuStoreInt(_ operand: ModRM, size: Int, popAfter: Bool) throws {
-        let rounded = fpuRoundedInteger(fpuST(0))
+    private func fpuStoreInt(_ operand: ModRM, size: Int, popAfter: Bool, truncate: Bool = false) throws {
+        let rounded = truncate ? fpuST(0).rounded(.towardZero) : fpuRoundedInteger(fpuST(0))
         let value: UInt64
         if rounded.isNaN || rounded >= 9.223372036854776e18 || rounded < -9.223372036854776e18 {
             value = size == 8 ? 0x8000000000000000 : (size == 4 ? 0x80000000 : 0x8000) // 整数不定値
@@ -2903,6 +2983,102 @@ final class X86CPU {
         }
         try writeOperand(operand, size: size, value)
         if popAfter { fpuPop() }
+    }
+
+    /// FPU 環境（FLDENV / FNSTENV 用）。32 ビット形式は 28 バイト、16 ビット形式は 14 バイト。
+    private func fpuEnvironment(size32: Bool) -> [UInt8] {
+        var tagWord: UInt16 = 0
+        for i in 0..<8 {
+            let tag: UInt16
+            if !fpuValid[i] {
+                tag = 3
+            } else if fpuRegisters[i] == 0 {
+                tag = 1
+            } else if fpuRegisters[i].isNaN || fpuRegisters[i].isInfinite || (fpuRegisters[i].exponentBitPattern == 0 && fpuRegisters[i].significandBitPattern != 0) {
+                tag = 2
+            } else {
+                tag = 0
+            }
+            tagWord |= tag << (2 * i)
+        }
+        var bytes = [UInt8](repeating: 0, count: size32 ? 28 : 14)
+        func put16(_ offset: Int, _ value: UInt16) { bytes[offset] = UInt8(value & 0xFF); bytes[offset + 1] = UInt8(value >> 8) }
+        func put32(_ offset: Int, _ value: UInt32) { for k in 0..<4 { bytes[offset + k] = UInt8((value >> (8 * k)) & 0xFF) } }
+        put16(0, fpuControlWord)
+        if size32 {
+            put16(4, fpuStatusWord)
+            put16(8, tagWord)
+            put32(12, UInt32(fpuLastInstructionPointer & 0xFFFFFFFF))
+            put16(18, fpuLastOpcode)
+            put32(20, UInt32(fpuLastDataPointer & 0xFFFFFFFF))
+        } else {
+            put16(2, fpuStatusWord)
+            put16(4, tagWord)
+            put16(6, UInt16(fpuLastInstructionPointer & 0xFFFF))
+            put16(10, UInt16(fpuLastDataPointer & 0xFFFF))
+        }
+        return bytes
+    }
+
+    private func fpuLoadEnvironment(_ operand: ModRM, size32: Bool) throws {
+        let bytes = try readOperandBytes(operand, count: size32 ? 28 : 14)
+        func get16(_ offset: Int) -> UInt16 { UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8 }
+        func get32(_ offset: Int) -> UInt32 { UInt32(le32(bytes, offset)) }
+        fpuControlWord = get16(0)
+        let status = get16(size32 ? 4 : 2)
+        fpuTop = Int((status >> 11) & 7)
+        fpuConditionCodes = (status & 0x0100 != 0, status & 0x0200 != 0, status & 0x0400 != 0, status & 0x4000 != 0)
+        let tagWord = get16(size32 ? 8 : 4)
+        for i in 0..<8 { fpuValid[i] = (tagWord >> (2 * i)) & 3 != 3 }
+        if size32 {
+            fpuLastInstructionPointer = UInt64(get32(12))
+            fpuLastOpcode = get16(18)
+            fpuLastDataPointer = UInt64(get32(20))
+        } else {
+            fpuLastInstructionPointer = UInt64(get16(6))
+            fpuLastDataPointer = UInt64(get16(10))
+        }
+    }
+
+    /// FNSAVE: 環境 + スタックイメージ（物理レジスタ順）を書き、FPU を初期化する。
+    private func fpuSaveState(_ operand: ModRM, size32: Bool) throws {
+        var bytes = fpuEnvironment(size32: size32)
+        for i in 0..<8 { bytes += storeExtended(fpuRegisters[i]) }
+        try writeOperandBytes(operand, bytes)
+        fpuControlWord = 0x037F
+        fpuTop = 0
+        fpuConditionCodes = (false, false, false, false)
+        for i in 0..<8 { fpuValid[i] = false }
+    }
+
+    /// FRSTOR: 環境 + スタックイメージを復元する。
+    private func fpuRestoreState(_ operand: ModRM, size32: Bool) throws {
+        let total = (size32 ? 28 : 14) + 80
+        let bytes = try readOperandBytes(operand, count: total)
+        let envCount = size32 ? 28 : 14
+        try fpuLoadEnvironmentBytes(Array(bytes[0..<envCount]), size32: size32)
+        for i in 0..<8 {
+            fpuRegisters[i] = loadExtended(Array(bytes[(envCount + i * 10)..<(envCount + i * 10 + 10)]))
+        }
+    }
+
+    private func fpuLoadEnvironmentBytes(_ bytes: [UInt8], size32: Bool) throws {
+        func get16(_ offset: Int) -> UInt16 { UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8 }
+        func get32(_ offset: Int) -> UInt32 { UInt32(le32(bytes, offset)) }
+        fpuControlWord = get16(0)
+        let status = get16(size32 ? 4 : 2)
+        fpuTop = Int((status >> 11) & 7)
+        fpuConditionCodes = (status & 0x0100 != 0, status & 0x0200 != 0, status & 0x0400 != 0, status & 0x4000 != 0)
+        let tagWord = get16(size32 ? 8 : 4)
+        for i in 0..<8 { fpuValid[i] = (tagWord >> (2 * i)) & 3 != 3 }
+        if size32 {
+            fpuLastInstructionPointer = UInt64(get32(12))
+            fpuLastOpcode = get16(18)
+            fpuLastDataPointer = UInt64(get32(20))
+        } else {
+            fpuLastInstructionPointer = UInt64(get16(6))
+            fpuLastDataPointer = UInt64(get16(10))
+        }
     }
 
     /// 二項演算（operation: 0 加算 / 1 乗算 / 2 比較 / 3 比較+ポップ /
@@ -2955,7 +3131,8 @@ final class X86CPU {
     /// 80 ビット拡張倍精度を Double へ変換する。
     private func loadExtended(_ bytes: [UInt8]) -> Double {
         let mantissa = le64(bytes, 0)
-        let field = bytes[8] | UInt8(bytes[9] & 0x7F) << 8
+        // 指数部は 15 ビット: UInt8 のまま << 8 すると 0 になるため UInt16 で合成する
+        let field = UInt16(bytes[8]) | UInt16(bytes[9] & 0x7F) << 8
         let exponentField = Int(field)
         let negative = bytes[9] & 0x80 != 0
         if exponentField == 0 { return negative ? -0.0 : 0.0 }
@@ -2991,11 +3168,24 @@ final class X86CPU {
         return bytes
     }
 
-    private func executeX87(opcode: UInt8, address: UInt64) throws {
+    private func executeX87(opcode: UInt8, operandSize: Int, address: UInt64) throws {
         if controlRegisters[0] & 0x4 != 0 { // CR0.EM → #NM
             throw CPUTrap.exception(vector: 7, errorCode: nil)
         }
+        if controlRegisters[0] & 0x8 != 0 { // CR0.TS → #NM
+            throw CPUTrap.exception(vector: 7, errorCode: nil)
+        }
         let modRM = try decodeModRM()
+        // 制御系以外の命令では FIP / FDP / FOP を更新する（FNSTENV / FNSAVE 用）
+        let isControl = (opcode == 0xD9 && (modRM.reg == 4 || modRM.reg == 5 || modRM.reg == 6 || modRM.reg == 7))
+            || (opcode == 0xDD && (modRM.reg == 4 || modRM.reg == 6 || modRM.reg == 7))
+        if !isControl {
+            fpuLastInstructionPointer = address
+            fpuLastOpcode = (UInt16(opcode & 7) << 8) | (UInt16(modRM.reg & 7) << 3) | UInt16(modRM.registerIndex & 7)
+            if !modRM.isRegister {
+                fpuLastDataPointer = segmentCaches[modRM.segmentIndex].base &+ resolvedOffset(modRM)
+            }
+        }
         let reg = modRM.reg & 7
         let rm = modRM.registerIndex & 7
         if modRM.isRegister {
@@ -3010,11 +3200,9 @@ final class X86CPU {
             case 0: fpuPush(Double(Float(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
             case 2: try writeOperand(modRM, size: 4, UInt64(Float(fpuST(0)).bitPattern))
             case 3: try writeOperand(modRM, size: 4, UInt64(Float(fpuST(0)).bitPattern)); fpuPop()
-            case 4: fpuControlWord = UInt16(try readOperand(modRM, size: 2) & 0xFFFF) // FLDENV（制御ワードのみ復元）
+            case 4: try fpuLoadEnvironment(modRM, size32: operandSize != 2) // FLDENV
             case 5: fpuControlWord = UInt16(try readOperand(modRM, size: 2) & 0xFFFF) // FLDCW
-            case 6: // FNSTENV（制御 / 状態ワードのみ書く）
-                try writeOperand(modRM, size: 2, UInt64(fpuControlWord))
-                try writeGuest(segmentIndex: modRM.segmentIndex, offset: resolvedOffset(modRM) &+ 2, size: 2, UInt64(fpuStatusWord))
+            case 6: try writeOperandBytes(modRM, fpuEnvironment(size32: operandSize != 2)) // FNSTENV
             case 7: try writeOperand(modRM, size: 2, UInt64(fpuControlWord)) // FNSTCW
             default: throw opcodeFault(opcode, address: address)
             }
@@ -3023,6 +3211,7 @@ final class X86CPU {
         case 0xDB:
             switch reg {
             case 0: fpuPush(Double(Int32(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
+            case 1: try fpuStoreInt(modRM, size: 4, popAfter: true, truncate: true) // FISTTP
             case 2: try fpuStoreInt(modRM, size: 4, popAfter: false)
             case 3: try fpuStoreInt(modRM, size: 4, popAfter: true)
             case 5: fpuPush(loadExtended(try readOperandBytes(modRM, count: 10)))
@@ -3034,10 +3223,12 @@ final class X86CPU {
         case 0xDD:
             switch reg {
             case 0: fpuPush(Double(bitPattern: try readOperand(modRM, size: 8)))
+            case 1: try fpuStoreInt(modRM, size: 8, popAfter: true, truncate: true) // FISTTP
             case 2: try writeOperand(modRM, size: 8, fpuST(0).bitPattern)
             case 3: try writeOperand(modRM, size: 8, fpuST(0).bitPattern); fpuPop()
-            case 4: fpuCompare(fpuST(0), Double(bitPattern: try readOperand(modRM, size: 8)))
-            case 5: fpuCompare(fpuST(0), Double(bitPattern: try readOperand(modRM, size: 8))); fpuPop()
+            case 4: try fpuRestoreState(modRM, size32: operandSize != 2) // FRSTOR
+            case 5: fpuCompare(fpuST(0), Double(bitPattern: try readOperand(modRM, size: 8))) // FUCOM m64
+            case 6: try fpuSaveState(modRM, size32: operandSize != 2) // FNSAVE
             case 7: try writeOperand(modRM, size: 2, UInt64(fpuStatusWord)) // FNSTSW m16
             default: throw opcodeFault(opcode, address: address)
             }
@@ -3046,6 +3237,7 @@ final class X86CPU {
         case 0xDF:
             switch reg {
             case 0: fpuPush(Double(Int16(bitPattern: UInt16(try readOperand(modRM, size: 2)))))
+            case 1: try fpuStoreInt(modRM, size: 2, popAfter: true, truncate: true) // FISTTP
             case 2: try fpuStoreInt(modRM, size: 2, popAfter: false)
             case 3: try fpuStoreInt(modRM, size: 2, popAfter: true)
             case 5: fpuPush(Double(Int64(bitPattern: try readOperand(modRM, size: 8))))
@@ -3211,6 +3403,7 @@ final class X86CPU {
 
     private func executeSSE(opcode: UInt8, operandSize: Int, address: UInt64) throws {
         if controlRegisters[0] & 0x4 != 0 { throw CPUTrap.exception(vector: 7, errorCode: nil) } // CR0.EM → #NM
+        if controlRegisters[0] & 0x8 != 0, opcode != 0xAE { throw CPUTrap.exception(vector: 7, errorCode: nil) } // CR0.TS → #NM
         if controlRegisters[4] & 0x200 == 0 { throw opcodeFault(opcode, address: address) } // CR4.OSFXSR なし → #UD
         let variant = sseVariant
         let p66 = decodePrefix66
@@ -3218,12 +3411,16 @@ final class X86CPU {
         case 0xAE:
             try executeSSEGroupAE(address: address)
         case 0x71, 0x72, 0x73: // シフト（即値）
-            guard p66 else { throw opcodeFault(opcode, address: address) }
             let modRM = try decodeModRM()
             guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
             let count = Int(try fetch8())
-            let index = modRM.registerIndex & 15
-            xmmRegisters[index] = sseShiftImmediate(opcode: opcode, subOperation: modRM.reg & 7, bytes: xmmRegisters[index], count: count)
+            if p66 {
+                let index = modRM.registerIndex & 15
+                xmmRegisters[index] = sseShiftImmediate(opcode: opcode, subOperation: modRM.reg & 7, bytes: xmmRegisters[index], count: count)
+            } else { // MMX 形式
+                let index = modRM.registerIndex & 7
+                mmRegisters[index] = try mmxShiftImmediate(opcode: opcode, subOperation: modRM.reg & 7, value: mmRegisters[index], count: count, address: address)
+            }
         case 0xC2: // CMPPS / CMPPD / CMPSS / CMPSD
             let modRM = try decodeModRM()
             let predicate = Int(try fetch8()) & 7
@@ -3267,21 +3464,30 @@ final class X86CPU {
             } else { throw opcodeFault(opcode, address: address) }
             xmmRegisters[modRM.reg & 15] = result
         case 0xC4: // PINSRW
-            guard p66 else { throw opcodeFault(opcode, address: address) }
             let modRM = try decodeModRM()
-            let lane = Int(try fetch8()) & 7
+            let lane = Int(try fetch8()) & (p66 ? 7 : 3)
             let value = try readOperand(modRM, size: 2)
-            var dest = xmmRegisters[modRM.reg & 15]
-            dest[lane * 2] = UInt8(value & 0xFF)
-            dest[lane * 2 + 1] = UInt8((value >> 8) & 0xFF)
-            xmmRegisters[modRM.reg & 15] = dest
+            if p66 {
+                var dest = xmmRegisters[modRM.reg & 15]
+                dest[lane * 2] = UInt8(value & 0xFF)
+                dest[lane * 2 + 1] = UInt8((value >> 8) & 0xFF)
+                xmmRegisters[modRM.reg & 15] = dest
+            } else {
+                var dest = mmRegisters[modRM.reg & 7]
+                dest = (dest & ~(UInt64(0xFFFF) << (lane * 16))) | ((value & 0xFFFF) << (lane * 16))
+                mmRegisters[modRM.reg & 7] = dest
+            }
         case 0xC5: // PEXTRW
-            guard p66 else { throw opcodeFault(opcode, address: address) }
             let modRM = try decodeModRM()
-            let lane = Int(try fetch8()) & 7
+            let lane = Int(try fetch8()) & (p66 ? 7 : 3)
             guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
-            let src = xmmRegisters[modRM.registerIndex & 15]
-            setRegisterValue(modRM.reg, size: 4, UInt64(src[lane * 2]) | UInt64(src[lane * 2 + 1]) << 8)
+            if p66 {
+                let src = xmmRegisters[modRM.registerIndex & 15]
+                setRegisterValue(modRM.reg, size: 4, UInt64(src[lane * 2]) | UInt64(src[lane * 2 + 1]) << 8)
+            } else {
+                let src = mmRegisters[modRM.registerIndex & 7]
+                setRegisterValue(modRM.reg, size: 4, (src >> (lane * 16)) & 0xFFFF)
+            }
         case 0x28: // MOVAPS / MOVAPD（読み込み）
             let modRM = try decodeModRM()
             xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
@@ -3337,8 +3543,26 @@ final class X86CPU {
                     try writeOperand(modRM, size: 8, le64(src, 0))
                 }
             }
-        case 0x12: // MOVLPS / MOVLPD（読み込み）/ MOVHLPS
+        case 0x12: // MOVLPS / MOVLPD（読み込み）/ MOVHLPS / MOVDDUP（F2）/ MOVSLDUP（F3）
             let modRM = try decodeModRM()
+            if decodeRepeatPrefix == 0xF2 { // MOVDDUP
+                let low = modRM.isRegister ? le64(xmmRegisters[modRM.registerIndex & 15], 0) : try readOperand(modRM, size: 8)
+                var dest = [UInt8](repeating: 0, count: 16)
+                putLE64(&dest, 0, low)
+                putLE64(&dest, 8, low)
+                xmmRegisters[modRM.reg & 15] = dest
+                break
+            }
+            if decodeRepeatPrefix == 0xF3 { // MOVSLDUP
+                let src = try readXMMOperand(modRM)
+                var dest = [UInt8](repeating: 0, count: 16)
+                for lane in 0..<2 {
+                    putLE32(&dest, lane * 8, le32(src, lane * 8))
+                    putLE32(&dest, lane * 8 + 4, le32(src, lane * 8))
+                }
+                xmmRegisters[modRM.reg & 15] = dest
+                break
+            }
             if modRM.isRegister {
                 var dest = xmmRegisters[modRM.reg & 15]
                 let src = xmmRegisters[modRM.registerIndex & 15]
@@ -3352,8 +3576,18 @@ final class X86CPU {
         case 0x13: // MOVLPS / MOVLPD（書き込み）
             let modRM = try decodeModRM()
             try writeOperand(modRM, size: 8, le64(xmmRegisters[modRM.reg & 15], 0))
-        case 0x16: // MOVHPS / MOVHPD（読み込み）/ MOVLHPS
+        case 0x16: // MOVHPS / MOVHPD（読み込み）/ MOVLHPS / MOVSHDUP（F3）
             let modRM = try decodeModRM()
+            if decodeRepeatPrefix == 0xF3 { // MOVSHDUP
+                let src = try readXMMOperand(modRM)
+                var dest = [UInt8](repeating: 0, count: 16)
+                for lane in 0..<2 {
+                    putLE32(&dest, lane * 8, le32(src, lane * 8 + 4))
+                    putLE32(&dest, lane * 8 + 4, le32(src, lane * 8 + 4))
+                }
+                xmmRegisters[modRM.reg & 15] = dest
+                break
+            }
             if modRM.isRegister {
                 var dest = xmmRegisters[modRM.reg & 15]
                 let src = xmmRegisters[modRM.registerIndex & 15]
@@ -3384,15 +3618,28 @@ final class X86CPU {
                 }
             }
             xmmRegisters[modRM.reg & 15] = result
-        case 0x6F: // MOVDQA / MOVDQU（読み込み）
+        case 0x6F: // MOVDQA / MOVDQU（読み込み）/ MOVQ mm（プリフィクスなし）
             let modRM = try decodeModRM()
-            xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
-        case 0x7F, 0xE7: // MOVDQA / MOVDQU / MOVNTDQ（書き込み）
+            if p66 || decodeRepeatPrefix == 0xF3 {
+                xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
+            } else {
+                mmRegisters[modRM.reg & 7] = modRM.isRegister ? mmRegisters[modRM.registerIndex & 7] : try readOperand(modRM, size: 8)
+            }
+        case 0x7F, 0xE7: // MOVDQA / MOVDQU / MOVNTDQ（書き込み）/ MOVQ mm, m64（プリフィクスなし）
             let modRM = try decodeModRM()
-            try writeXMMOperand(modRM, xmmRegisters[modRM.reg & 15])
-        case 0x6E: // MOVD / MOVQ（GPR・メモリ → XMM）
-            guard p66 else { throw opcodeFault(opcode, address: address) }
+            if p66 || decodeRepeatPrefix == 0xF3 {
+                try writeXMMOperand(modRM, xmmRegisters[modRM.reg & 15])
+            } else if modRM.isRegister {
+                mmRegisters[modRM.registerIndex & 7] = mmRegisters[modRM.reg & 7]
+            } else {
+                try writeOperand(modRM, size: 8, mmRegisters[modRM.reg & 7])
+            }
+        case 0x6E: // MOVD / MOVQ（GPR・メモリ → XMM）/ MOVD mm（プリフィクスなし）
             let modRM = try decodeModRM()
+            if !p66 {
+                mmRegisters[modRM.reg & 7] = try readOperand(modRM, size: 4) & 0xFFFFFFFF
+                break
+            }
             var dest = [UInt8](repeating: 0, count: 16)
             if operandSize == 8 {
                 putLE64(&dest, 0, try readOperand(modRM, size: 8))
@@ -3417,6 +3664,8 @@ final class X86CPU {
                 } else {
                     try writeOperand(modRM, size: 4, UInt64(le32(src, 0)))
                 }
+            } else if decodeRepeatPrefix == 0 { // MOVD r/m32, mm
+                try writeOperand(modRM, size: 4, mmRegisters[modRM.reg & 7] & 0xFFFFFFFF)
             } else { throw opcodeFault(opcode, address: address) }
         case 0xD6: // MOVQ（書き込み）
             guard p66 else { throw opcodeFault(opcode, address: address) }
@@ -3505,11 +3754,482 @@ final class X86CPU {
             xmmRegisters[modRM.reg & 15] = result
         case 0x60...0x6D, 0x74, 0x75, 0x76, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
              0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF,
-             0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE: // 整数演算（SSE2）
-            guard p66 else { throw opcodeFault(opcode, address: address) }
+             0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE: // 整数演算（SSE2 / MMX）
+            let modRM = try decodeModRM()
+            if p66 {
+                let src = try readXMMOperand(modRM)
+                try sseInteger(opcode: opcode, dest: modRM.reg & 15, src: src, address: address)
+            } else { // MMX 形式（66 プリフィクスなし）
+                let src = modRM.isRegister ? mmRegisters[modRM.registerIndex & 7] : try readOperand(modRM, size: 8)
+                mmRegisters[modRM.reg & 7] = try mmxInteger(opcode: opcode, dest: mmRegisters[modRM.reg & 7], src: src, address: address)
+            }
+        case 0xD7: // PMOVMSKB
+            let modRM = try decodeModRM()
+            guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            var mask: UInt64 = 0
+            if p66 {
+                let src = xmmRegisters[modRM.registerIndex & 15]
+                for i in 0..<16 where src[i] & 0x80 != 0 { mask |= UInt64(1 << i) }
+            } else {
+                let src = mmRegisters[modRM.registerIndex & 7]
+                for i in 0..<8 where (src >> (i * 8 + 7)) & 1 != 0 { mask |= UInt64(1 << i) }
+            }
+            setRegisterValue(modRM.reg, size: 4, mask)
+        case 0xD0: // ADDSUBPS（F2）/ ADDSUBPD（66）
             let modRM = try decodeModRM()
             let src = try readXMMOperand(modRM)
-            try sseInteger(opcode: opcode, dest: modRM.reg & 15, src: src, address: address)
+            let dest = modRM.reg & 15
+            var result = xmmRegisters[dest]
+            if decodeRepeatPrefix == 0xF2 {
+                for lane in 0..<4 {
+                    let a = Float(bitPattern: le32(result, lane * 4))
+                    let b = Float(bitPattern: le32(src, lane * 4))
+                    putLE32(&result, lane * 4, (lane % 2 == 0 ? a - b : a + b).bitPattern)
+                }
+            } else if p66 {
+                for lane in 0..<2 {
+                    let a = Double(bitPattern: le64(result, lane * 8))
+                    let b = Double(bitPattern: le64(src, lane * 8))
+                    putLE64(&result, lane * 8, (lane % 2 == 0 ? a - b : a + b).bitPattern)
+                }
+            } else { throw opcodeFault(opcode, address: address) }
+            xmmRegisters[dest] = result
+        case 0x7C, 0x7D: // HADDPS / HADDPD（F2 / 66）、HSUBPS / HSUBPD
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            let dest = modRM.reg & 15
+            let destBytes = xmmRegisters[dest]
+            var result = [UInt8](repeating: 0, count: 16)
+            let subtract = opcode == 0x7D
+            if decodeRepeatPrefix == 0xF2 {
+                let lanes: [Float] = (0..<4).map { Float(bitPattern: le32(destBytes, $0 * 4)) }
+                let other: [Float] = (0..<4).map { Float(bitPattern: le32(src, $0 * 4)) }
+                let pairs: [Float] = [subtract ? lanes[0] - lanes[1] : lanes[0] + lanes[1],
+                                      subtract ? lanes[2] - lanes[3] : lanes[2] + lanes[3],
+                                      subtract ? other[0] - other[1] : other[0] + other[1],
+                                      subtract ? other[2] - other[3] : other[2] + other[3]]
+                for i in 0..<4 { putLE32(&result, i * 4, pairs[i].bitPattern) }
+            } else if p66 {
+                let a0 = Double(bitPattern: le64(destBytes, 0)), a1 = Double(bitPattern: le64(destBytes, 8))
+                let b0 = Double(bitPattern: le64(src, 0)), b1 = Double(bitPattern: le64(src, 8))
+                putLE64(&result, 0, (subtract ? a0 - a1 : a0 + a1).bitPattern)
+                putLE64(&result, 8, (subtract ? b0 - b1 : b0 + b1).bitPattern)
+            } else { throw opcodeFault(opcode, address: address) }
+            xmmRegisters[dest] = result
+        case 0xF0: // LDDQU（F2）
+            guard decodeRepeatPrefix == 0xF2 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
+        default:
+            throw opcodeFault(opcode, address: address)
+        }
+    }
+
+
+    // MARK: - MMX
+
+    /// MMX 整数演算（64 ビット幅）。PACK / PUNPCK 系は専用実装、それ以外は
+    /// 128 ビット版カーネルを下位 64 ビットに限定して再利用する。
+    private func mmxInteger(opcode: UInt8, dest: UInt64, src: UInt64, address: UInt64) throws -> UInt64 {
+        func byte(_ value: UInt64, _ index: Int) -> UInt8 { UInt8((value >> (index * 8)) & 0xFF) }
+        func word(_ value: UInt64, _ index: Int) -> UInt16 { UInt16((value >> (index * 16)) & 0xFFFF) }
+        func dword(_ value: UInt64, _ index: Int) -> UInt32 { UInt32((value >> (index * 32)) & 0xFFFFFFFF) }
+        switch opcode {
+        case 0x6C, 0x6D: // PUNPCKLQDQ / PUNPCKHQDQ は MMX 形式なし
+            throw opcodeFault(opcode, address: address)
+        case 0x60, 0x61, 0x62, 0x68, 0x69, 0x6A: // PUNPCK L/H（BW / WD / DQ）
+            let size = (opcode == 0x60 || opcode == 0x68) ? 1 : ((opcode == 0x61 || opcode == 0x69) ? 2 : 4)
+            let base = opcode >= 0x68 ? 4 / size : 0
+            var result: UInt64 = 0
+            for i in 0..<(4 / size) {
+                let shift = (2 * i) * size * 8
+                switch size {
+                case 1:
+                    result |= UInt64(byte(dest, base + i)) << shift
+                    result |= UInt64(byte(src, base + i)) << (shift + 8)
+                case 2:
+                    result |= UInt64(word(dest, base + i)) << shift
+                    result |= UInt64(word(src, base + i)) << (shift + 16)
+                default:
+                    result |= UInt64(dword(dest, base + i)) << shift
+                    result |= UInt64(dword(src, base + i)) << (shift + 32)
+                }
+            }
+            return result
+        case 0x63, 0x67: // PACKSSWB / PACKUSWB
+            var result: UInt64 = 0
+            for i in 0..<4 {
+                for (offset, value) in [(0, dest), (4, src)] {
+                    let raw = Int16(bitPattern: word(value, i))
+                    let packed: UInt8
+                    if opcode == 0x63 {
+                        packed = UInt8(bitPattern: Int8(max(-128, min(127, Int(raw)))))
+                    } else {
+                        packed = UInt8(max(0, min(255, Int(raw))))
+                    }
+                    result |= UInt64(packed) << ((offset + i) * 8)
+                }
+            }
+            return result
+        case 0x6B: // PACKSSDW
+            var result: UInt64 = 0
+            for i in 0..<2 {
+                for (offset, value) in [(0, dest), (2, src)] {
+                    let raw = Int32(bitPattern: dword(value, i))
+                    let packed = UInt16(bitPattern: Int16(max(-32768, min(32767, Int(raw)))))
+                    result |= UInt64(packed) << ((offset + i) * 16)
+                }
+            }
+            return result
+        default:
+            // 下位 64 ビットにゼロ拡張して 128 ビット版カーネルを流用する
+            let saved = xmmRegisters[0]
+            var destBytes = [UInt8](repeating: 0, count: 16)
+            var srcBytes = [UInt8](repeating: 0, count: 16)
+            putLE64(&destBytes, 0, dest)
+            putLE64(&srcBytes, 0, src)
+            xmmRegisters[0] = destBytes
+            try sseInteger(opcode: opcode, dest: 0, src: srcBytes, address: address)
+            let result = le64(xmmRegisters[0], 0)
+            xmmRegisters[0] = saved
+            return result
+        }
+    }
+
+    private func mmxShiftImmediate(opcode: UInt8, subOperation: Int, value: UInt64, count: Int, address: UInt64) throws -> UInt64 {
+        func lanes(_ size: Int, _ body: (UInt64) -> UInt64) -> UInt64 {
+            var result: UInt64 = 0
+            let mask: UInt64 = size == 8 ? UInt64.max : (UInt64(1) << (size * 8)) - 1
+            for i in 0..<(8 / size) {
+                let lane = (value >> (i * size * 8)) & mask
+                result |= (body(lane) & mask) << (i * size * 8)
+            }
+            return result
+        }
+        switch (opcode, subOperation) {
+        case (0x71, 2): return lanes(2) { count > 15 ? 0 : $0 >> count }
+        case (0x71, 4): return lanes(2) { count > 15 ? (Int16(bitPattern: UInt16($0)) < 0 ? 0xFFFF : 0) : UInt64(bitPattern: Int64(Int16(bitPattern: UInt16($0)) >> count)) }
+        case (0x71, 6): return lanes(2) { count > 15 ? 0 : $0 << count }
+        case (0x72, 2): return lanes(4) { count > 31 ? 0 : $0 >> count }
+        case (0x72, 4): return lanes(4) { count > 31 ? (Int32(bitPattern: UInt32($0)) < 0 ? 0xFFFFFFFF : 0) : UInt64(bitPattern: Int64(Int32(bitPattern: UInt32($0)) >> count)) }
+        case (0x72, 6): return lanes(4) { count > 31 ? 0 : $0 << count }
+        case (0x73, 2): return count > 63 ? 0 : value >> count
+        case (0x73, 6): return count > 63 ? 0 : value << count
+        default: throw opcodeFault(opcode, address: address)
+        }
+    }
+
+    // MARK: - SSSE3 / SSE4（0F 38 / 0F 3A マップ）
+
+    private func checkSSEAvailable(_ opcode: UInt8, address: UInt64) throws {
+        if controlRegisters[0] & 0x4 != 0 || controlRegisters[0] & 0x8 != 0 { throw CPUTrap.exception(vector: 7, errorCode: nil) }
+        if controlRegisters[4] & 0x200 == 0 { throw opcodeFault(opcode, address: address) }
+    }
+
+    private func executeSSE38(operandSize: Int, address: UInt64) throws {
+        let opcode = try fetch8()
+        if opcode == 0xF0 || opcode == 0xF1 { // MOVBE
+            let modRM = try decodeModRM()
+            guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            if opcode == 0xF0 {
+                let raw = try readOperand(modRM, size: operandSize)
+                setRegisterValue(modRM.reg, size: operandSize, operandSize == 8 ? raw.byteSwapped : (operandSize == 4 ? UInt64(UInt32(raw).byteSwapped) : UInt64(UInt16(raw).byteSwapped)))
+            } else {
+                let raw = registerValue(modRM.reg, size: operandSize)
+                let swapped = operandSize == 8 ? raw.byteSwapped : (operandSize == 4 ? UInt64(UInt32(raw).byteSwapped) : UInt64(UInt16(raw).byteSwapped))
+                try writeOperand(modRM, size: operandSize, swapped)
+            }
+            return
+        }
+        try checkSSEAvailable(opcode, address: address)
+        let modRM = try decodeModRM()
+        let p66 = decodePrefix66
+        let isSSSE3 = (0x00...0x0B).contains(opcode) || (0x1C...0x1E).contains(opcode)
+        if !p66 {
+            guard isSSSE3 else { throw opcodeFault(opcode, address: address) }
+            let src = modRM.isRegister ? mmRegisters[modRM.registerIndex & 7] : try readOperand(modRM, size: 8)
+            var srcBytes = [UInt8](repeating: 0, count: 8)
+            var destBytes = [UInt8](repeating: 0, count: 8)
+            putLE64(&srcBytes, 0, src)
+            putLE64(&destBytes, 0, mmRegisters[modRM.reg & 7])
+            mmRegisters[modRM.reg & 7] = le64(try ssse3Kernel(opcode: opcode, dest: destBytes, src: srcBytes, address: address), 0)
+            return
+        }
+        let dest = modRM.reg & 15
+        switch opcode {
+        case 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35: // PMOVSX / PMOVZX
+            let sign = opcode < 0x28
+            let kind = Int(opcode & 0xF)
+            let srcCount = [8, 4, 2, 8, 4, 8][kind]
+            let laneSize = [2, 4, 8, 4, 8, 8][kind]
+            var srcBytes = [UInt8](repeating: 0, count: 16)
+            if modRM.isRegister {
+                srcBytes = xmmRegisters[modRM.registerIndex & 15]
+            } else {
+                let raw = try readOperandBytes(modRM, count: srcCount)
+                for i in 0..<srcCount { srcBytes[i] = raw[i] }
+            }
+            var result = [UInt8](repeating: 0, count: 16)
+            let elementSize = [1, 1, 1, 2, 2, 4][kind]
+            let elements = 16 / laneSize
+            for i in 0..<elements {
+                var raw: UInt64 = 0
+                for k in 0..<elementSize { raw |= UInt64(srcBytes[i * elementSize + k]) << (8 * k) }
+                let extended: UInt64
+                if sign {
+                    switch elementSize {
+                    case 1: extended = UInt64(bitPattern: Int64(Int8(bitPattern: UInt8(raw))))
+                    case 2: extended = UInt64(bitPattern: Int64(Int16(bitPattern: UInt16(raw))))
+                    default: extended = UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(raw))))
+                    }
+                } else { extended = raw }
+                for k in 0..<laneSize { result[i * laneSize + k] = UInt8((extended >> (8 * k)) & 0xFF) }
+            }
+            xmmRegisters[dest] = result
+        case 0x29: // PCMPEQQ
+            let src = try readXMMOperand(modRM)
+            var result = xmmRegisters[dest]
+            for lane in 0..<2 {
+                putLE64(&result, lane * 8, le64(result, lane * 8) == le64(src, lane * 8) ? UInt64.max : 0)
+            }
+            xmmRegisters[dest] = result
+        case 0x40: // PMULLD
+            let src = try readXMMOperand(modRM)
+            var result = xmmRegisters[dest]
+            for lane in 0..<4 {
+                putLE32(&result, lane * 4, le32(result, lane * 4) &* le32(src, lane * 4))
+            }
+            xmmRegisters[dest] = result
+        case 0x28: // PMULDQ
+            let src = try readXMMOperand(modRM)
+            var result = xmmRegisters[dest]
+            for lane in 0..<2 {
+                let a = Int64(Int32(bitPattern: le32(result, lane * 8)))
+                let b = Int64(Int32(bitPattern: le32(src, lane * 8)))
+                putLE64(&result, lane * 8, UInt64(bitPattern: a * b))
+            }
+            xmmRegisters[dest] = result
+        default:
+            guard isSSSE3 else { throw opcodeFault(opcode, address: address) }
+            let src = try readXMMOperand(modRM)
+            xmmRegisters[dest] = try ssse3Kernel(opcode: opcode, dest: xmmRegisters[dest], src: src, address: address)
+        }
+    }
+
+    /// SSSE3 カーネル（幅 8 = MMX / 幅 16 = XMM 共通）。
+    private func ssse3Kernel(opcode: UInt8, dest: [UInt8], src: [UInt8], address: UInt64) throws -> [UInt8] {
+        let width = dest.count
+        var result = dest
+        func lane(_ bytes: [UInt8], _ size: Int, _ index: Int) -> UInt64 {
+            var value: UInt64 = 0
+            for k in 0..<size { value |= UInt64(bytes[index * size + k]) << (8 * k) }
+            return value
+        }
+        func setLane(_ size: Int, _ index: Int, _ value: UInt64) {
+            for k in 0..<size { result[index * size + k] = UInt8((value >> (8 * k)) & 0xFF) }
+        }
+        func signed(_ bytes: [UInt8], _ size: Int, _ index: Int) -> Int64 {
+            let raw = lane(bytes, size, index)
+            switch size {
+            case 1: return Int64(Int8(bitPattern: UInt8(raw)))
+            case 2: return Int64(Int16(bitPattern: UInt16(raw)))
+            default: return Int64(Int32(bitPattern: UInt32(raw)))
+            }
+        }
+        switch opcode {
+        case 0x00: // PSHUFB
+            for i in 0..<width {
+                result[i] = src[i] & 0x80 != 0 ? 0 : dest[Int(src[i]) & (width - 1)]
+            }
+        case 0x01, 0x02, 0x05, 0x06: // PHADDW / PHADDD / PHSUBW / PHSUBD
+            let size = (opcode == 0x01 || opcode == 0x05) ? 2 : 4
+            let subtract = opcode >= 0x05
+            // 水平演算はレジスタ全幅に対して dest のペアをすべて並べ、
+            // 続けて src のペアを並べる（64 ビット単位で混ぜてはいけない）
+            var out = [UInt8](repeating: 0, count: width)
+            var produced = 0
+            for source in [dest, src] {
+                var index = 0
+                while index < width / size {
+                    let a = signed(source, size, index)
+                    let b = signed(source, size, index + 1)
+                    let value = subtract ? a - b : a + b
+                    for k in 0..<size { out[produced * size + k] = UInt8((UInt64(bitPattern: value) >> (8 * k)) & 0xFF) }
+                    produced += 1
+                    index += 2
+                }
+            }
+            result = out
+        case 0x03: // PHADDSW（飽和水平加算）
+            var out = [UInt8](repeating: 0, count: width)
+            var produced = 0
+            for source in [dest, src] {
+                var index = 0
+                while index < width / 2 {
+                    let value = max(-32768, min(32767, Int(signed(source, 2, index) + signed(source, 2, index + 1))))
+                    out[produced * 2] = UInt8(value & 0xFF)
+                    out[produced * 2 + 1] = UInt8((value >> 8) & 0xFF)
+                    produced += 1
+                    index += 2
+                }
+            }
+            result = out
+        case 0x04: // PMADDUBSW
+            for chunkStart in stride(from: 0, to: width, by: 8) {
+                for j in 0..<4 {
+                    let i0 = chunkStart + j * 2
+                    let product = Int(dest[i0]) * Int(Int8(bitPattern: src[i0])) + Int(dest[i0 + 1]) * Int(Int8(bitPattern: src[i0 + 1]))
+                    let clamped = max(-32768, min(32767, product))
+                    result[i0] = UInt8(clamped & 0xFF)
+                    result[i0 + 1] = UInt8((clamped >> 8) & 0xFF)
+                }
+            }
+        case 0x07: // PHSUBSW
+            var out = [UInt8](repeating: 0, count: width)
+            var produced = 0
+            for source in [dest, src] {
+                var index = 0
+                while index < width / 2 {
+                    let value = max(-32768, min(32767, Int(signed(source, 2, index) - signed(source, 2, index + 1))))
+                    out[produced * 2] = UInt8(value & 0xFF)
+                    out[produced * 2 + 1] = UInt8((value >> 8) & 0xFF)
+                    produced += 1
+                    index += 2
+                }
+            }
+            result = out
+        case 0x0B: // PMULHRSW
+            for i in 0..<(width / 2) {
+                let product = signed(dest, 2, i) * signed(src, 2, i)
+                setLane(2, i, UInt64(bitPattern: (product + 0x4000) >> 15))
+            }
+        case 0x08, 0x09, 0x0A: // PSIGNB / PSIGNW / PSIGND
+            let size = opcode == 0x08 ? 1 : (opcode == 0x09 ? 2 : 4)
+            for i in 0..<(width / size) {
+                let condition = signed(src, size, i)
+                let value = signed(dest, size, i)
+                setLane(size, i, UInt64(bitPattern: condition < 0 ? -value : (condition == 0 ? 0 : value)))
+            }
+        case 0x1C, 0x1D, 0x1E: // PABSB / PABSW / PABSD
+            let size = opcode == 0x1C ? 1 : (opcode == 0x1D ? 2 : 4)
+            for i in 0..<(width / size) {
+                setLane(size, i, UInt64(bitPattern: abs(signed(dest, size, i))))
+            }
+        default:
+            throw opcodeFault(opcode, address: address)
+        }
+        return result
+    }
+
+    private func executeSSE3A(operandSize: Int, address: UInt64) throws {
+        let opcode = try fetch8()
+        try checkSSEAvailable(opcode, address: address)
+        guard decodePrefix66 else { throw opcodeFault(opcode, address: address) }
+        let modRM = try decodeModRM()
+        let immediate = try fetch8()
+        let dest = modRM.reg & 15
+        func roundingMode() -> FloatingPointRoundingRule {
+            switch (immediate & 4 != 0 ? Int((mxcsr >> 13) & 3) : Int(immediate & 3)) {
+            case 1: return .down
+            case 2: return .up
+            case 3: return .towardZero
+            default: return .toNearestOrEven
+            }
+        }
+        switch opcode {
+        case 0x08, 0x09: // ROUNDPS / ROUNDPD
+            let src = try readXMMOperand(modRM)
+            var result = [UInt8](repeating: 0, count: 16)
+            if opcode == 0x08 {
+                for lane in 0..<4 { putLE32(&result, lane * 4, Float(bitPattern: le32(src, lane * 4)).rounded(roundingMode()).bitPattern) }
+            } else {
+                for lane in 0..<2 { putLE64(&result, lane * 8, Double(bitPattern: le64(src, lane * 8)).rounded(roundingMode()).bitPattern) }
+            }
+            xmmRegisters[dest] = result
+        case 0x0A, 0x0B: // ROUNDSS / ROUNDSD（上位はデスティネーションを保持）
+            var result = xmmRegisters[dest]
+            if opcode == 0x0A {
+                let value = modRM.isRegister ? Float(bitPattern: le32(xmmRegisters[modRM.registerIndex & 15], 0)) : Float(bitPattern: UInt32(try readOperand(modRM, size: 4)))
+                putLE32(&result, 0, value.rounded(roundingMode()).bitPattern)
+            } else {
+                let value = modRM.isRegister ? Double(bitPattern: le64(xmmRegisters[modRM.registerIndex & 15], 0)) : Double(bitPattern: try readOperand(modRM, size: 8))
+                putLE64(&result, 0, value.rounded(roundingMode()).bitPattern)
+            }
+            xmmRegisters[dest] = result
+        case 0x0C, 0x0D, 0x0E: // BLENDPS / BLENDPD / PBLENDW
+            let src = try readXMMOperand(modRM)
+            var result = xmmRegisters[dest]
+            let size = opcode == 0x0C ? 4 : (opcode == 0x0D ? 8 : 2)
+            for lane in 0..<(16 / size) where immediate & UInt8(1 << lane) != 0 {
+                for k in 0..<size { result[lane * size + k] = src[lane * size + k] }
+            }
+            xmmRegisters[dest] = result
+        case 0x14: // PEXTRB（宛先は r/m8）
+            let value = xmmRegisters[dest][Int(immediate & 15)]
+            try writeOperand(modRM, size: 1, UInt64(value))
+        case 0x16: // PEXTRD / PEXTRQ（宛先は r/m）
+            if operandSize == 8 {
+                try writeOperand(modRM, size: 8, le64(xmmRegisters[dest], Int(immediate & 1) * 8))
+            } else {
+                try writeOperand(modRM, size: 4, UInt64(le32(xmmRegisters[dest], Int(immediate & 3) * 4)))
+            }
+        case 0x17: // EXTRACTPS（宛先は r/m32）
+            try writeOperand(modRM, size: 4, UInt64(le32(xmmRegisters[dest], Int(immediate & 3) * 4)))
+        case 0x20: // PINSRB
+            let value = try readOperand(modRM, size: 1)
+            xmmRegisters[dest][Int(immediate & 15)] = UInt8(value & 0xFF)
+        case 0x21: // INSERTPS
+            var result = xmmRegisters[dest]
+            let sourceLane: UInt32
+            if modRM.isRegister {
+                sourceLane = le32(xmmRegisters[modRM.registerIndex & 15], Int((immediate >> 6) & 3) * 4)
+            } else {
+                sourceLane = UInt32(try readOperand(modRM, size: 4))
+            }
+            putLE32(&result, Int((immediate >> 4) & 3) * 4, sourceLane)
+            for lane in 0..<4 where immediate & UInt8(1 << lane) != 0 { putLE32(&result, lane * 4, 0) }
+            xmmRegisters[dest] = result
+        case 0x22: // PINSRD / PINSRQ
+            if operandSize == 8 {
+                let value = try readOperand(modRM, size: 8)
+                putLE64(&xmmRegisters[dest], Int(immediate & 1) * 8, value)
+            } else {
+                let value = try readOperand(modRM, size: 4)
+                putLE32(&xmmRegisters[dest], Int(immediate & 3) * 4, UInt32(value))
+            }
+        case 0x40: // DPPS
+            let src = try readXMMOperand(modRM)
+            let destBytes = xmmRegisters[dest]
+            var sum: Float = 0
+            for lane in 0..<4 where immediate & UInt8(0x10 << lane) != 0 {
+                sum += Float(bitPattern: le32(destBytes, lane * 4)) * Float(bitPattern: le32(src, lane * 4))
+            }
+            var result = [UInt8](repeating: 0, count: 16)
+            for lane in 0..<4 where immediate & UInt8(1 << lane) != 0 { putLE32(&result, lane * 4, sum.bitPattern) }
+            xmmRegisters[dest] = result
+        case 0x41: // DPPD
+            let src = try readXMMOperand(modRM)
+            let destBytes = xmmRegisters[dest]
+            var sum: Double = 0
+            for lane in 0..<2 where immediate & UInt8(0x10 << lane) != 0 {
+                sum += Double(bitPattern: le64(destBytes, lane * 8)) * Double(bitPattern: le64(src, lane * 8))
+            }
+            var result = [UInt8](repeating: 0, count: 16)
+            for lane in 0..<2 where immediate & UInt8(1 << lane) != 0 { putLE64(&result, lane * 8, sum.bitPattern) }
+            xmmRegisters[dest] = result
+        case 0x42: // MPSADBW
+            let src = try readXMMOperand(modRM)
+            let destBytes = xmmRegisters[dest]
+            var result = [UInt8](repeating: 0, count: 16)
+            let destBase = Int(immediate & 1) * 4
+            let srcBase = Int((immediate >> 2) & 1) * 4
+            for i in 0..<8 {
+                var sum = 0
+                for k in 0..<4 { sum += abs(Int(destBytes[destBase + i + k]) - Int(src[srcBase + k])) }
+                result[i * 2] = UInt8(sum & 0xFF)
+                result[i * 2 + 1] = UInt8((sum >> 8) & 0xFF)
+            }
+            xmmRegisters[dest] = result
         default:
             throw opcodeFault(opcode, address: address)
         }
@@ -3873,19 +4593,57 @@ final class X86CPU {
         switch modRM.reg {
         case 0:
             guard !modRM.isRegister else { throw opcodeFault(0xAE, address: address) }
+            try checkTSForFPU(opcode: 0xAE, address: address)
             try fxsave(modRM)
         case 1:
             guard !modRM.isRegister else { throw opcodeFault(0xAE, address: address) }
+            try checkTSForFPU(opcode: 0xAE, address: address)
             try fxrstor(modRM)
-        case 2: mxcsr = UInt32(try readOperand(modRM, size: 4)) // LDMXCSR
-        case 3: try writeOperand(modRM, size: 4, UInt64(mxcsr)) // STMXCSR
+        case 2:
+            try checkTSForFPU(opcode: 0xAE, address: address)
+            mxcsr = UInt32(try readOperand(modRM, size: 4)) // LDMXCSR
+        case 3:
+            try checkTSForFPU(opcode: 0xAE, address: address)
+            try writeOperand(modRM, size: 4, UInt64(mxcsr)) // STMXCSR
+        case 4 where !modRM.isRegister: // XSAVE
+            try checkTSForFPU(opcode: 0xAE, address: address)
+            try xsave(modRM)
+        case 5 where !modRM.isRegister: // XRSTOR
+            try checkTSForFPU(opcode: 0xAE, address: address)
+            try xrstor(modRM)
+        case 6 where !modRM.isRegister: // XSAVEOPT（XSAVE と同じ扱い）
+            try checkTSForFPU(opcode: 0xAE, address: address)
+            try xsave(modRM)
         case 7 where !modRM.isRegister: break // CLFLUSH（NOP 扱い）
         case 5, 6, 7: break // LFENCE / MFENCE / SFENCE（NOP 扱い）
         default: throw opcodeFault(0xAE, address: address)
         }
     }
 
+    private func checkTSForFPU(opcode: UInt8, address: UInt64) throws {
+        if controlRegisters[0] & 0x8 != 0 { throw CPUTrap.exception(vector: 7, errorCode: nil) } // CR0.TS → #NM
+    }
+
+    private func xsave(_ operand: ModRM) throws {
+        let requested = (registers[2] << 32) | (registers[0] & 0xFFFFFFFF)
+        var area = fxsaveArea()
+        area += [UInt8](repeating: 0, count: 64)
+        putLE64(&area, 512, requested & xcr0 & 0x3) // XSTATE_BV（x87 / SSE のみ対応）
+        try writeOperandBytes(operand, area)
+    }
+
+    private func xrstor(_ operand: ModRM) throws {
+        let area = try readOperandBytes(operand, count: 576)
+        let stateBits = le64(area, 512)
+        guard stateBits & ~xcr0 == 0 else { throw CPUTrap.exception(vector: 13, errorCode: 0) }
+        fxrstorArea(Array(area[0..<512]), loadX87: stateBits & 1 != 0, loadSSE: stateBits & 2 != 0)
+    }
+
     private func fxsave(_ operand: ModRM) throws {
+        try writeOperandBytes(operand, fxsaveArea())
+    }
+
+    private func fxsaveArea() -> [UInt8] {
         var area = [UInt8](repeating: 0, count: 512)
         area[0] = UInt8(fpuControlWord & 0xFF)
         area[1] = UInt8(fpuControlWord >> 8)
@@ -3903,24 +4661,50 @@ final class X86CPU {
         for i in 0..<16 {
             for k in 0..<16 { area[160 + i * 16 + k] = xmmRegisters[i][k] }
         }
-        try writeOperandBytes(operand, area)
+        return area
     }
 
     private func fxrstor(_ operand: ModRM) throws {
         let area = try readOperandBytes(operand, count: 512)
-        fpuControlWord = UInt16(area[0]) | UInt16(area[1]) << 8
-        let status = UInt16(area[2]) | UInt16(area[3]) << 8
-        fpuTop = Int((status >> 11) & 7)
-        fpuConditionCodes = (status & 0x0100 != 0, status & 0x0200 != 0, status & 0x0400 != 0, status & 0x4000 != 0)
-        let tag = area[4]
-        for i in 0..<8 {
-            fpuValid[i] = tag & UInt8(1 << i) != 0
-            fpuRegisters[i] = loadExtended(Array(area[(32 + i * 16)..<(32 + i * 16 + 10)]))
+        fxrstorArea(area, loadX87: true, loadSSE: true)
+    }
+
+    private func fxrstorArea(_ area: [UInt8], loadX87: Bool, loadSSE: Bool) {
+        if loadX87 {
+            fpuControlWord = UInt16(area[0]) | UInt16(area[1]) << 8
+            let status = UInt16(area[2]) | UInt16(area[3]) << 8
+            fpuTop = Int((status >> 11) & 7)
+            fpuConditionCodes = (status & 0x0100 != 0, status & 0x0200 != 0, status & 0x0400 != 0, status & 0x4000 != 0)
+            let tag = area[4]
+            for i in 0..<8 {
+                fpuValid[i] = tag & UInt8(1 << i) != 0
+                fpuRegisters[i] = loadExtended(Array(area[(32 + i * 16)..<(32 + i * 16 + 10)]))
+            }
         }
-        mxcsr = le32(area, 24)
-        for i in 0..<16 {
-            xmmRegisters[i] = Array(area[(160 + i * 16)..<(160 + i * 16 + 16)])
+        if loadSSE {
+            mxcsr = le32(area, 24)
+            for i in 0..<16 {
+                xmmRegisters[i] = Array(area[(160 + i * 16)..<(160 + i * 16 + 16)])
+            }
         }
+    }
+
+    /// VGA モード 13h（チェーン 4）のフレームを BGRA バイト列で返す。
+    /// BIOS でモード 13h が設定されたか、レジスタ状態からチェーン 4
+    /// グラフィックスと判断できる場合のみ非 nil。
+    func vgaMode13hFrame() -> (width: Int, height: Int, bgra: [UInt8])? {
+        guard devices.biosVideoMode == 0x13 || devices.vgaChain4Graphics else { return nil }
+        let palette = devices.vgaPalette
+        var bgra = [UInt8](repeating: 0, count: 320 * 200 * 4)
+        for pixel in 0..<(320 * 200) {
+            let index = Int((try? readMemory8(at: 0xA0000 + pixel)) ?? 0)
+            let red = palette[index * 3], green = palette[index * 3 + 1], blue = palette[index * 3 + 2]
+            bgra[pixel * 4] = (blue << 2) | (blue >> 4)
+            bgra[pixel * 4 + 1] = (green << 2) | (green >> 4)
+            bgra[pixel * 4 + 2] = (red << 2) | (red >> 4)
+            bgra[pixel * 4 + 3] = 0xFF
+        }
+        return (320, 200, bgra)
     }
 
     // MARK: - ポート I/O（デバイスバスへ委譲）

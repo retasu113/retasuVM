@@ -77,6 +77,32 @@ enum X86UEFI {
         var data: [UInt8]
     }
 
+    /// Authenticode イメージハッシュ（SHA-256）。チェックサムフィールドと
+    /// 証明書テーブルエントリ・証明書テーブル本体を除いてハッシュする。
+    static func authenticodeHash(_ data: [UInt8]) -> [UInt8]? {
+        func u16(_ offset: Int) -> Int { Int(data[offset]) | Int(data[offset + 1]) << 8 }
+        func u32(_ offset: Int) -> Int {
+            Int(data[offset]) | Int(data[offset + 1]) << 8 | Int(data[offset + 2]) << 16 | Int(data[offset + 3]) << 24
+        }
+        guard data.count > 0x40, data[0] == 0x4D, data[1] == 0x5A else { return nil }
+        let peOffset = u32(0x3C)
+        guard peOffset > 0, peOffset + 24 + 112 + 40 <= data.count else { return nil }
+        let optional = peOffset + 24
+        guard u16(optional) == 0x20B else { return nil } // PE32+
+        let checksumOffset = optional + 64
+        let certEntryOffset = optional + 112 + 4 * 8
+        guard u32(optional + 108) > 4 else { return nil } // NumberOfRvaAndSizes
+        let certSize = u32(certEntryOffset + 4)
+        var hashed = [UInt8]()
+        hashed.reserveCapacity(data.count)
+        hashed += data[0..<checksumOffset]
+        hashed += data[(checksumOffset + 4)..<certEntryOffset]
+        let end = certSize > 0 ? data.count - certSize : data.count
+        guard end >= certEntryOffset + 8, end <= data.count else { return nil }
+        hashed += data[(certEntryOffset + 8)..<end]
+        return SHA256.hash(hashed)
+    }
+
     /// PE ヘッダだけを見て UEFI アプリケーションかどうかを判定する。
     static func isUEFIApplication(_ data: [UInt8]) -> Bool {
         guard let info = parsePE(data) else { return false }
@@ -316,10 +342,21 @@ enum X86UEFI {
         unowned let cpu: X86CPU
         let imageBase: UInt64
         let sizeOfImage: Int
-        private var heapPointer = X86UEFI.heapStart
+        // メモリアロケータ: ヒープ領域（heapStart–heapEnd）を 4 KiB ページ単位で管理する
+        private enum PageRecordKind { case guest, pool, firmware }
+        private var pageUsed = [Bool](repeating: false, count: (X86UEFI.heapEnd - X86UEFI.heapStart) / 4096)
+        private var pageTypes = [UInt32](repeating: 7, count: (X86UEFI.heapEnd - X86UEFI.heapStart) / 4096)
+        private var pageRecords: [Int: (pages: Int, memoryType: UInt32, kind: PageRecordKind)] = [:]
+        private var poolFreeBlocks: [(address: UInt64, size: Int)] = []
+        private var poolAllocations: [UInt64: Int] = [:]
+        private var guestCallStacks: [UInt64] = []
+        private var imageCallStacks: [UInt64] = []
+        private var imageRegionAllocations: [(base: Int, size: Int)] = []
         private var mapKey: UInt64 = 0
         private var monotonicCount: UInt64 = 0
         private var exitedBootServices = false
+        private var virtualAddressMap: [(physical: UInt64, virtual: UInt64, pages: UInt64)] = []
+        private var virtualAddressMapSet = false
 
         // プロトコルデータベース（ハンドル → GUID → インターフェイス）
         private var protocolDB: [UInt64: [[UInt8]: UInt64]] = [:]
@@ -348,13 +385,14 @@ enum X86UEFI {
         private var startedDrivers: [UInt64: [(interface: UInt64, imageHandle: UInt64)]] = [:]
         // LoadImage で読み込んだイメージ
         private var loadedImages: [UInt64: LoadedImageInfo] = [:]
-        private var nextImageAddress = X86UEFI.loadRegionStart
         // StartImage の呼び出しフレーム（戻り先の復元用）
         private var imageCallStack: [ImageCallFrame] = []
         // GOP フレームバッファ
         private var framebufferBase = 0
-        private let framebufferWidth = 640
-        private let framebufferHeight = 400
+        private let gopModes: [(width: Int, height: Int)] = [(640, 400), (800, 600), (1024, 768)]
+        private var gopCurrentMode = 0
+        private var framebufferWidth: Int { gopModes[gopCurrentMode].width }
+        private var framebufferHeight: Int { gopModes[gopCurrentMode].height }
         private var highMonotonicCount: UInt64 = 0
         // 構成テーブル（初期値は ACPI 2.0 → RSDP）
         private var configEntries: [(guid: [UInt8], table: UInt64)] = [
@@ -373,6 +411,11 @@ enum X86UEFI {
         private let guidLoadedImage: [UInt8] = [0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
         private let guidGOP: [UInt8] = [0xDE, 0xA9, 0x42, 0x90, 0xDC, 0x23, 0x38, 0x4A, 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A]
         private let guidConIn: [UInt8] = [0x31, 0x5D, 0xB2, 0xD3, 0x54, 0x1B, 0xD2, 0x11, 0x8E, 0x4F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]
+        private let guidGlobalVariable: [UInt8] = [0x61, 0xDF, 0xE4, 0x8B, 0xCA, 0x93, 0xD2, 0x11, 0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C]
+        private let guidImageSecurityDB: [UInt8] = [0xCB, 0xB2, 0x19, 0xD7, 0x3A, 0x3D, 0x96, 0x45, 0xA3, 0xBC, 0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F]
+        private let guidCertSHA256: [UInt8] = [0x26, 0x16, 0xC4, 0xC1, 0x4C, 0x50, 0x99, 0x40, 0xAC, 0xA9, 0x41, 0xF9, 0x36, 0x93, 0x43, 0x28]
+        private let guidEventGroupEBS: [UInt8] = [0x55, 0xF0, 0xAB, 0x27, 0xB8, 0xB1, 0x86, 0x4C, 0x80, 0x43, 0x74, 0x8E, 0xA6, 0xBF, 0xFD, 0xE9]
+        private let guidEventGroupVAC: [UInt8] = [0x6B, 0xD5, 0xF2, 0x40, 0x76, 0x93, 0x4D, 0x42, 0xA9, 0xFE, 0x99, 0x6F, 0x61, 0xFD, 0x2F, 0x66]
         private let guidDriverBinding: [UInt8] = [0xAB, 0x31, 0xA0, 0x18, 0x43, 0xB4, 0x1A, 0x4D, 0xA5, 0xC0, 0x0C, 0x09, 0x26, 0x1E, 0x9F, 0x71]
         private let deviceError: UInt64 = 0x8000000000000007
 
@@ -386,6 +429,7 @@ enum X86UEFI {
             var timerType: UInt64 = 0
             var timerPeriod100ns: UInt64 = 0
             var timerDue: Date?
+            var eventGroup: [UInt8]?
         }
 
         /// LoadImage で配置したイメージの情報。
@@ -448,6 +492,8 @@ enum X86UEFI {
         private let notReady: UInt64 = 0x8000000000000006
         private let outOfResources: UInt64 = 0x8000000000000009
         private let notFound: UInt64 = 0x800000000000000E
+        private let securityViolation: UInt64 = 0x800000000000001A
+        private let writeProtected: UInt64 = 0x8000000000000008
 
         init(cpu: X86CPU, imageBase: UInt64, sizeOfImage: Int,
              initialVariables: [X86UEFI.Variable],
@@ -500,10 +546,11 @@ enum X86UEFI {
         }
 
         func installStructures() {
-            // GOP フレームバッファをヒープ先頭に予約する
+            refreshSecureBootVariables()
+            // GOP フレームバッファをアロケータから予約する
             let framebufferSize = framebufferWidth * framebufferHeight * 4
-            framebufferBase = heapPointer
-            heapPointer += (framebufferSize + 4095) & ~4095
+            framebufferBase = Int(allocPagesInternal(count: (framebufferSize + 4095) / 4096,
+                                                     memoryType: 6, kind: .firmware) ?? 0)
             installPageTablesAndGDT()
             installIDT()
             installSystemTable()
@@ -701,6 +748,12 @@ enum X86UEFI {
         /// RIP がスタブ範囲ならサービスを実行し、戻り先へ RIP を移す。
         func handleStub(address: UInt64) -> Bool {
             let base = UInt64(X86UEFI.stubBase)
+            var address = address
+            if !(address >= base && address < base + 0x2000), !virtualAddressMap.isEmpty,
+               let translated = translateVirtualToPhysical(address),
+               translated >= base, translated < base + 0x2000 {
+                address = translated // SetVirtualAddressMap 後の仮想アドレス経由の呼び出し
+            }
             guard address >= base, address < base + 0x2000 else { return false }
             let index = Int((address - base) / 16)
             guard let service = Service(rawValue: index) else { return false }
@@ -744,9 +797,10 @@ enum X86UEFI {
                 return returnToCaller(status: invalidParameter)
             }
             let stackSize = 0x10000
-            guard heapPointer + stackSize <= X86UEFI.heapEnd else {
+            guard let stackBase = allocPagesInternal(count: stackSize / 4096, memoryType: 4, kind: .firmware) else {
                 return returnToCaller(status: outOfResources)
             }
+            imageCallStacks.append(stackBase)
             let frame = ImageCallFrame(
                 handle: handle,
                 savedRegisters: (0..<16).map { cpu.register64($0) },
@@ -754,10 +808,9 @@ enum X86UEFI {
                 exitDataSizeAddress: cpu.register64(2),
                 exitDataAddress: cpu.register64(8))
             imageCallStack.append(frame)
-            let childStackTop = heapPointer + stackSize
-            heapPointer += stackSize
-            write(UInt64(childStackTop - 8), stubAddress(.imageReturnTrap), size: 8)
-            cpu.setRegister64(4, UInt64(childStackTop - 8))
+            let childStackTop = stackBase + UInt64(stackSize)
+            write(childStackTop - 8, stubAddress(.imageReturnTrap), size: 8)
+            cpu.setRegister64(4, childStackTop - 8)
             cpu.setRegister64(1, handle) // ImageHandle
             cpu.setRegister64(2, UInt64(X86UEFI.systemTableAddress)) // SystemTable
             cpu.redirectExecution(to: info.entry)
@@ -770,7 +823,12 @@ enum X86UEFI {
             let handle = cpu.register64(1)
             let exitStatus = cpu.register64(2)
             if let index = imageCallStack.lastIndex(where: { $0.handle == handle }) {
-                while imageCallStack.count > index + 1 { imageCallStack.removeLast() }
+                while imageCallStack.count > index + 1 {
+                    imageCallStack.removeLast()
+                    if let stackBase = imageCallStacks.popLast() {
+                        freeRecordInternal(address: stackBase)
+                    }
+                }
                 return finishImageCall(exitStatus: exitStatus)
             }
             if handle == imageBase {
@@ -785,6 +843,9 @@ enum X86UEFI {
             guard let frame = imageCallStack.popLast() else {
                 cpu.halt(exitCode: Int32(exitStatus & 0xFFFF_FFFF))
                 return true
+            }
+            if let stackBase = imageCallStacks.popLast() {
+                freeRecordInternal(address: stackBase)
             }
             if frame.exitDataSizeAddress != 0 { write(frame.exitDataSizeAddress, 0, size: 8) }
             if frame.exitDataAddress != 0 { write(frame.exitDataAddress, 0, size: 8) }
@@ -855,8 +916,14 @@ enum X86UEFI {
             // BootServices
             case .bsRaiseTPL:
                 return 0
-            case .bsRestoreTPL, .bsFreePages, .bsFreePool, .bsSetWatchdogTimer:
+            case .bsRestoreTPL, .bsSetWatchdogTimer:
                 return success
+            case .bsFreePages:
+                // RCX=Memory, RDX=Pages
+                return freePages(memory: rcx, pages: rdx)
+            case .bsFreePool:
+                // RCX=Buffer
+                return freePool(address: rcx)
             case .bsStall:
                 // RCX = Microseconds。実際に待つ（1 回あたり最大 1 秒）。
                 let microseconds = min(rcx, 1_000_000)
@@ -866,7 +933,7 @@ enum X86UEFI {
                 return success
             case .bsAllocatePages:
                 // RCX=Type, RDX=MemoryType, R8=Pages, R9=*Memory
-                return allocatePages(pages: r8, pointerAddress: r9)
+                return allocatePages(allocateType: rcx, memoryType: rdx, pages: r8, pointerAddress: r9)
             case .bsAllocatePool:
                 // RCX=PoolType, RDX=Size, R8=*Buffer
                 return allocatePool(bytes: rdx, pointerAddress: r8)
@@ -1022,10 +1089,11 @@ enum X86UEFI {
                                    notifyFunction: r8, notifyContext: r9,
                                    eventAddress: stackArgument(5))
             case .bsCreateEventEx:
-                // 引数 5 は EventGroup GUID（無視）、引数 6 が *Event
+                // 引数 5 は EventGroup GUID、引数 6 が *Event
                 return createEvent(type: UInt32(rcx & 0xFFFFFFFF),
                                    notifyFunction: r8, notifyContext: r9,
-                                   eventAddress: stackArgument(6))
+                                   eventAddress: stackArgument(6),
+                                   eventGroup: readGUID(stackArgument(5)))
             case .bsSetTimer:
                 return setTimer(event: rcx, type: rdx, triggerTime: r8)
             case .bsSignalEvent:
@@ -1121,10 +1189,16 @@ enum X86UEFI {
             case .rsSetWakeupTime:
                 return success
             case .rsSetVirtualAddressMap:
-                signalEventGroup(0x602) // EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
-                return success // アイデンティティマップのまま受理する
+                return setVirtualAddressMap(mapSize: rcx, descriptorSize: rdx, mapAddress: r9)
             case .rsConvertPointer:
-                return success // ポインタは変換不要（同一アドレス）
+                // RCX = 変換種別（bit0 = 0: 仮想へ / 1: 物理へ）、RDX = **Address
+                let pointer = read(rdx, size: 8)
+                if rcx & 1 == 0 {
+                    write(rdx, translatePhysicalToVirtual(pointer), size: 8)
+                } else {
+                    write(rdx, translateVirtualToPhysical(pointer) ?? pointer, size: 8)
+                }
+                return success
             case .rsGetNextHighMonotonicCount:
                 highMonotonicCount += 1
                 write(rcx, highMonotonicCount << 32, size: 8)
@@ -1159,36 +1233,206 @@ enum X86UEFI {
             }
         }
 
-        private func allocatePages(pages: UInt64, pointerAddress: UInt64) -> UInt64 {
-            let byteCount = Int(pages) * 4096
-            guard heapPointer + byteCount <= X86UEFI.heapEnd else { return outOfResources }
-            let address = heapPointer
-            heapPointer += byteCount
-            write(pointerAddress, UInt64(address), size: 8)
+        // MARK: メモリアロケータ
+
+        /// 連続ページの空きランがあるか（確保せずに調べる）。
+        private func canAllocPages(count: Int) -> Bool {
+            var run = 0
+            for used in pageUsed {
+                if used { run = 0 } else {
+                    run += 1
+                    if run >= count { return true }
+                }
+            }
+            return false
+        }
+
+        private func markPages(start: Int, count: Int, memoryType: UInt32, kind: PageRecordKind) {
+            for i in start..<(start + count) {
+                pageUsed[i] = true
+                pageTypes[i] = memoryType
+            }
+            pageRecords[start] = (count, memoryType, kind)
+        }
+
+        /// 最低アドレスの first-fit で連続ページを確保する。
+        private func allocPagesInternal(count: Int, memoryType: UInt32, kind: PageRecordKind) -> UInt64? {
+            guard count > 0, count <= pageUsed.count else { return nil }
+            var run = 0
+            for index in 0..<pageUsed.count {
+                if pageUsed[index] { run = 0; continue }
+                run += 1
+                if run == count {
+                    let start = index - count + 1
+                    markPages(start: start, count: count, memoryType: memoryType, kind: kind)
+                    return UInt64(X86UEFI.heapStart + start * 4096)
+                }
+            }
+            return nil
+        }
+
+        /// 指定アドレスちょうどの範囲が空いていれば確保する。
+        private func allocPagesAt(address: UInt64, count: Int, memoryType: UInt32, kind: PageRecordKind) -> Bool {
+            guard address % 4096 == 0, address >= UInt64(X86UEFI.heapStart) else { return false }
+            let start = Int(address - UInt64(X86UEFI.heapStart)) / 4096
+            guard start + count <= pageUsed.count else { return false }
+            for i in start..<(start + count) where pageUsed[i] { return false }
+            markPages(start: start, count: count, memoryType: memoryType, kind: kind)
+            return true
+        }
+
+        /// maxAddress 以下に収まる最も高いランを確保する（AllocateMaxAddress 用）。
+        private func allocPagesBelow(maxAddress: UInt64, count: Int, memoryType: UInt32, kind: PageRecordKind) -> UInt64? {
+            guard count > 0 else { return nil }
+            var run = 0
+            var index = pageUsed.count - 1
+            while index >= 0 {
+                if pageUsed[index] { run = 0 } else {
+                    run += 1
+                    if run == count {
+                        let start = index
+                        let address = UInt64(X86UEFI.heapStart + start * 4096)
+                        if address + UInt64(count * 4096) - 1 <= maxAddress {
+                            markPages(start: start, count: count, memoryType: memoryType, kind: kind)
+                            return address
+                        }
+                        run = 0 // このランは上限を超えるため、より低いランを探す
+                    }
+                }
+                index -= 1
+            }
+            return nil
+        }
+
+        /// 記録のある確保を開始アドレスから解放する（内部用）。
+        @discardableResult
+        private func freeRecordInternal(address: UInt64) -> Bool {
+            guard address % 4096 == 0, address >= UInt64(X86UEFI.heapStart) else { return false }
+            let start = Int(address - UInt64(X86UEFI.heapStart)) / 4096
+            guard let record = pageRecords.removeValue(forKey: start) else { return false }
+            for i in start..<(start + record.pages) {
+                pageUsed[i] = false
+                pageTypes[i] = 7
+            }
+            return true
+        }
+
+        private func allocatePages(allocateType: UInt64, memoryType: UInt64, pages: UInt64, pointerAddress: UInt64) -> UInt64 {
+            guard pages > 0, pages <= UInt64(pageUsed.count) else { return invalidParameter }
+            let count = Int(pages)
+            let type = UInt32(memoryType & 0xFFFFFFFF)
+            let address: UInt64?
+            switch allocateType {
+            case 0: // AllocateAnyPages
+                address = allocPagesInternal(count: count, memoryType: type, kind: .guest)
+            case 1: // AllocateMaxAddress
+                address = allocPagesBelow(maxAddress: read(pointerAddress, size: 8), count: count, memoryType: type, kind: .guest)
+            case 2: // AllocateAddress
+                let requested = read(pointerAddress, size: 8)
+                guard requested % 4096 == 0 else { return invalidParameter }
+                address = allocPagesAt(address: requested, count: count, memoryType: type, kind: .guest) ? requested : nil
+                if address == nil { return notFound }
+            default:
+                return invalidParameter
+            }
+            guard let resolved = address else { return outOfResources }
+            write(pointerAddress, resolved, size: 8)
+            return success
+        }
+
+        private func freePages(memory: UInt64, pages: UInt64) -> UInt64 {
+            guard pages > 0, memory % 4096 == 0, memory >= UInt64(X86UEFI.heapStart) else { return invalidParameter }
+            let start = Int(memory - UInt64(X86UEFI.heapStart)) / 4096
+            guard let record = pageRecords[start], record.pages == Int(pages), record.kind == .guest else {
+                return invalidParameter
+            }
+            freeRecordInternal(address: memory)
             return success
         }
 
         private func allocatePool(bytes: UInt64, pointerAddress: UInt64) -> UInt64 {
-            let byteCount = max(16, (Int(bytes) + 15) & ~15)
-            guard heapPointer + byteCount <= X86UEFI.heapEnd else { return outOfResources }
-            let address = heapPointer
-            heapPointer += byteCount
-            write(pointerAddress, UInt64(address), size: 8)
+            guard bytes <= 0x4000_0000 else { return outOfResources }
+            let size = max(16, (Int(bytes) + 15) & ~15)
+            if let index = poolFreeBlocks.firstIndex(where: { $0.size >= size }) {
+                let block = poolFreeBlocks[index]
+                if block.size - size >= 16 {
+                    poolFreeBlocks[index] = (block.address + UInt64(size), block.size - size)
+                    poolAllocations[block.address] = size
+                } else {
+                    poolFreeBlocks.remove(at: index)
+                    poolAllocations[block.address] = block.size
+                }
+                write(pointerAddress, block.address, size: 8)
+                return success
+            }
+            // 新しいプールチャンクをページアロケータから確保する（最低 64 KiB）
+            let chunkPages = max(16, (size + 4095) / 4096)
+            guard let chunk = allocPagesInternal(count: chunkPages, memoryType: 4, kind: .pool) else {
+                return outOfResources
+            }
+            let chunkSize = chunkPages * 4096
+            if chunkSize - size >= 16 {
+                poolFreeBlocks.append((chunk + UInt64(size), chunkSize - size))
+                poolAllocations[chunk] = size
+            } else {
+                poolAllocations[chunk] = chunkSize
+            }
+            write(pointerAddress, chunk, size: 8)
+            return success
+        }
+
+        private func freePool(address: UInt64) -> UInt64 {
+            guard let size = poolAllocations.removeValue(forKey: address) else { return invalidParameter }
+            poolFreeBlocks.append((address, size))
+            poolFreeBlocks.sort { $0.address < $1.address }
+            var merged: [(address: UInt64, size: Int)] = []
+            for block in poolFreeBlocks {
+                if let last = merged.last, last.address + UInt64(last.size) == block.address {
+                    merged[merged.count - 1].size += block.size
+                } else {
+                    merged.append(block)
+                }
+            }
+            poolFreeBlocks = merged
             return success
         }
 
         private func memoryRegions() -> [(start: UInt64, pages: UInt64, type: UInt32)] {
             let imagePages = UInt64((sizeOfImage + 4095) / 4096)
-            return [
+            var regions: [(start: UInt64, pages: UInt64, type: UInt32)] = [
                 (0x000000, 0x80, 7), // 通常メモリ（0〜512 KiB）
                 (0x080000, 0x80, 0), // 予約（BIOS / ACPI 領域を含む）
                 (0x100000, 0x100, 3), // ファームウェア構造（ページ表・GDT・IDT）
                 (imageBase, imagePages, 2), // ローダコード（イメージ）
-                (0x300000, 0x10, 3), // システムテーブル等
+                (0x300000, 0x1, 5), // ランタイムサービスコード（システムテーブル等）
+                (0x301000, 0x2, 5), // ランタイムサービスコード（スタブ）
+                (0x303000, 0xD, 3), // ブートサービス領域（アリーナ等）
                 (0x310000, 0xE0, 7), // 通常メモリ
                 (0x3F0000, 0x10, 3), // スタック
-                (0x400000, 0xC00, 7), // 通常メモリ（ヒープを含む）
+                (0x400000, 0x100, 7), // 通常メモリ
             ]
+            // ヒープ領域はページ記録から動的に分割する
+            var index = 0
+            while index < pageUsed.count {
+                let type = pageTypes[index]
+                var end = index + 1
+                while end < pageUsed.count, pageTypes[end] == type { end += 1 }
+                regions.append((UInt64(X86UEFI.heapStart + index * 4096), UInt64(end - index), type))
+                index = end
+            }
+            // ロード領域はイメージ配置記録から分割する
+            var cursor = X86UEFI.loadRegionStart
+            for allocation in imageRegionAllocations.sorted(by: { $0.base < $1.base }) {
+                if allocation.base > cursor {
+                    regions.append((UInt64(cursor), UInt64((allocation.base - cursor) / 4096), 7))
+                }
+                regions.append((UInt64(allocation.base), UInt64((allocation.size + 4095) / 4096), 2))
+                cursor = max(cursor, allocation.base + ((allocation.size + 4095) & ~4095))
+            }
+            if cursor < X86UEFI.loadRegionEnd {
+                regions.append((UInt64(cursor), UInt64((X86UEFI.loadRegionEnd - cursor) / 4096), 7))
+            }
+            return regions
         }
 
         private func getMemoryMap(sizeAddress: UInt64, mapAddress: UInt64, keyAddress: UInt64,
@@ -1212,9 +1456,11 @@ enum X86UEFI {
                 let base = mapAddress + UInt64(index * descriptorSize)
                 write(base, UInt64(region.type), size: 4)
                 write(base + 8, region.start, size: 8)
-                write(base + 16, 0, size: 8) // VirtualStart（未使用）
+                write(base + 16, region.start, size: 8) // VirtualStart（初期は物理と同一）
                 write(base + 24, region.pages, size: 8)
-                write(base + 32, 0xF, size: 8) // Attribute
+                let attribute: UInt64 = (region.type == 5 || region.type == 6)
+                    ? 0x800000000000000F : 0xF // ランタイム領域には EFI_MEMORY_RUNTIME
+                write(base + 32, attribute, size: 8)
             }
             write(sizeAddress, UInt64(required), size: 8)
             return success
@@ -1450,6 +1696,20 @@ enum X86UEFI {
 
         /// GOP（Graphics Output Protocol）を構築してコンソールハンドルへ登録する。
         private func installGOP() {
+            writeGOPModeStructs()
+            // GOP 構造体は Revision を持たず QueryMode から始まる
+            var gop = [UInt8](repeating: 0, count: 32)
+            put64(&gop, 0, stubAddress(.gopQueryMode))
+            put64(&gop, 8, stubAddress(.gopSetMode))
+            put64(&gop, 16, stubAddress(.gopBlt))
+            put64(&gop, 24, UInt64(X86UEFI.gopModeAddress)) // Mode
+            cpu.loadData(gop, at: X86UEFI.gopAddress)
+            installProtocol(handle: UInt64(X86UEFI.consoleHandleAddress),
+                            guid: guidGOP, interface: UInt64(X86UEFI.gopAddress))
+        }
+
+        /// 現在のモードに合わせて Info / Mode 構造体を書き直す。
+        private func writeGOPModeStructs() {
             var info = [UInt8](repeating: 0, count: 36)
             put32(&info, 4, UInt32(framebufferWidth))
             put32(&info, 8, UInt32(framebufferHeight))
@@ -1462,22 +1722,27 @@ enum X86UEFI {
             cpu.loadData(info, at: X86UEFI.gopInfoAddress)
             let framebufferSize = framebufferWidth * framebufferHeight * 4
             var mode = [UInt8](repeating: 0, count: 40)
-            put32(&mode, 0, 1) // MaxMode（モード 0 のみ）
-            put32(&mode, 4, 0) // Mode
+            put32(&mode, 0, UInt32(gopModes.count - 1)) // MaxMode
+            put32(&mode, 4, UInt32(gopCurrentMode)) // Mode
             put64(&mode, 8, UInt64(X86UEFI.gopInfoAddress))
             put64(&mode, 16, 36) // SizeOfInfo
             put64(&mode, 24, UInt64(framebufferBase))
             put64(&mode, 32, UInt64(framebufferSize))
             cpu.loadData(mode, at: X86UEFI.gopModeAddress)
-            // GOP 構造体は Revision を持たず QueryMode から始まる
-            var gop = [UInt8](repeating: 0, count: 32)
-            put64(&gop, 0, stubAddress(.gopQueryMode))
-            put64(&gop, 8, stubAddress(.gopSetMode))
-            put64(&gop, 16, stubAddress(.gopBlt))
-            put64(&gop, 24, UInt64(X86UEFI.gopModeAddress)) // Mode
-            cpu.loadData(gop, at: X86UEFI.gopAddress)
-            installProtocol(handle: UInt64(X86UEFI.consoleHandleAddress),
-                            guid: guidGOP, interface: UInt64(X86UEFI.gopAddress))
+        }
+
+        /// 指定モードの Info 構造体バイト列。
+        private func gopInfoBytes(mode: Int) -> [UInt8] {
+            var info = [UInt8](repeating: 0, count: 36)
+            put32(&info, 4, UInt32(gopModes[mode].width))
+            put32(&info, 8, UInt32(gopModes[mode].height))
+            put32(&info, 12, 1)
+            put32(&info, 16, 0x00FF0000)
+            put32(&info, 20, 0x0000FF00)
+            put32(&info, 24, 0x000000FF)
+            put32(&info, 28, 0xFF000000)
+            put32(&info, 32, UInt32(gopModes[mode].width))
+            return info
         }
 
         /// 接続済みディスクへ書き戻す（Block I/O / FAT の変更を共有する）。
@@ -1726,13 +1991,15 @@ enum X86UEFI {
         // MARK: イベント / タイマ
 
         private func createEvent(type: UInt32, notifyFunction: UInt64,
-                                 notifyContext: UInt64, eventAddress: UInt64) -> UInt64 {
+                                 notifyContext: UInt64, eventAddress: UInt64,
+                                 eventGroup: [UInt8]? = nil) -> UInt64 {
             let handle = arenaAlloc(8)
             guard handle != 0 else { return outOfResources }
             let event = EventObject()
             event.type = type
             event.notifyFunction = notifyFunction
             event.notifyContext = notifyContext
+            event.eventGroup = eventGroup
             events[handle] = event
             write(eventAddress, handle, size: 8)
             return success
@@ -1765,11 +2032,58 @@ enum X86UEFI {
             notifyQueue.append(handle)
         }
 
+        private func translateVirtualToPhysical(_ address: UInt64) -> UInt64? {
+            for entry in virtualAddressMap {
+                let size = entry.pages * 4096
+                if address >= entry.virtual, address < entry.virtual + size {
+                    return entry.physical + (address - entry.virtual)
+                }
+            }
+            return nil
+        }
+
+        private func translatePhysicalToVirtual(_ address: UInt64) -> UInt64 {
+            for entry in virtualAddressMap {
+                let size = entry.pages * 4096
+                if address >= entry.physical, address < entry.physical + size {
+                    return entry.virtual + (address - entry.physical)
+                }
+            }
+            return address
+        }
+
+        /// SetVirtualAddressMap: ランタイム領域の仮想配置を記録し、以降は
+        /// 仮想アドレス経由のランタイムサービス呼び出しを受け付ける。
+        private func setVirtualAddressMap(mapSize: UInt64, descriptorSize: UInt64, mapAddress: UInt64) -> UInt64 {
+            guard !virtualAddressMapSet else { return invalidParameter }
+            guard descriptorSize >= 40, mapSize > 0, mapSize % descriptorSize == 0 else { return invalidParameter }
+            var entries: [(physical: UInt64, virtual: UInt64, pages: UInt64)] = []
+            for index in 0..<Int(mapSize / descriptorSize) {
+                let base = mapAddress + UInt64(index) * descriptorSize
+                let physical = read(base + 8, size: 8)
+                let virtual = read(base + 16, size: 8)
+                let pages = read(base + 24, size: 8)
+                let attribute = read(base + 32, size: 8)
+                if attribute & 0x8000000000000000 != 0, pages > 0 {
+                    entries.append((physical: physical, virtual: virtual, pages: pages))
+                }
+            }
+            virtualAddressMap = entries
+            virtualAddressMapSet = true
+            signalEventGroup(0x602) // EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
+            return success
+        }
+
         /// シグナルグループ（ExitBootServices / VirtualAddressChange）の発火。
         private func signalEventGroup(_ mask: UInt32) {
-            for (handle, event) in events where event.type & mask == mask {
-                event.signaled = true
-                enqueueNotify(handle: handle, event: event)
+            let groupGUID = mask == 0x202 ? guidEventGroupEBS : (mask == 0x602 ? guidEventGroupVAC : nil)
+            for (handle, event) in events {
+                let byType = event.type & mask == mask
+                let byGroup = groupGUID != nil && event.eventGroup == groupGUID
+                if byType || byGroup {
+                    event.signaled = true
+                    enqueueNotify(handle: handle, event: event)
+                }
             }
         }
 
@@ -1784,7 +2098,7 @@ enum X86UEFI {
             while let handle = notifyQueue.first {
                 notifyQueue.removeFirst()
                 guard let event = events[handle], event.notifyFunction != 0 else { continue }
-                guard heapPointer + 0x10000 <= X86UEFI.heapEnd else { return }
+                guard canAllocPages(count: 16) else { return }
                 let frame = GuestCallFrame(
                     savedRegisters: (0..<16).map { cpu.register64($0) },
                     savedStackPointer: cpu.register64(4),
@@ -1798,20 +2112,26 @@ enum X86UEFI {
         }
 
         /// ゲスト関数呼び出しの開始（専用スタック + 戻りトラップ）。
-        private func beginGuestCall(function: UInt64, arguments: [UInt64]) {
+        /// 戻り値は確保したスタックのベース（失敗時は 0）。
+        @discardableResult
+        private func beginGuestCall(function: UInt64, arguments: [UInt64]) -> UInt64 {
             let stackSize = 0x10000
-            let stackTop = heapPointer + stackSize
-            heapPointer += stackSize
-            write(UInt64(stackTop - 8), stubAddress(.guestCallTrap), size: 8)
-            cpu.setRegister64(4, UInt64(stackTop - 8))
+            guard let stackBase = allocPagesInternal(count: stackSize / 4096, memoryType: 4, kind: .firmware) else {
+                return 0
+            }
+            guestCallStacks.append(stackBase)
+            let stackTop = stackBase + UInt64(stackSize)
+            write(stackTop - 8, translatePhysicalToVirtual(stubAddress(.guestCallTrap)), size: 8)
+            cpu.setRegister64(4, stackTop - 8)
             let registerIndices = [1, 2, 8, 9] // RCX / RDX / R8 / R9
             for (index, value) in arguments.prefix(4).enumerated() {
                 cpu.setRegister64(registerIndices[index], value)
             }
             for (offset, value) in arguments.dropFirst(4).enumerated() {
-                write(UInt64(stackTop - 8) + 32 + UInt64(offset * 8), value, size: 8)
+                write(stackTop - 8 + 32 + UInt64(offset * 8), value, size: 8)
             }
             cpu.redirectExecution(to: function)
+            return stackBase
         }
 
         /// ゲスト関数から戻ってきたときの処理。
@@ -1819,6 +2139,9 @@ enum X86UEFI {
             guard let frame = guestCallStack.popLast() else {
                 cpu.halt(exitCode: 0)
                 return true
+            }
+            if let stackBase = guestCallStacks.popLast() {
+                freeRecordInternal(address: stackBase)
             }
             if frame.isDriverCall, let context = frame.driverContext {
                 return continueDriverCall(frame: frame, context: context,
@@ -1844,7 +2167,7 @@ enum X86UEFI {
                 }
             }
             guard !bindings.isEmpty else { return returnToCaller(status: success) }
-            guard heapPointer + 0x10000 <= X86UEFI.heapEnd else {
+            guard canAllocPages(count: 16) else {
                 return returnToCaller(status: outOfResources)
             }
             let context = DriverCallContext(
@@ -1865,7 +2188,7 @@ enum X86UEFI {
             let controller = cpu.register64(1)
             let drivers = startedDrivers[controller] ?? []
             guard !drivers.isEmpty else { return returnToCaller(status: success) }
-            guard heapPointer + 0x10000 <= X86UEFI.heapEnd else {
+            guard canAllocPages(count: 16) else {
                 return returnToCaller(status: outOfResources)
             }
             startedDrivers[controller] = nil
@@ -2060,22 +2383,28 @@ enum X86UEFI {
             }
             guard let info = X86UEFI.parsePE(data),
                   info.machine == 0x8664 else { return unsupportedStatus }
+            if isSecureBootActive {
+                // dbx にあれば拒否、db になければ拒否（イメージハッシュ方式）
+                guard let hash = X86UEFI.authenticodeHash(data) else { return securityViolation }
+                if signatureDatabaseHashes(name: "dbx").contains(hash) { return securityViolation }
+                guard signatureDatabaseHashes(name: "db").contains(hash) else { return securityViolation }
+            }
             let size = (Int(info.sizeOfImage) + 0xFFF) & ~0xFFF
-            // 配置先: 希望 ImageBase が空いていればそこ、駄目なら読み込み領域
+            // 配置先: 希望 ImageBase が空いていればそこ、駄目なら読み込み領域の空きへ
             let preferred = Int(info.imageBase)
             let loadBase: Int
             if preferred >= 0x110000, preferred + size <= X86UEFI.loadRegionEnd,
                !rangesOverlap(preferred, size) {
                 loadBase = preferred
-            } else if nextImageAddress + size <= X86UEFI.loadRegionEnd {
-                loadBase = nextImageAddress
+            } else if let fitted = firstFitImageAddress(size: size) {
+                loadBase = fitted
             } else {
                 return outOfResources
             }
             guard X86UEFI.stageImage(cpu: cpu, data: data, info: info, base: loadBase) else {
                 return unsupportedStatus // 再配置情報が無く希望ベースに置けない
             }
-            if loadBase >= nextImageAddress { nextImageAddress = loadBase + size }
+            imageRegionAllocations.append((base: loadBase, size: size))
             let handle = arenaAlloc(8)
             let structAddress = arenaAlloc(104)
             guard handle != 0, structAddress != 0 else { return outOfResources }
@@ -2091,22 +2420,41 @@ enum X86UEFI {
             return success
         }
 
+        /// ロード領域内の first-fit 空きアドレスを探す。
+        private func firstFitImageAddress(size: Int) -> Int? {
+            var candidate = X86UEFI.loadRegionStart
+            let sorted = imageRegionAllocations.sorted { $0.base < $1.base }
+            for allocation in sorted {
+                if candidate + size <= allocation.base { break }
+                if candidate < allocation.base + allocation.size {
+                    candidate = allocation.base + allocation.size
+                }
+            }
+            return candidate + size <= X86UEFI.loadRegionEnd ? candidate : nil
+        }
+
         /// [base, base+size) が既存の確保領域と重なるか。
         private func rangesOverlap(_ base: Int, _ size: Int) -> Bool {
             let end = base + size
-            let reserved: [(Int, Int)] = [
+            var reserved: [(Int, Int)] = [
                 (0x100000, 0x400000), // ファームウェア構造 + スタック
                 (Int(imageBase), Int(imageBase) + sizeOfImage), // 起動イメージ
-                (X86UEFI.heapStart, heapPointer), // ヒープ確保済み
-                (X86UEFI.loadRegionStart, nextImageAddress), // 読み込み済み
             ]
+            for (start, record) in pageRecords {
+                reserved.append((X86UEFI.heapStart + start * 4096,
+                                 X86UEFI.heapStart + (start + record.pages) * 4096))
+            }
+            for allocation in imageRegionAllocations {
+                reserved.append((allocation.base, allocation.base + allocation.size))
+            }
             return reserved.contains { base < $0.1 && $0.0 < end }
         }
 
         private func unloadImage(handle: UInt64) -> UInt64 {
-            guard loadedImages.removeValue(forKey: handle) != nil else {
+            guard let info = loadedImages.removeValue(forKey: handle) else {
                 return invalidParameter
             }
+            imageRegionAllocations.removeAll { $0.base == Int(info.base) }
             protocolDB[handle]?[guidLoadedImage] = nil
             if protocolDB[handle]?.isEmpty == true {
                 protocolDB[handle] = nil
@@ -2232,17 +2580,28 @@ enum X86UEFI {
 
         private func gopQueryMode(modeNumber: UInt64, sizeAddress: UInt64,
                                   infoAddress: UInt64) -> UInt64 {
-            guard modeNumber == 0 else { return invalidParameter }
+            guard modeNumber < UInt64(gopModes.count) else { return invalidParameter }
             let info = arenaAlloc(36)
             guard info != 0 else { return outOfResources }
-            writeBytes(info, readBytes(UInt64(X86UEFI.gopInfoAddress), count: 36))
+            writeBytes(info, gopInfoBytes(mode: Int(modeNumber)))
             write(sizeAddress, 36, size: 8)
             write(infoAddress, info, size: 8)
             return success
         }
 
         private func gopSetMode(modeNumber: UInt64) -> UInt64 {
-            guard modeNumber == 0 else { return invalidParameter }
+            guard modeNumber < UInt64(gopModes.count) else { return invalidParameter }
+            if Int(modeNumber) != gopCurrentMode {
+                let newSize = gopModes[Int(modeNumber)].width * gopModes[Int(modeNumber)].height * 4
+                guard let newBase = allocPagesInternal(count: (newSize + 4095) / 4096,
+                                                       memoryType: 6, kind: .firmware) else {
+                    return outOfResources
+                }
+                if framebufferBase != 0 { freeRecordInternal(address: UInt64(framebufferBase)) }
+                framebufferBase = Int(newBase)
+                gopCurrentMode = Int(modeNumber)
+                writeGOPModeStructs()
+            }
             let size = framebufferWidth * framebufferHeight * 4
             cpu.loadData([UInt8](repeating: 0, count: size), at: framebufferBase)
             return success
@@ -2359,37 +2718,110 @@ enum X86UEFI {
                                  dataSize: UInt64, dataAddress: UInt64) -> UInt64 {
             let name = readString16(nameAddress)
             let guid = readGUID(guidAddress)
+            // Secure Boot のモード変数はファームウェアが管理する（書き込み禁止）
+            if guid == guidGlobalVariable, name == "SecureBoot" || name == "SetupMode" {
+                return writeProtected
+            }
+            // セットアップモードでないとき、セキュリティデータベース類の更新には
+            // 認証付き書き込みが必要（本実装では未対応のため拒否する）
+            let isSecurityDatabase = (guid == guidGlobalVariable && (name == "PK" || name == "KEK"))
+                || (guid == guidImageSecurityDB && ["db", "dbx", "dbt", "dbr"].contains(name))
+            if isSecurityDatabase, !isSetupMode {
+                return securityViolation
+            }
             if dataSize == 0 {
                 variables.removeAll { $0.guid == guid && $0.name == name }
-                onVariablesChanged?(variables)
-                return success
+            } else {
+                let data = readBytes(dataAddress, count: Int(dataSize))
+                if let index = variables.firstIndex(where: { $0.guid == guid && $0.name == name }) {
+                    variables[index].attributes = UInt32(attributes)
+                    variables[index].data = data
+                } else {
+                    variables.append(X86UEFI.Variable(
+                        guid: guid, name: name,
+                        attributes: UInt32(attributes), data: data))
+                }
             }
-            let data = readBytes(dataAddress, count: Int(dataSize))
-            if let index = variables.firstIndex(where: { $0.guid == guid && $0.name == name }) {
-                variables[index].attributes = UInt32(attributes)
-                variables[index].data = data
+            if isSecurityDatabase { refreshSecureBootVariables() }
+            // 合成変数（SecureBoot / SetupMode）は派生値なので永続化対象から除く
+            onVariablesChanged?(variables.filter {
+                !($0.guid == guidGlobalVariable && ($0.name == "SecureBoot" || $0.name == "SetupMode"))
+            })
+            return success
+        }
+
+        // MARK: Secure Boot
+
+        /// PK が未登録ならセットアップモード。
+        private var isSetupMode: Bool {
+            variables.first { $0.guid == guidGlobalVariable && $0.name == "PK" } == nil
+        }
+
+        private var isSecureBootActive: Bool { !isSetupMode }
+
+        /// SecureBoot / SetupMode 変数を PK の有無から再計算する。
+        private func refreshSecureBootVariables() {
+            upsertSyntheticVariable(name: "SecureBoot", value: isSecureBootActive ? 1 : 0)
+            upsertSyntheticVariable(name: "SetupMode", value: isSetupMode ? 1 : 0)
+        }
+
+        private func upsertSyntheticVariable(name: String, value: UInt8) {
+            if let index = variables.firstIndex(where: { $0.guid == guidGlobalVariable && $0.name == name }) {
+                variables[index].data = [value]
+                variables[index].attributes = 0x3 // BS | RT
             } else {
                 variables.append(X86UEFI.Variable(
-                    guid: guid, name: name,
-                    attributes: UInt32(attributes), data: data))
+                    guid: guidGlobalVariable, name: name, attributes: 0x3, data: [value]))
             }
-            onVariablesChanged?(variables)
-            return success
+        }
+
+        /// 署名データベース（db / dbx）から SHA-256 イメージハッシュの一覧を取り出す。
+        private func signatureDatabaseHashes(name: String) -> [[UInt8]] {
+            guard let variable = variables.first(where: { $0.guid == guidImageSecurityDB && $0.name == name }) else {
+                return []
+            }
+            let data = variable.data
+            func u32(_ offset: Int) -> Int {
+                Int(data[offset]) | Int(data[offset + 1]) << 8 | Int(data[offset + 2]) << 16 | Int(data[offset + 3]) << 24
+            }
+            var hashes: [[UInt8]] = []
+            var offset = 0
+            while offset + 28 <= data.count {
+                let listSize = u32(offset + 16)
+                let headerSize = u32(offset + 20)
+                let signatureSize = u32(offset + 24)
+                guard listSize >= 28, signatureSize >= 48, offset + listSize <= data.count else { break }
+                if Array(data[offset..<(offset + 16)]) == guidCertSHA256 {
+                    var entry = offset + 28 + headerSize
+                    while entry + 48 <= offset + listSize {
+                        hashes.append(Array(data[(entry + 16)..<(entry + 48)]))
+                        entry += signatureSize
+                    }
+                }
+                offset += listSize
+            }
+            return hashes
         }
 
         private func getNextVariableName(sizeAddress: UInt64, nameAddress: UInt64, guidAddress: UInt64) -> UInt64 {
             let capacity = Int(read(sizeAddress, size: 8))
             let currentName = readString16(nameAddress)
             let currentGUID = readGUID(guidAddress)
+            // 列挙順序は仕様上不定。互換性のため、ファームウェア合成変数
+            // （SecureBoot / SetupMode）はゲストが作った変数の後ろに並べる。
+            func isSynthetic(_ variable: X86UEFI.Variable) -> Bool {
+                variable.guid == guidGlobalVariable && (variable.name == "SecureBoot" || variable.name == "SetupMode")
+            }
+            let ordered = variables.filter { !isSynthetic($0) } + variables.filter { isSynthetic($0) }
             var nextIndex = 0
             if !currentName.isEmpty {
-                guard let index = variables.firstIndex(where: { $0.guid == currentGUID && $0.name == currentName }) else {
+                guard let index = ordered.firstIndex(where: { $0.guid == currentGUID && $0.name == currentName }) else {
                     return notFound
                 }
                 nextIndex = index + 1
             }
-            guard nextIndex < variables.count else { return notFound }
-            let next = variables[nextIndex]
+            guard nextIndex < ordered.count else { return notFound }
+            let next = ordered[nextIndex]
             let needed = (next.name.count + 1) * 2
             guard capacity >= needed else {
                 write(sizeAddress, UInt64(needed), size: 8)
