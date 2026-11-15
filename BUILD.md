@@ -59,6 +59,10 @@ retasuVM.swiftpm/
 │   ├── ARM64Assembler.swift   … ARM64 ゲスト用アセンブラ
 │   ├── ARM64DemoOS.swift      … ARM64 デモゲスト「Arm64DemoOS」
 │   ├── ARM64Session.swift     … ARM64 実行セッション
+│   ├── ARM64NVMe.swift        … NVMe 1.4 コアサブセット（Mac プラットフォーム用）
+│   ├── AppleDeviceTree.swift  … Apple Device Tree（ADT）の生成
+│   ├── MacPlatform.swift      … Mac ブート基盤（ADT 配置と X0 = ADT での起動）
+│   ├── MacBootTestOS.swift    … Mac ブートテストゲスト「MacBootTestOS」
 │   ├── BuiltInSamples.swift   … 内蔵サンプルの定義（種類・名前・SHA-256・データ復号）
 │   └── BuiltInSampleData.swift … 内蔵サンプルのバイナリ（Base64、生成ファイル）
 ├── Views/

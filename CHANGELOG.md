@@ -2,6 +2,36 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.15.0] - 2026-11-15
+
+### 追加
+
+- Mac ブート基盤（ARM64 の「Mac ブート基盤」ブート方式）:
+  - Apple Device Tree（ADT）の生成（Engine/AppleDeviceTree.swift）。ルート（model = "Apple Virtual Machine 1"）/ chosen（boot-args）/ memory / cpus / arm-io（aic・uart0・nvme・timer）を記述し、RAM + 1 MiB へ配置する。
+  - XNU と同じ入口規約でのカーネル起動: EL1 / MMU 無効で開始し、X0 = ADT の物理アドレスを渡す（Engine/MacPlatform.swift）。ELF64 カーネルをそのまま起動できる。
+  - Apple Interrupt Controller（AIC v1 サブセット）: INFO / CONFIG / WHOAMI / EVENT（読み取りで自動マスク）/ IPI_SEND・ACK・MASK / TARGET_CPU / SW_SET・SW_CLR / MASK_SET・MASK_CLR / HW_STATE。割り込み番号は ADT で定義（UART = 1、NVMe = 2）。
+  - FIQ 配送: Mac プラットフォームではジェネリックタイマと AIC イベントを IRQ ではなく FIQ ベクタへ配送する（実機の Apple Silicon と同じ）。
+  - NVMe 1.4 コアサブセット（Engine/ARM64NVMe.swift）: CAP / VS / CC / CSTS / AQA / ASQ / ACQ / ドアベル。管理コマンド（IO キューの作成・削除、Identify（コントローラ / 名前空間）、Get Log Page、Set / Get Features）と I/O コマンド（Read / Write / Flush）を実装。PRP / PRP リスト転送、完了エントリのフェーズ管理、IEN 有効時の完了割り込みに対応。ディスクは 512 バイトセクタのイメージを接続できる。
+  - ブートテストゲスト「MacBootTestOS」: ADT を解析して model・boot-args・メモリ量を表示し、NVMe を有効化して RDY を確認し、タイマ FIQ を受けて停止する。VM 編集画面で ARM64 の「ブート方式」から選べる（メモリ 256 MiB）。
+- ARM64 アセンブラに MRS / MSR を追加: システムレジスタ名指定（sctlr_el1、ttbr0_el1、vbar_el1、cntp_tval_el0 など 27 種）と PSTATE 即値形式（daifset / daifclr / spsel）。出力は clang とのコーパス比較（116 ワード）で一致を検証。
+
+### 修正
+
+- VM の編集保存時に、永続化済みの UEFI 変数（uefiVariables）が新しい構成へ引き継がれず消えてしまう不具合を修正した（v0.10.0 以来の潜在バグ）。
+
+### 検証
+
+- 新規統合テスト「Mac ブートカーネル」（C + アセンブリ、XNU の入口規約で起動）: ADT の各ノード・プロパティ解析、AIC のソフトウェア割り込み配送（EVENT のタイプ / 番号 / 自動マスク）、ジェネリックタイマ FIQ、NVMe の初期化・Identify（モデル名）・IO キュー作成・8 セクタの書き込みと読み戻し比較・Flush がすべて成功（ALL MACBOOT OK）。
+- アプリ内ゲスト MacBootTestOS をアプリと同じ起動手順で実行し、全項目の表示と正常停止を確認。
+- 全 Swift ファイル（48 本）の型チェック・構文チェックでエラーなし。命令照合パターンの到達不能スキャンもクリーン。
+- 既存の全回帰テスト（x86 カーネル群、UEFI アプリ 6 種、BIOS ISO、RISC-V、ARM、ARM64 カーネル / デモ、内蔵サンプル ハッシュ、Codable、UEFI 変数永続化）が合格。
+- 実機（iPhone / iPad）の Swift Playgrounds での動作確認は未実施。
+
+### 注意
+
+- Apple 純正の iBoot / XNU はまだ起動しません。macOS の起動にはリストア手順（IPSW の取得と復元フロー）、SEP、仮想 GPU など別レイヤーの実装が必要です。本バージョンは「カーネルが XNU と同じ規約で起動できるブート環境」の提供です。
+- AIC は単一 CPU 向けのサブセットで、AIC v2 やマルチ CPU の IPI 配送は未対応です。NVMe は SGL / MSI-X に未対応で、転送は PRP リスト 1 ページ分までです。
+
 ## [0.14.0] - 2026-11-15
 
 ### 追加
