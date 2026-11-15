@@ -200,7 +200,8 @@ struct VMDetailView: View {
             case .arm:
                 LabeledContent("ゲスト", value: "ArmDemoOS")
             case .arm64:
-                LabeledContent("ゲスト", value: "Arm64DemoOS")
+                LabeledContent("ブート方式", value: vm.configuration.arm64Platform.label)
+                LabeledContent("ゲスト", value: vm.configuration.bootTargetName)
             }
             LabeledContent("CPU", value: "\(vm.configuration.cpuCount) コア")
             LabeledContent("メモリ", value: vm.configuration.memoryText)

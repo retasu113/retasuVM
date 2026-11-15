@@ -27,6 +27,8 @@ struct VMEditorView: View {
     @State private var useSample: Bool
     /// 選択中の内蔵サンプル
     @State private var sampleSelection: BuiltInSample
+    /// ARM64 のブート方式
+    @State private var arm64Platform: Arm64Platform
     @State private var cpuCount: Int
     @State private var memoryMB: Int
     @State private var diskGB: Int
@@ -48,6 +50,7 @@ struct VMEditorView: View {
         _isoDisplayName = State(initialValue: config.isoDisplayName)
         _useSample = State(initialValue: config.builtInSample != nil)
         _sampleSelection = State(initialValue: config.builtInSample ?? .kernel)
+        _arm64Platform = State(initialValue: config.arm64Platform)
         _cpuCount = State(initialValue: config.cpuCount)
         _memoryMB = State(initialValue: config.memoryMB)
         _diskGB = State(initialValue: config.diskGB)
@@ -100,7 +103,12 @@ struct VMEditorView: View {
                     case .arm:
                         LabeledContent("ゲスト", value: "ArmDemoOS")
                     case .arm64:
-                        LabeledContent("ゲスト", value: "Arm64DemoOS")
+                        Picker("ブート方式", selection: $arm64Platform) {
+                            ForEach(Arm64Platform.allCases) { platform in
+                                Text(platform.label).tag(platform)
+                            }
+                        }
+                        LabeledContent("ゲスト", value: arm64Platform == .mac ? "MacBootTestOS" : "Arm64DemoOS")
                     }
                 } header: {
                     Text("基本情報")
@@ -292,8 +300,10 @@ struct VMEditorView: View {
             isoFileName: effectiveISOFileName,
             isoDisplayName: effectiveISODisplayName,
             builtInSample: effectiveBuiltInSample,
+            arm64Platform: architecture == .arm64 ? arm64Platform : (editing?.configuration.arm64Platform ?? .demo),
             networkEnabled: networkEnabled,
-            sharedFolderEnabled: sharedFolderEnabled
+            sharedFolderEnabled: sharedFolderEnabled,
+            uefiVariables: editing?.configuration.uefiVariables ?? []
         )
         if let editing {
             store.update(editing, name: trimmedName, configuration: configuration)

@@ -6,12 +6,13 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("retasuVM について") {
-                    LabeledContent("バージョン", value: "0.14.0")
+                    LabeledContent("バージョン", value: "0.15.0")
                     LabeledContent("対応 OS", value: "iOS 17 / iPadOS 17 以降")
                     LabeledContent("RISC-V", value: "RV32IM（メモリ 1 MiB）")
                     LabeledContent("x86", value: "リアル / プロテクト / ロングモード（64 ビット）")
                     LabeledContent("ARM", value: "ARMv7-A サブセット（メモリ 4 MiB）")
-                    LabeledContent("ARM64", value: "AArch64（EL0 / EL1 + MMU、メモリ 64 MiB）")
+                    LabeledContent("ARM64", value: "AArch64（EL0 / EL1 + MMU、メモリ 64 MiB / Mac 基盤は 256 MiB）")
+                    LabeledContent("Mac ブート基盤", value: "ADT（デバイスツリー）/ AIC / NVMe / FIQ 配送（X0 = ADT で起動）")
                     LabeledContent("内蔵サンプル", value: "x86 カーネル / UEFI アプリ / ISO など 17 種（ファイル不要で起動可能）")
                     LabeledContent("ISO 起動", value: "BOOT.BIN 形式 / El Torito 対応")
                     LabeledContent("カーネル起動", value: "Multiboot（ELF32）対応")
@@ -22,7 +23,7 @@ struct SettingsView: View {
                     LabeledContent("ACPI", value: "RSDP / XSDT / FADT / DSDT / MADT / HPET")
                     LabeledContent("SMBIOS", value: "2.7 形式（iMac19,1 として提示）")
                     LabeledContent("CPUID", value: "GenuineIntel / Intel Core i5-8259U（Coffee Lake）")
-                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。実行エンジンはすべて自作のソフトウェアエミュレータ（RISC-V / x86 / ARM / ARM64）で、ゲストが実際に動作します。x86 は 64 ビット ロングモード、特権リング（リング 3 + SYSCALL / SYSRET）、LAPIC / IOAPIC、ACPI テーブル、UEFI ファームウェア（プロトコルデータベース、Loaded Image、LoadImage / StartImage、ConIn、イベント通知関数の呼び出し、ドライババインディング、GOP、本物のメモリアロケータ、Secure Boot（イメージハッシュ方式）、SetVirtualAddressMap、Block I/O、FAT ファイルシステム、永続化される変数サービス）まで備えました。v0.14.0 ではサンプル OS / UEFI アプリ / ISO（17 種）をアプリに内蔵し、ファイルを用意しなくても起動できるようにしました。また ARM64（AArch64）エンジンを追加し、EL0 / EL1、段 1 MMU、GIC、仮想タイマを備えました。ただし証明書方式の Secure Boot や TPM などは未提供のため、Windows や現在の Linux のような一般の OS はまだ実行できません。macOS については、iOS / iPadOS 上で Mac を動かす Henge の方式（ARM64 の Apple Silicon Mac エミュレーション + Apple 公式リストアイメージの取得）を参考に、ARM64 基盤の実装を進めている段階で、macOS 自体の起動はまだできません。")
+                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。実行エンジンはすべて自作のソフトウェアエミュレータ（RISC-V / x86 / ARM / ARM64）で、ゲストが実際に動作します。x86 は 64 ビット ロングモード、特権リング（リング 3 + SYSCALL / SYSRET）、LAPIC / IOAPIC、ACPI テーブル、UEFI ファームウェア（プロトコルデータベース、Loaded Image、LoadImage / StartImage、ConIn、イベント通知関数の呼び出し、ドライババインディング、GOP、本物のメモリアロケータ、Secure Boot（イメージハッシュ方式）、SetVirtualAddressMap、Block I/O、FAT ファイルシステム、永続化される変数サービス）まで備えました。v0.14.0 ではサンプル OS / UEFI アプリ / ISO（17 種）をアプリに内蔵し、ファイルを用意しなくても起動できるようにしました。また ARM64（AArch64）エンジンを追加し、EL0 / EL1、段 1 MMU、GIC、仮想タイマを備えました。v0.15.0 では Mac ブート基盤として、Apple Device Tree（ADT）の生成、Apple Interrupt Controller（AIC）、NVMe ストレージ、タイマと AIC の FIQ 配送を実装し、カーネルが XNU と同じ入口規約（EL1 / MMU 無効 / X0 = ADT）で起動できるようになりました。ただし証明書方式の Secure Boot や TPM などは未提供のため、Windows や現在の Linux のような一般の OS はまだ実行できません。macOS については、iOS / iPadOS 上で Mac を動かす Henge の方式（ARM64 の Apple Silicon Mac エミュレーション + Apple 公式リストアイメージの取得）を参考に実装を進めている段階で、Apple 純正の iBoot / XNU の起動にはリストア手順や SEP など別レイヤーが必要なため、macOS 自体の起動はまだできません。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
