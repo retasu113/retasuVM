@@ -59,11 +59,47 @@ enum GuestOS: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// エミュレーションする CPU アーキテクチャ。
+enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
+    case riscv
+    case x86
+    case arm
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .riscv: return "RISC-V"
+        case .x86: return "x86"
+        case .arm: return "ARM"
+        }
+    }
+
+    /// 仕様の要約（設定画面や詳細画面の表示用）
+    var detail: String {
+        switch self {
+        case .riscv: return "RV32IM ソフトウェア CPU"
+        case .x86: return "16 ビット リアルモード + BIOS"
+        case .arm: return "ARMv7-A (A32) サブセット"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .riscv: return "terminal"
+        case .x86: return "desktopcomputer"
+        case .arm: return "cpu"
+        }
+    }
+}
+
 /// 仮想マシンのハードウェア構成。
 struct VMConfiguration: Equatable {
     var cpuCount: Int = 2
     var memoryMB: Int = 4096
     var diskGB: Int = 32
+    /// エミュレーションする CPU アーキテクチャ
+    var architecture: CPUArchitecture = .riscv
     var guestOS: GuestOS = .linux
     /// 起動するゲスト OS イメージ（実際にエミュレータで動くもの）
     var guestImage: GuestImage = .retasuOS
@@ -87,11 +123,47 @@ struct VMConfiguration: Equatable {
     var summary: String {
         "\(cpuCount) CPU / \(memoryText) / \(diskGB) GB"
     }
+
+    /// 一覧・詳細で使う起動対象の表示名。
+    var bootTargetName: String {
+        switch architecture {
+        case .riscv:
+            return useISO ? (isoDisplayName ?? "ISO ファイル") : guestImage.displayName
+        case .x86:
+            return isoDisplayName ?? "イメージファイル"
+        case .arm:
+            return "ArmDemoOS"
+        }
+    }
+
+    /// 一覧・詳細で使うアイコン名。
+    var bootSystemImage: String {
+        switch architecture {
+        case .riscv:
+            return useISO ? "opticaldisc" : guestImage.systemImage
+        case .x86:
+            return "opticaldisc"
+        case .arm:
+            return "cpu"
+        }
+    }
+
+    /// コンソールのクイックコマンド。
+    var quickCommands: [String] {
+        switch architecture {
+        case .riscv:
+            return useISO ? ["info", "help"] : guestImage.quickCommands
+        case .x86:
+            return []
+        case .arm:
+            return ["fact", "help", "quit"]
+        }
+    }
 }
 
 extension VMConfiguration: Codable {
     private enum CodingKeys: String, CodingKey {
-        case cpuCount, memoryMB, diskGB, guestOS, guestImage
+        case cpuCount, memoryMB, diskGB, architecture, guestOS, guestImage
         case useISO, isoFileName, isoDisplayName
         case networkEnabled, sharedFolderEnabled
     }
@@ -103,6 +175,7 @@ extension VMConfiguration: Codable {
         cpuCount = try container.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 2
         memoryMB = try container.decodeIfPresent(Int.self, forKey: .memoryMB) ?? 4096
         diskGB = try container.decodeIfPresent(Int.self, forKey: .diskGB) ?? 32
+        architecture = try container.decodeIfPresent(CPUArchitecture.self, forKey: .architecture) ?? .riscv
         guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
         guestImage = try container.decodeIfPresent(GuestImage.self, forKey: .guestImage) ?? .retasuOS
         useISO = try container.decodeIfPresent(Bool.self, forKey: .useISO) ?? false
@@ -117,6 +190,7 @@ extension VMConfiguration: Codable {
         try container.encode(cpuCount, forKey: .cpuCount)
         try container.encode(memoryMB, forKey: .memoryMB)
         try container.encode(diskGB, forKey: .diskGB)
+        try container.encode(architecture, forKey: .architecture)
         try container.encode(guestOS, forKey: .guestOS)
         try container.encode(guestImage, forKey: .guestImage)
         try container.encode(useISO, forKey: .useISO)

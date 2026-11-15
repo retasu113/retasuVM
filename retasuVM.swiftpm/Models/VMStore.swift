@@ -10,8 +10,8 @@ struct ConsoleLine: Identifiable, Equatable {
 /// 仮想マシン一覧と実行セッションを管理するストア。
 ///
 /// - 一覧は JSON としてアプリのドキュメントフォルダに保存し、再起動後も保持する。
-/// - 起動すると `EmulatorSession` が RISC-V エミュレータ上でゲスト OS
-///   （retasuOS）を実際に走らせる。コンソール入出力はセッション経由。
+/// - 起動するとアーキテクチャに応じたセッション（RISC-V / x86 / ARM）が
+///   自作エミュレータ上でゲストを実際に走らせる。コンソール入出力はセッション経由。
 @MainActor
 final class VMStore: ObservableObject {
     @Published private(set) var machines: [VirtualMachine] = []
@@ -20,7 +20,7 @@ final class VMStore: ObservableObject {
     @Published private(set) var consoleText: [UUID: String] = [:]
     @Published private(set) var transitioning: Set<UUID> = []
 
-    private var sessions: [UUID: EmulatorSession] = [:]
+    private var sessions: [UUID: any GuestSession] = [:]
     private let fileURL: URL?
 
     init() {
@@ -80,15 +80,8 @@ final class VMStore: ObservableObject {
 
     // MARK: - 状態遷移
 
-    /// 起動: エミュレータセッションを作り、ゲスト OS をブートする。
-    func start(_ vm: VirtualMachine) {
-        guard vm.state == .stopped || vm.state == .error else { return }
-        guard sessions[vm.id] == nil else { return }
-        guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
-
-        consoleText[vm.id] = ""
-        let session = EmulatorSession()
-        let vmID = vm.id
+    /// セッションのコールバックをストアへ接続する（全アーキテクチャ共通）。
+    private func wireCallbacks(session: any GuestSession, vmID: UUID) {
         session.onOutput = { [weak self] text in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -110,39 +103,82 @@ final class VMStore: ObservableObject {
                 self?.handleGuestFault(vmID: vmID, message: message)
             }
         }
+    }
 
+    /// 起動: アーキテクチャに応じたセッションを作り、ゲストをブートする。
+    func start(_ vm: VirtualMachine) {
+        guard vm.state == .stopped || vm.state == .error else { return }
+        guard sessions[vm.id] == nil else { return }
+        guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
+
+        consoleText[vm.id] = ""
+        let session: any GuestSession
         let bootDescription: String
-        if vm.configuration.useISO {
-            // ISO ブート: ISO 9660 を解析し、ルート直下の BOOT.BIN を起動する
-            guard let isoData = loadISOData(for: vm) else {
-                failStart(index: index, vm: vm, message: "ISO ファイルが見つかりません")
+
+        switch vm.configuration.architecture {
+        case .riscv:
+            let emulatorSession = EmulatorSession()
+            wireCallbacks(session: emulatorSession, vmID: vm.id)
+            if vm.configuration.useISO {
+                // ISO ブート: ISO 9660 を解析し、ルート直下の BOOT.BIN を起動する
+                guard let isoData = loadISOData(for: vm) else {
+                    failStart(index: index, vm: vm, message: "ISO ファイルが見つかりません")
+                    return
+                }
+                let image: ISO9660Image
+                do {
+                    image = try ISO9660Image(data: isoData)
+                } catch {
+                    failStart(index: index, vm: vm, message: error.localizedDescription)
+                    return
+                }
+                guard let bootBinary = image.file(named: "BOOT.BIN") else {
+                    failStart(index: index, vm: vm, message: "ISO 内に BOOT.BIN がありません（retasuVM 形式の ISO が必要です）")
+                    return
+                }
+                guard bootBinary.count <= 1 << 20 else {
+                    failStart(index: index, vm: vm, message: "BOOT.BIN がゲストメモリ（1 MiB）より大きいため起動できません")
+                    return
+                }
+                emulatorSession.boot(program: bootBinary, entry: 0, diskImage: isoData)
+                bootDescription = "ISO「\(image.volumeLabel.isEmpty ? (vm.configuration.isoDisplayName ?? "名称なし") : image.volumeLabel)」"
+            } else {
+                do {
+                    try emulatorSession.boot(guestImage: vm.configuration.guestImage)
+                } catch {
+                    failStart(index: index, vm: vm, message: error.localizedDescription)
+                    return
+                }
+                bootDescription = vm.configuration.guestImage.displayName
+            }
+            session = emulatorSession
+        case .x86:
+            // x86 は BIOS ブート: El Torito ISO または raw イメージから起動する
+            guard let imageData = loadISOData(for: vm) else {
+                failStart(index: index, vm: vm, message: "ISO / イメージファイルが見つかりません")
                 return
             }
-            let image: ISO9660Image
+            let x86Session = X86Session()
+            wireCallbacks(session: x86Session, vmID: vm.id)
             do {
-                image = try ISO9660Image(data: isoData)
+                try x86Session.boot(imageData: imageData)
             } catch {
                 failStart(index: index, vm: vm, message: error.localizedDescription)
                 return
             }
-            guard let bootBinary = image.file(named: "BOOT.BIN") else {
-                failStart(index: index, vm: vm, message: "ISO 内に BOOT.BIN がありません（retasuVM 形式の ISO が必要です）")
-                return
-            }
-            guard bootBinary.count <= 1 << 20 else {
-                failStart(index: index, vm: vm, message: "BOOT.BIN がゲストメモリ（1 MiB）より大きいため起動できません")
-                return
-            }
-            session.boot(program: bootBinary, entry: 0, diskImage: isoData)
-            bootDescription = "ISO「\(image.volumeLabel.isEmpty ? (vm.configuration.isoDisplayName ?? "名称なし") : image.volumeLabel)」"
-        } else {
+            bootDescription = "BIOS（\(vm.configuration.isoDisplayName ?? "イメージ")）"
+            session = x86Session
+        case .arm:
+            let armSession = ARMSession()
+            wireCallbacks(session: armSession, vmID: vm.id)
             do {
-                try session.boot(guestImage: vm.configuration.guestImage)
+                try armSession.boot(source: ARMDemoOS.source)
             } catch {
                 failStart(index: index, vm: vm, message: error.localizedDescription)
                 return
             }
-            bootDescription = vm.configuration.guestImage.displayName
+            bootDescription = "ArmDemoOS"
+            session = armSession
         }
 
         sessions[vm.id] = session
@@ -171,17 +207,34 @@ final class VMStore: ObservableObject {
         return directory
     }
 
-    /// 選択された ISO をアプリ内へコピーし、検証して保存名を返す。
-    /// retasuVM 形式（ISO 9660 でルート直下に BOOT.BIN がある）でなければエラーを投げる。
-    func importISO(from url: URL) throws -> String {
+    /// 選択された ISO / イメージをアプリ内へコピーし、検証して保存名を返す。
+    ///
+    /// 検証はアーキテクチャごとに異なる:
+    /// - RISC-V: retasuVM 形式（ISO 9660 でルート直下に BOOT.BIN がある）
+    /// - x86: El Torito ブート可能な ISO、またはブートセクタ（55 AA）付き raw イメージ
+    func importISO(from url: URL, architecture: CPUArchitecture = .riscv) throws -> String {
         let accessing = url.startAccessingSecurityScopedResource()
         defer {
             if accessing { url.stopAccessingSecurityScopedResource() }
         }
         let data = try Data(contentsOf: url)
-        let image = try ISO9660Image(data: [UInt8](data))
-        guard image.file(named: "BOOT.BIN") != nil else {
-            throw ISO9660Error.missingBootBinary
+        let bytes = [UInt8](data)
+        switch architecture {
+        case .riscv:
+            let image = try ISO9660Image(data: bytes)
+            guard image.file(named: "BOOT.BIN") != nil else {
+                throw ISO9660Error.missingBootBinary
+            }
+        case .x86:
+            if ElTorito.isISO9660(bytes) {
+                _ = try ElTorito.bootImage(fromISO: bytes)
+            } else {
+                guard bytes.count >= 512, bytes[510] == 0x55, bytes[511] == 0xAA else {
+                    throw X86BootError.notBootable("ブート可能なイメージではありません。El Torito 対応の ISO か、ブートセクタ付きの raw イメージ（.img）を選んでください")
+                }
+            }
+        case .arm:
+            throw X86BootError.notBootable("ARM ではイメージファイルは使いません")
         }
         guard let directory = isoDirectory else {
             throw ISO9660Error.storageUnavailable
@@ -370,6 +423,19 @@ final class VMStore: ObservableObject {
                     diskGB: 1,
                     guestOS: .other,
                     guestImage: .calcOS,
+                    networkEnabled: false,
+                    sharedFolderEnabled: false
+                )
+            ),
+            VirtualMachine(
+                name: "ARM デモ VM",
+                configuration: VMConfiguration(
+                    cpuCount: 1,
+                    memoryMB: 4,
+                    diskGB: 1,
+                    architecture: .arm,
+                    guestOS: .other,
+                    guestImage: .retasuOS,
                     networkEnabled: false,
                     sharedFolderEnabled: false
                 )
