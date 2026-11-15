@@ -100,7 +100,7 @@ struct VMRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: vm.configuration.guestOS.systemImage)
+            Image(systemName: vm.configuration.guestImage.systemImage)
                 .font(.title3)
                 .foregroundStyle(.tint)
                 .frame(width: 28)
@@ -122,6 +122,6 @@ struct VMRowView: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(vm.name)、\(vm.configuration.guestOS.label)、\(vm.configuration.summary)、状態は\(vm.state.label)")
+        .accessibilityLabel("\(vm.name)、\(vm.configuration.guestImage.displayName)、\(vm.configuration.summary)、状態は\(vm.state.label)")
     }
 }

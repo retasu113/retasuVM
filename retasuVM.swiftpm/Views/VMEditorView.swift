@@ -12,7 +12,7 @@ struct VMEditorView: View {
     let editing: VirtualMachine?
 
     @State private var name: String
-    @State private var guestOS: GuestOS
+    @State private var guestImage: GuestImage
     @State private var cpuCount: Int
     @State private var memoryMB: Int
     @State private var diskGB: Int
@@ -23,7 +23,7 @@ struct VMEditorView: View {
         self.editing = editing
         let config = editing?.configuration ?? VMConfiguration()
         _name = State(initialValue: editing?.name ?? "")
-        _guestOS = State(initialValue: config.guestOS)
+        _guestImage = State(initialValue: config.guestImage)
         _cpuCount = State(initialValue: config.cpuCount)
         _memoryMB = State(initialValue: config.memoryMB)
         _diskGB = State(initialValue: config.diskGB)
@@ -38,15 +38,19 @@ struct VMEditorView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("基本情報") {
+                Section {
                     TextField("名前", text: $name)
                         .textInputAutocapitalization(.never)
-                    Picker("ゲスト OS", selection: $guestOS) {
-                        ForEach(GuestOS.allCases) { os in
-                            Label(os.label, systemImage: os.systemImage)
-                                .tag(os)
+                    Picker("ゲストイメージ", selection: $guestImage) {
+                        ForEach(GuestImage.allCases) { image in
+                            Label(image.displayName, systemImage: image.systemImage)
+                                .tag(image)
                         }
                     }
+                } header: {
+                    Text("基本情報")
+                } footer: {
+                    Text("ゲストイメージは、起動時にエミュレータへ読み込む OS です。\(guestImage.displayName): \(guestImage.detail)")
                 }
 
                 Section("ハードウェア") {
@@ -98,7 +102,8 @@ struct VMEditorView: View {
             cpuCount: cpuCount,
             memoryMB: memoryMB,
             diskGB: diskGB,
-            guestOS: guestOS,
+            guestOS: editing?.configuration.guestOS ?? .linux,
+            guestImage: guestImage,
             networkEnabled: networkEnabled,
             sharedFolderEnabled: sharedFolderEnabled
         )
