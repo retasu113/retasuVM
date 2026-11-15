@@ -527,13 +527,16 @@ struct RISCVAssembler {
             return [try encodeI(opcode: 0x13, funct3: funct3, rd: reg(operands[0]),
                             rs1: reg(operands[1]), imm: (funct7 << 5) | shamt)]
 
-        // OP（レジスタ同士）
-        case "add", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and":
+        // OP（レジスタ同士、M 拡張を含む）
+        case "add", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
+             "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu":
             try require(operands, 3, line)
             let table: [String: (UInt32, UInt32)] = [
                 "add": (0, 0x00), "sub": (0, 0x20), "sll": (1, 0x00), "slt": (2, 0x00),
                 "sltu": (3, 0x00), "xor": (4, 0x00), "srl": (5, 0x00), "sra": (5, 0x20),
-                "or": (6, 0x00), "and": (7, 0x00)
+                "or": (6, 0x00), "and": (7, 0x00),
+                "mul": (0, 0x01), "mulh": (1, 0x01), "mulhsu": (2, 0x01), "mulhu": (3, 0x01),
+                "div": (4, 0x01), "divu": (5, 0x01), "rem": (6, 0x01), "remu": (7, 0x01)
             ]
             let (funct3, funct7) = table[mnemonic]!
             return [try encodeR(funct7: funct7, funct3: funct3, rd: reg(operands[0]),

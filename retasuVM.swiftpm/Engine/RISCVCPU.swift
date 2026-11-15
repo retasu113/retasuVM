@@ -29,7 +29,10 @@ enum CPUFault: Error, CustomStringConvertible {
 /// - a7=3: a0 が指す NUL 終端文字列を出力
 /// - a7=4: 1 文字入力（入力が無い場合は待機状態になり、同じ ECALL を再試行する）
 /// - a7=5: コンソール消去
+/// - a7=6: 乱数を a0 に返す（xorshift32）
 /// - a7=10: 終了（a0 が終了コード）
+///
+/// 命令セットは RV32I + M 拡張（乗除算）。
 final class RISCVCPU {
     /// レジスタ x0〜x31（x0 は常に 0）
     private(set) var regs: [UInt32] = [UInt32](repeating: 0, count: 32)
@@ -45,6 +48,23 @@ final class RISCVCPU {
     private(set) var waitingForInput = false
 
     private var inputQueue: [UInt8] = []
+
+    /// 乱数生成器（xorshift32）の状態。決定的に動作する（テスト可能）。
+    private var randomState: UInt32 = 0x2545F491
+
+    /// 乱数の種を設定する。0 は使えないため固定値に置き換える。
+    func setRandomSeed(_ seed: UInt32) {
+        randomState = seed == 0 ? 0x2545F491 : seed
+    }
+
+    private func nextRandom() -> UInt32 {
+        var x = randomState
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        randomState = x
+        return x
+    }
 
     /// 1 文字出力時のコールバック
     var onChar: ((UInt8) -> Void)?
@@ -191,6 +211,41 @@ final class RISCVCPU {
             case (0x5, 0x20): setReg(rd, UInt32(bitPattern: Int32(bitPattern: a) >> (b & 0x1F))) // SRA
             case (0x6, 0x00): setReg(rd, a | b) // OR
             case (0x7, 0x00): setReg(rd, a & b) // AND
+            // M 拡張（乗除算）
+            case (0x0, 0x01): setReg(rd, a &* b) // MUL（下位 32 ビット）
+            case (0x1, 0x01): // MULH（符号付き × 符号付き、上位 32 ビット）
+                let product = Int64(Int32(bitPattern: a)) * Int64(Int32(bitPattern: b))
+                setReg(rd, UInt32(bitPattern: Int32(truncatingIfNeeded: product >> 32)))
+            case (0x2, 0x01): // MULHSU（符号付き × 符号なし、上位 32 ビット）
+                let product = Int64(Int32(bitPattern: a)) * Int64(b)
+                setReg(rd, UInt32(bitPattern: Int32(truncatingIfNeeded: product >> 32)))
+            case (0x3, 0x01): // MULHU（符号なし × 符号なし、上位 32 ビット）
+                let product = UInt64(a) * UInt64(b)
+                setReg(rd, UInt32(truncatingIfNeeded: product >> 32))
+            case (0x4, 0x01): // DIV（符号付き）
+                let sa = Int32(bitPattern: a)
+                let sb = Int32(bitPattern: b)
+                if sb == 0 {
+                    setReg(rd, 0xFFFFFFFF)
+                } else if sa == Int32.min && sb == -1 {
+                    setReg(rd, a) // オーバーフロー: 商は被除数自身
+                } else {
+                    setReg(rd, UInt32(bitPattern: sa / sb))
+                }
+            case (0x5, 0x01): // DIVU（符号なし）
+                setReg(rd, b == 0 ? 0xFFFFFFFF : a / b)
+            case (0x6, 0x01): // REM（符号付き）
+                let sa = Int32(bitPattern: a)
+                let sb = Int32(bitPattern: b)
+                if sb == 0 {
+                    setReg(rd, a)
+                } else if sa == Int32.min && sb == -1 {
+                    setReg(rd, 0)
+                } else {
+                    setReg(rd, UInt32(bitPattern: sa % sb))
+                }
+            case (0x7, 0x01): // REMU（符号なし）
+                setReg(rd, b == 0 ? a : a % b)
             default: throw CPUFault.invalidInstruction(instr, pc: pc)
             }
 
@@ -257,6 +312,9 @@ final class RISCVCPU {
             return true
         case 5: // clear console
             onClear?()
+            return true
+        case 6: // random (xorshift32)
+            setReg(10, nextRandom())
             return true
         case 10: // exit
             halted = true

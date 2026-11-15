@@ -44,9 +44,11 @@ final class EmulatorSession {
         return terminatedFlag
     }
 
-    /// ゲスト OS をアセンブルして読み込み、実行を開始する。
-    func boot() throws {
-        let program = try RISCVAssembler().assemble(GuestOS.source)
+    /// 指定したゲスト OS イメージをアセンブルして読み込み、実行を開始する。
+    func boot(guestImage: GuestImage) throws {
+        let program = try RISCVAssembler().assemble(guestImage.assemblySource)
+        // 起動ごとに乱数の種を変える（ゲーム用）。テストでは CPU 側の固定種を使う。
+        cpu.setRandomSeed(UInt32(truncatingIfNeeded: Int64(Date().timeIntervalSince1970 * 1000)))
         cpu.loadProgram(program.bytes, at: program.entry)
         cpu.onChar = { [weak self] byte in
             guard let self else { return }
