@@ -1,0 +1,24 @@
+# Xcode / Swift
+DerivedData/
+.build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# 配布物（Release Assets として配布し、リポジトリには含めない）
+dist/
+*.zip
+SHA256SUMS.txt
