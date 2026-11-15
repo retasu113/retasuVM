@@ -56,11 +56,17 @@ struct VMConsoleView: View {
         .navigationTitle("コンソール")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: displayMode) {
-            // 画面モードの間だけ定期的にスナップショットを更新する
+            // 画面モードの間だけ定期的にスナップショットを更新する（保険のポーリング）
             guard displayMode == .screen else { return }
             while !Task.isCancelled {
                 snapshot = store.screenSnapshot(for: vmID)
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        .onChange(of: store.screenRevision(for: vmID)) { _, _ in
+            // 画面の変化通知を受けたら即座にスナップショットを取り直す
+            if displayMode == .screen {
+                snapshot = store.screenSnapshot(for: vmID)
             }
         }
     }
