@@ -1,0 +1,77 @@
+name: Release
+
+# vX.X.X タグの push で Swift Playgrounds 用 ZIP を作成し、
+# GitHub Release へ添付する。
+# 注意: このワークフローはプロジェクト構成の検証と ZIP 作成までを行い、
+# iOS 実機 / Swift Playgrounds 実機での動作検証は行わない。
+# 実機検証の有無は Release Notes に明記すること（REQUIREMENTS.md 参照）。
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify project structure
+        run: |
+          set -euo pipefail
+          test -f retasuVM.swiftpm/Package.swift
+          test -f retasuVM.swiftpm/RetasuVMApp.swift
+          test -f retasuVM.swiftpm/ContentView.swift
+          test -d retasuVM.swiftpm/Assets.xcassets
+          test -f README.md
+          test -f LICENSE
+          test -f BUILD.md
+          test -f CHANGELOG.md
+          # Swift ファイルが 1 つ以上あること
+          find retasuVM.swiftpm -name "*.swift" | grep -q .
+          # 秘密情報らしいファイルが含まれていないこと
+          if find retasuVM.swiftpm -name "*.pem" -o -name "*.key" -o -name ".env*" | grep -q .; then
+            echo "秘密情報らしいファイルが含まれています" >&2
+            exit 1
+          fi
+
+      - name: Build Swift Playgrounds ZIP
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/stage
+          cp -R retasuVM.swiftpm dist/stage/
+          cp README.md LICENSE BUILD.md CHANGELOG.md dist/stage/
+          cd dist/stage
+          zip -r "../retasuVM-v${VERSION}-SwiftPlaygrounds.zip" \
+            retasuVM.swiftpm README.md LICENSE BUILD.md CHANGELOG.md
+          cd ..
+          unzip -t "retasuVM-v${VERSION}-SwiftPlaygrounds.zip"
+          shasum -a 256 "retasuVM-v${VERSION}-SwiftPlaygrounds.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # 0.x は開発版として Pre-release にする
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" == 0.* ]]; then PRERELEASE_FLAG="--prerelease"; fi
+          gh release create "v${VERSION}" \
+            "dist/retasuVM-v${VERSION}-SwiftPlaygrounds.zip" \
+            "dist/SHA256SUMS.txt" \
+            --title "retasuVM v${VERSION}" \
+            --notes "retasuVM v${VERSION} のリリースです。詳細は CHANGELOG.md を参照してください。
+
+          動作確認環境: GitHub Actions（macos-latest）でプロジェクト構成と ZIP の整合性を検証。実機 Swift Playgrounds での検証は未実施です。" \
+            $PRERELEASE_FLAG
