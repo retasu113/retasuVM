@@ -109,7 +109,7 @@ final class VMStore: ObservableObject {
         }
 
         do {
-            try session.boot()
+            try session.boot(guestImage: vm.configuration.guestImage)
         } catch {
             machines[index].state = .error
             machines[index].errorMessage = error.localizedDescription
@@ -122,7 +122,7 @@ final class VMStore: ObservableObject {
         machines[index].state = .running
         machines[index].errorMessage = nil
         machines[index].lastStartedAt = Date()
-        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を起動しました（retasuOS ブート）"])
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を起動しました（\(vm.configuration.guestImage.displayName) ブート）"])
         save()
     }
 
@@ -254,7 +254,7 @@ final class VMStore: ObservableObject {
         }
     }
 
-    /// 初回起動時に表示するサンプルデータ。
+    /// 初回起動時に表示するサンプルデータ。各ゲストイメージを 1 台ずつ用意する。
     static var sampleData: [VirtualMachine] {
         [
             VirtualMachine(
@@ -264,17 +264,31 @@ final class VMStore: ObservableObject {
                     memoryMB: 1,
                     diskGB: 1,
                     guestOS: .linux,
+                    guestImage: .retasuOS,
                     networkEnabled: false,
                     sharedFolderEnabled: false
                 )
             ),
             VirtualMachine(
-                name: "テスト用 VM",
+                name: "ゲーム用 VM",
                 configuration: VMConfiguration(
                     cpuCount: 1,
                     memoryMB: 1,
                     diskGB: 1,
                     guestOS: .other,
+                    guestImage: .playOS,
+                    networkEnabled: false,
+                    sharedFolderEnabled: false
+                )
+            ),
+            VirtualMachine(
+                name: "計算用 VM",
+                configuration: VMConfiguration(
+                    cpuCount: 1,
+                    memoryMB: 1,
+                    diskGB: 1,
+                    guestOS: .other,
+                    guestImage: .calcOS,
                     networkEnabled: false,
                     sharedFolderEnabled: false
                 )

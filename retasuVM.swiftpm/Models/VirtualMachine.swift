@@ -60,11 +60,13 @@ enum GuestOS: String, Codable, CaseIterable, Identifiable {
 }
 
 /// 仮想マシンのハードウェア構成。
-struct VMConfiguration: Codable, Equatable {
+struct VMConfiguration: Equatable {
     var cpuCount: Int = 2
     var memoryMB: Int = 4096
     var diskGB: Int = 32
     var guestOS: GuestOS = .linux
+    /// 起動するゲスト OS イメージ（実際にエミュレータで動くもの）
+    var guestImage: GuestImage = .retasuOS
     var networkEnabled: Bool = true
     var sharedFolderEnabled: Bool = false
 
@@ -78,6 +80,36 @@ struct VMConfiguration: Codable, Equatable {
 
     var summary: String {
         "\(cpuCount) CPU / \(memoryText) / \(diskGB) GB"
+    }
+}
+
+extension VMConfiguration: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case cpuCount, memoryMB, diskGB, guestOS, guestImage, networkEnabled, sharedFolderEnabled
+    }
+
+    /// 旧バージョンの保存データ（guestImage キーが無い）も読み込めるよう、
+    /// 各キーを任意としてデコードする。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        cpuCount = try container.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 2
+        memoryMB = try container.decodeIfPresent(Int.self, forKey: .memoryMB) ?? 4096
+        diskGB = try container.decodeIfPresent(Int.self, forKey: .diskGB) ?? 32
+        guestOS = try container.decodeIfPresent(GuestOS.self, forKey: .guestOS) ?? .linux
+        guestImage = try container.decodeIfPresent(GuestImage.self, forKey: .guestImage) ?? .retasuOS
+        networkEnabled = try container.decodeIfPresent(Bool.self, forKey: .networkEnabled) ?? true
+        sharedFolderEnabled = try container.decodeIfPresent(Bool.self, forKey: .sharedFolderEnabled) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(cpuCount, forKey: .cpuCount)
+        try container.encode(memoryMB, forKey: .memoryMB)
+        try container.encode(diskGB, forKey: .diskGB)
+        try container.encode(guestOS, forKey: .guestOS)
+        try container.encode(guestImage, forKey: .guestImage)
+        try container.encode(networkEnabled, forKey: .networkEnabled)
+        try container.encode(sharedFolderEnabled, forKey: .sharedFolderEnabled)
     }
 }
 
