@@ -166,7 +166,7 @@ final class VMStore: ObservableObject {
                 failStart(index: index, vm: vm, message: error.localizedDescription)
                 return
             }
-            bootDescription = "BIOS（\(vm.configuration.isoDisplayName ?? "イメージ")）"
+            bootDescription = Multiboot.isMultibootKernel(imageData) ? "Multiboot（\(vm.configuration.isoDisplayName ?? "カーネル")）" : "BIOS（\(vm.configuration.isoDisplayName ?? "イメージ")）"
             session = x86Session
         case .arm:
             let armSession = ARMSession()
@@ -226,11 +226,17 @@ final class VMStore: ObservableObject {
                 throw ISO9660Error.missingBootBinary
             }
         case .x86:
-            if ElTorito.isISO9660(bytes) {
-                _ = try ElTorito.bootImage(fromISO: bytes)
+            if Multiboot.isMultibootKernel(bytes) {
+                // Multiboot カーネル（ELF32）はそのまま起動できる
+            } else if ElTorito.isISO9660(bytes) {
+                if let iso = try? ISO9660Image(data: bytes), let kernel = iso.file(named: "KERNEL.ELF"), Multiboot.isMultibootKernel(kernel) {
+                    // ISO 内の Multiboot カーネルを起動できる
+                } else {
+                    _ = try ElTorito.bootImage(fromISO: bytes)
+                }
             } else {
                 guard bytes.count >= 512, bytes[510] == 0x55, bytes[511] == 0xAA else {
-                    throw X86BootError.notBootable("ブート可能なイメージではありません。El Torito 対応の ISO か、ブートセクタ付きの raw イメージ（.img）を選んでください")
+                    throw X86BootError.notBootable("ブート可能なイメージではありません。El Torito 対応の ISO、ブートセクタ付きの raw イメージ（.img）、または Multiboot 対応カーネル（ELF32）を選んでください")
                 }
             }
         case .arm:

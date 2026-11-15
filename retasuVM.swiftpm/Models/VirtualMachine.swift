@@ -79,7 +79,7 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .riscv: return "RV32IM ソフトウェア CPU"
-        case .x86: return "16 ビット リアルモード + BIOS"
+        case .x86: return "リアルモード + 32 ビット プロテクトモード"
         case .arm: return "ARMv7-A (A32) サブセット"
         }
     }
