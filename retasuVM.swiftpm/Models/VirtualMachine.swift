@@ -97,6 +97,30 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// ARM64 のブート方式。
+enum Arm64Platform: String, Codable, CaseIterable, Identifiable {
+    /// デモゲスト（Arm64DemoOS）を SVC コンソールで起動する
+    case demo
+    /// Mac プラットフォーム（ADT + AIC + NVMe、X0 = ADT で起動する）
+    case mac
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .demo: return "デモゲスト"
+        case .mac: return "Mac ブート基盤"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .demo: return "Arm64DemoOS（対話型デモ）"
+        case .mac: return "MacBootTestOS（ADT / AIC / NVMe のブートテスト）"
+        }
+    }
+}
+
 /// 仮想マシンのハードウェア構成。
 /// 永続化する UEFI 変数 1 件（x86 UEFI セッションと受け渡す）。
 struct UEFIVariableRecord: Codable, Equatable {
@@ -123,6 +147,8 @@ struct VMConfiguration: Equatable {
     var isoDisplayName: String? = nil
     /// アプリ内蔵サンプルから起動する場合のサンプル（ファイルより優先）
     var builtInSample: BuiltInSample? = nil
+    /// ARM64 のブート方式（デモゲスト / Mac ブート基盤）
+    var arm64Platform: Arm64Platform = .demo
     var networkEnabled: Bool = true
     var sharedFolderEnabled: Bool = false
     /// 永続化された UEFI 変数（x86 の UEFI 起動時に引き継ぐ）
@@ -152,7 +178,7 @@ struct VMConfiguration: Equatable {
         case .arm:
             return "ArmDemoOS"
         case .arm64:
-            return "Arm64DemoOS"
+            return arm64Platform == .mac ? "MacBootTestOS" : "Arm64DemoOS"
         }
     }
 
@@ -182,7 +208,7 @@ struct VMConfiguration: Equatable {
         case .arm:
             return ["fact", "help", "quit"]
         case .arm64:
-            return ["fact", "help", "quit"]
+            return arm64Platform == .mac ? [] : ["fact", "help", "quit"]
         }
     }
 }
@@ -190,7 +216,7 @@ struct VMConfiguration: Equatable {
 extension VMConfiguration: Codable {
     private enum CodingKeys: String, CodingKey {
         case cpuCount, memoryMB, diskGB, architecture, guestOS, guestImage
-        case useISO, isoFileName, isoDisplayName, builtInSample
+        case useISO, isoFileName, isoDisplayName, builtInSample, arm64Platform
         case networkEnabled, sharedFolderEnabled
         case uefiVariables
     }
@@ -210,6 +236,7 @@ extension VMConfiguration: Codable {
         isoFileName = Self.tolerantString(container, .isoFileName)
         isoDisplayName = Self.tolerantString(container, .isoDisplayName)
         builtInSample = Self.tolerantEnum(BuiltInSample.self, container, .builtInSample)
+        arm64Platform = Self.tolerantEnum(Arm64Platform.self, container, .arm64Platform) ?? .demo
         networkEnabled = Self.tolerantBool(container, .networkEnabled) ?? true
         sharedFolderEnabled = Self.tolerantBool(container, .sharedFolderEnabled) ?? false
         uefiVariables = (try? container.decodeIfPresent([UEFIVariableRecord].self, forKey: .uefiVariables)) ?? nil ?? []
@@ -255,6 +282,7 @@ extension VMConfiguration: Codable {
         try container.encodeIfPresent(isoFileName, forKey: .isoFileName)
         try container.encodeIfPresent(isoDisplayName, forKey: .isoDisplayName)
         try container.encodeIfPresent(builtInSample, forKey: .builtInSample)
+        try container.encode(arm64Platform, forKey: .arm64Platform)
         try container.encode(networkEnabled, forKey: .networkEnabled)
         try container.encode(sharedFolderEnabled, forKey: .sharedFolderEnabled)
     }

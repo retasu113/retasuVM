@@ -233,16 +233,29 @@ final class VMStore: ObservableObject {
             bootDescription = "ArmDemoOS"
             session = armSession
         case .arm64:
-            let arm64Session = ARM64Session()
-            wireCallbacks(session: arm64Session, vmID: vm.id, generation: generation)
-            do {
-                try arm64Session.boot(source: ARM64DemoOS.source)
-            } catch {
-                failStart(index: index, vm: vm, message: error.localizedDescription)
-                return
+            if vm.configuration.arm64Platform == .mac {
+                let arm64Session = ARM64Session(memorySize: 256 * 1024 * 1024)
+                wireCallbacks(session: arm64Session, vmID: vm.id, generation: generation)
+                do {
+                    try arm64Session.bootMac(source: MacBootTestOS.source)
+                } catch {
+                    failStart(index: index, vm: vm, message: error.localizedDescription)
+                    return
+                }
+                bootDescription = "MacBootTestOS"
+                session = arm64Session
+            } else {
+                let arm64Session = ARM64Session()
+                wireCallbacks(session: arm64Session, vmID: vm.id, generation: generation)
+                do {
+                    try arm64Session.boot(source: ARM64DemoOS.source)
+                } catch {
+                    failStart(index: index, vm: vm, message: error.localizedDescription)
+                    return
+                }
+                bootDescription = "Arm64DemoOS"
+                session = arm64Session
             }
-            bootDescription = "Arm64DemoOS"
-            session = arm64Session
         }
 
         sessions[vm.id] = session
