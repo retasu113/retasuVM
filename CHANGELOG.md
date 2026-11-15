@@ -2,6 +2,102 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.10.0] - 2026-11-15
+
+### 追加
+
+- x86 CPU に SWAPGS 命令と TSS ハードウェアタスクスイッチを実装した。
+  JMP / CALL FAR → TSS ディスクリプタ / タスクゲート、割り込み
+  ゲート（種別 5）、NT フラグ付き IRET によるタスク切替に対応し、
+  状態の保存 / 復元、ビジービット管理、CR0.TS の設定を行う。
+  検証カーネルで JMP FAR 往復と SWAPGS の往復を確認した。
+- UEFI に Loaded Image プロトコルを追加し、LoadImage /
+  StartImage / Exit / UnloadImage を実装した。メモリバッファから
+  PE32+ を読み込み（希望 ImageBase が空いていない場合は
+  DIR64 再配置を適用）、子イメージへ制御を移して終了ステータスを
+  受け取れる。
+- UEFI に GOP（Graphics Output Protocol）を追加した。
+  640×400（BGRA）の線形フレームバッファ、QueryMode / SetMode /
+  Blt（VideoFill / BufferToVideo / VideoToBuffer / VideoToVideo）。
+- UEFI にイベント / タイマサービスを追加した。CreateEvent /
+  CreateEventEx / SetTimer（周期・相対）/ WaitForEvent /
+  SignalEvent / CloseEvent / CheckEvent。
+- UEFI の残りのサービスを実装した。LocateHandle（呼び出し側
+  バッファ形式）、LocateDevicePath、ReinstallProtocolInterface、
+  Install / UninstallMultipleProtocolInterfaces、
+  OpenProtocolInformation、ConnectController /
+  DisconnectController（即成功）、RegisterProtocolNotify、
+  ランタイムの GetTime / SetTime / GetWakeupTime /
+  SetWakeupTime / SetVirtualAddressMap / ConvertPointer /
+  GetNextHighMonotonicCount。
+- UEFI 変数を永続化した。セッション終了時に VM の構成へ保存し、
+  次回起動時に引き継ぐ（保存データ形式は後方互換）。
+- ExitBootServices の後はブートサービス呼び出しがエラー
+  （EFI_NOT_READY）を返すようになった。ランタイムサービスと
+  コンソール / GOP は継続して使える。
+- FAT の書き込みでロングファイル名（LFN）に対応した。
+  LFN エントリの生成、上書き時のエントリ再利用、削除時の
+  LFN エントリ除去、列挙時のチェックサム検証。
+
+### 修正（全 Swift ファイル監査で見つけた確定バグ）
+
+- x86 ページングで R/W ビットを検査していなかった（リング 3 から
+  読み取り専用ページへ書き込めた）。全階層の AND で判定し、
+  CPL 3 と CR0.WP 有効時のリング 0 で #PF を出すよう修正。
+- 特権検査の漏れ: OUT imm8、INS / OUTS に IOPL 検査がなかった。
+  POPF が IOPL / IF を無条件に書き換えた。Far 転送に CS の
+  DPL 検査がなかった（リング昇格が可能だった）。
+- IDIV が Int 最小値 / -1 などで Swift のトラップでプロセス
+  ごと落ちた。除算前に #DE として弾くよう修正。
+- UEFI の PE 判定で Subsystem を 4 バイト読みしていたため、
+  DllCharacteristics が非ゼロの通常の .efi を UEFI アプリと
+  認識できず BIOS 起動に落ちていた。2 バイト読みに修正。
+- GetNextMonotonicCount が引数を RDX に書いていた（正しくは
+  RCX）。Block I/O で巨大 LBA が Int 変換でトラップした。
+  GetMemoryMap が失敗時にも MapKey を進めていた。
+- 保存データのデコードを寛容にした。未知の enum 値や型の
+  不一致で全 VM が消える問題を修正し、デコード不能時は
+  ファイルを退避してからサンプルへ戻すようになった。
+- VGA アトリビュートレジスタの範囲外アクセス、Multiboot
+  a.out クルージュの減算アンダーフローで落ちる問題を修正。
+- ARM アセンブラの範囲外即値でのトラップ、リテラルプールの
+  負オフセット拒否、ldrb のバイトフラグ欠落、lsl #32 の
+  誤エンコードを修正。RISC-V アセンブラの即値切り捨てを
+  エラーにするよう修正。ARMDemoOS の行入力に上限を追加し、
+  RetasuOS の fib 上限を 46 に修正（47 以上で値が化けた）。
+- FAT の短い名前生成が 21 バイト返してディレクトリを壊す
+  問題、FAT 種別判定のオフバイツー、破損 BPB でのクラッシュ、
+  LFN ファイル上書き時のエントリ重複を修正。
+- IDE の範囲外 LBA が成功扱いだった問題、PCI CONFIG_ADDRESS
+  の部分書き込み、PIT モード 6 / 7、BIOS INT 1Ah の
+  24 時間ラップ値などを仕様どおりに修正。
+- そのほか監査で確認した細かな仕様ずれ（#PF の U/S ビット、
+  非正準アドレスの #GP 化、IRET の SS/ESP 復元、REP 文字列
+  命令の割り込み応答性、入力キューのデータ競合対策、
+  セッションの二重起動ガードなど）を修正した。
+
+### 検証
+
+- 新規統合テスト: UEFI3（Loaded Image / LoadImage→StartImage /
+  GOP / イベント / WaitForEvent / LocateHandle / GetTime /
+  EBS 無効化）、変数永続化（2 セッション引き継ぎ）、LFN
+  （作成・列挙・読み戻し・上書き・削除）、タスクスイッチ +
+  SWAPGS 検証カーネル。すべて合格。
+- 全回帰テスト（リング / DMA / ロングモード / デバイス /
+  Multiboot / BIOS ISO / UEFI サンプル 2 種 / RISC-V / ARM /
+  Codable 寛容デコード）合格。全 36 ファイルの文法チェックと
+  エンジン + モデルの型チェック合格。
+- 実機（iPhone / iPad の Swift Playgrounds）での検証は未実施。
+
+### 既知の制限
+
+- UEFI の通知関数呼び出し、ドライバモデル、Secure Boot、
+  ConIn は未提供。一般の OS（Windows / 現在の Linux）は
+  まだ起動できない。
+- FPU / SSE 命令は未実装（CPUID でも申告しない）。
+- GOP のフレームバッファはアプリのコンソールに描画されない。
+- 大きな ISO は起動時に全体をメモリへ読み込む。
+
 ## [0.9.0] - 2026-11-15
 
 ### 追加

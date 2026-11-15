@@ -3,7 +3,7 @@
 retasuVM は、iPhone と iPad で仮想マシンを管理するための SwiftUI アプリです。
 Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgrounds でそのまま開けるプロジェクト形式（`.swiftpm`）で配布します。
 
-> **現在の実行エンジンについて**: v0.8.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード + 自作 BIOS / 最小 UEFI + 周辺デバイス群）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、ロングモードへの移行、APIC 割り込み、ACPI テーブルの読み取り、UEFI アプリケーション（.efi）の実行が可能です。UEFI はプロトコルデータベース、Block I/O、Simple File System（FAT12 / 16 / 32 の読み書き）、変数サービスまで備えましたが、Loaded Image プロトコルやグラフィックス出力（GOP）などが未提供のため、Windows や現在の Linux のような一般の OS はまだ実行できません。
+> **現在の実行エンジンについて**: v0.8.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード + 自作 BIOS / 最小 UEFI + 周辺デバイス群）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、ロングモードへの移行、APIC 割り込み、ACPI テーブルの読み取り、UEFI アプリケーション（.efi）の実行が可能です。UEFI はプロトコルデータベース、Loaded Image プロトコル、LoadImage / StartImage / Exit、イベント / タイマ、GOP（フレームバッファ）、Block I/O、Simple File System（FAT12 / 16 / 32 の読み書き、ロングファイル名の書き込み対応）、永続化される変数サービスまで備えましたが、UEFI ドライバモデルや Secure Boot などは未提供のため、Windows や現在の Linux のような一般の OS はまだ実行できません。
 
 ## 主な機能
 
@@ -95,10 +95,11 @@ Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます�
 2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にして、ダウンロードした .efi を選びます。
 3. VM を起動すると、最小 UEFI ファームウェアが PE32+ イメージを読み込み、ロングモードでエントリポイントを呼びます（RCX = ImageHandle、RDX = SystemTable）。サンプルは ConOut へ挨拶を表示し、GetMemoryMap と ExitBootServices を呼んだあと、シリアルポートへ直接出力して停止します。
 
-自作 UEFI アプリの条件: x86-64 の PE32+ イメージ（サブシステム: EFI アプリケーション / ブートサービスドライバ / ランタイムドライバ）。ImageBase は 16 MiB の RAM 内に収まる必要があります。使えるサービスは ConOut（OutputString など）、基本ブートサービス（AllocatePages / AllocatePool / GetMemoryMap / ExitBootServices / Stall / CopyMem / SetMem / CalculateCrc32 など）、プロトコル関連サービス（InstallProtocolInterface / HandleProtocol / OpenProtocol / LocateProtocol / LocateHandleBuffer など）、Block I/O プロトコル、Simple File System プロトコル（FAT ボリュームの読み書き。ディスク未接続時は RAM 上の FAT12 フロッピーが対象）、変数サービス（GetVariable / SetVariable / GetNextVariableName / QueryVariableInfo。ただし変数はメモリ上のみで永続化しません）です。一方で Loaded Image プロトコル、グラフィックス出力（GOP）、デバイスパスユーティリティなどは未提供のため、Windows Boot Manager や GRUB のような本格的なブートローダはまだ起動できません。
+自作 UEFI アプリの条件: x86-64 の PE32+ イメージ（サブシステム: EFI アプリケーション / ブートサービスドライバ / ランタイムドライバ）。ImageBase は 16 MiB の RAM 内に収まる必要があります。使えるサービスは ConOut（OutputString など）、ブートサービス（AllocatePages / AllocatePool / GetMemoryMap / ExitBootServices / Stall / CopyMem / SetMem / CalculateCrc32 / LoadImage / StartImage / Exit / UnloadImage / CreateEvent / SetTimer / WaitForEvent / CheckEvent など）、プロトコル関連サービス（InstallProtocolInterface / HandleProtocol / OpenProtocol / LocateProtocol / LocateHandle / LocateHandleBuffer / LocateDevicePath など）、Loaded Image プロトコル、GOP（Graphics Output、640×400 フレームバッファ + Blt）、Block I/O プロトコル、Simple File System プロトコル（FAT ボリュームの読み書き、ロングファイル名対応。ディスク未接続時は RAM 上の FAT12 フロッピーが対象）、変数サービス（GetVariable / SetVariable / GetNextVariableName / QueryVariableInfo。変数は VM の構成に保存され、次回起動時に引き継がれます）、ランタイムサービス（GetTime / GetVariable 群 / ResetSystem など）です。ExitBootServices の後はブートサービスが無効化されます。一方で UEFI ドライバモデル、イベント通知関数の呼び出し、Secure Boot、ConIn（入力プロトコル）などは未提供のため、Windows Boot Manager や GRUB のような本格的なブートローダの起動はまだ保証できません。
 
 ## 現在の開発状況
 
+- v0.10.0: 残りの不足機能を実装した。x86 に SWAPGS と TSS ハードウェアタスクスイッチを追加。UEFI に Loaded Image プロトコル、LoadImage / StartImage / Exit / UnloadImage、GOP（フレームバッファ + Blt）、イベント / タイマ、残りのブート / ランタイムサービス、変数の永続化、ExitBootServices 後のブートサービス無効化を追加。FAT はロングファイル名の書き込みに対応。あわせて全 Swift ファイル（36 ファイル）を監査し、ページ書き込み保護の欠落や IDIV のトラップ、PE の Subsystem フィールドの読み違い（通常のリンカで作った .efi を UEFI アプリと認識できない問題）など、確定バグをすべて修正した。新規統合テスト（UEFI3 / 永続化 / LFN / タスクスイッチ・SWAPGS）と全回帰テストで検証済み。
 - v0.9.0: x86 に特権リング（リング 3、TSS スタック切替、U/S 検査）と SYSCALL / SYSRET、IDE バスマスタ DMA を追加。UEFI にプロトコルデータベース、Block I/O、Simple File System（FAT12 / 16 / 32 読み書き）、変数サービスを追加。リング検証カーネル、DMA 検証カーネル、UEFI 統合テストアプリと全回帰テストで検証済み。
 - v0.8.0: x86 に 64 ビット ロングモード（REX / 4 階層ページング / EFER）、LAPIC / IOAPIC、ACPI テーブル（RSDP〜MADT）、最小 UEFI ファームウェア（PE32+ ローダ + ConOut + 基本ブートサービス）を追加。ロングモード検証カーネルと UEFI サンプルアプリで実行テストを実施済み。
 - v0.7.0: x86 に PC 周辺デバイス（PIC / PIT / キーボード / PCI / IDE / RTC / シリアル）を追加。割り込みで動く OS らしいカーネルが動作するようになった。デバイス検証カーネルと全エンジンの実行テストを実施済み。
@@ -113,8 +114,8 @@ Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます�
 
 ## 既知の制約
 
-- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード / ロングモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）、最小 UEFI で動く PE32+ アプリケーション（.efi）です。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（UEFI に Loaded Image プロトコルやグラフィックス出力（GOP）などが未提供のため）。
-- x86 の特権リングはリング 0〜3 に対応しましたが、TSS タスクスイッチ（ハードウェアタスク切替）と SWAPGS 命令は未実装です。UEFI 変数はメモリ上のみで永続化せず、FAT の書き込みは 8.3 形式の短いファイル名のみ（ロングファイル名は読み取りのみ）です。Block I/O の対象は接続中のディスクイメージ、未接続時は RAM 上の FAT12 フロッピーです。ExitBootServices 後もブートサービスを完全には無効化しません。VGA はレジスタとテキストメモリの保持のみで画面描画はしません。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。
+- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード / ロングモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）、最小 UEFI で動く PE32+ アプリケーション（.efi）です。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（UEFI ドライバモデルや Secure Boot、ConIn などが未提供のため）。
+- x86 の特権リング、TSS タスクスイッチ、SWAPGS、SYSCALL / SYSRET に対応しました。ただし FPU / SSE 命令は未実装です（CPUID でも申告しません）。UEFI 変数は VM の構成に保存され永続化されます。FAT はロングファイル名の読み書きに対応しました。Block I/O の対象は接続中のディスクイメージ、未接続時は RAM 上の FAT12 フロッピーです。ExitBootServices の後はブートサービスが無効化されます（ランタイムサービスとコンソール / GOP は継続）。UEFI のイベント通知関数（NotifyFunction）の呼び出し、ドライバモデル、LoadImage のデバイスパス経由の読み込み（メモリバッファ経由のみ対応）は未実装です。GOP のフレームバッファはゲストメモリ上にありますが、アプリのコンソールには描画されません。VGA はレジスタとテキストメモリの保持のみで画面描画はしません。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。大きな ISO は起動時に全体をメモリへ読み込みます。
 - エミュレータは固定スペック（RISC-V: RV32IM / 1 MiB、x86: リアルモード / 16 MiB、ARM: ARMv7-A サブセット / 4 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
 - ゲスト画面はテキストコンソールのみです（グラフィカル表示はありません）。
 - VM の設定データは端末内にのみ保存されます（同期機能はありません）。
