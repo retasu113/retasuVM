@@ -41,6 +41,7 @@ final class X86Session: GuestSession {
     /// 置かれた KERNEL.ELF）は Multiboot ローダで、それ以外は BIOS
     /// ブート（El Torito / raw イメージ）で起動する。
     func boot(imageData: [UInt8]) throws {
+        X86ACPI.install(cpu: cpu)
         if Multiboot.isMultibootKernel(imageData) {
             try Multiboot.boot(cpu: cpu, imageData: imageData)
             attachRAMDiskIfNeeded()
@@ -49,6 +50,8 @@ final class X86Session: GuestSession {
                   Multiboot.isMultibootKernel(kernel) {
             try Multiboot.boot(cpu: cpu, imageData: kernel)
             attachRAMDiskIfNeeded()
+        } else if X86UEFI.isUEFIApplication(imageData) {
+            try X86UEFI.boot(cpu: cpu, imageData: imageData)
         } else {
             try bios.boot(imageData: imageData)
         }

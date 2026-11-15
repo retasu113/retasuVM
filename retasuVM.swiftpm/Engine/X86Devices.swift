@@ -23,6 +23,10 @@ final class X86DeviceBus {
 
     let pic = X86PIC()
     let pit = X86PIT()
+    let lapic = X86LAPIC()
+    let ioapic = X86IOAPIC()
+    /// MMIO 書き込み時の時刻（updateDevices で更新）。
+    private var lastNow: UInt64 = 0
     let rtc = X86RTC()
     let keyboard = X86KeyboardController()
     let pci = X86PCIHost()
@@ -58,6 +62,8 @@ final class X86DeviceBus {
     func reset() {
         pic.reset()
         pit.reset()
+        lapic.reset()
+        ioapic.reset()
         keyboard.reset()
         ide.reset()
         serialIER = 0
@@ -66,13 +72,76 @@ final class X86DeviceBus {
 
     // MARK: - デバイス更新（CPU が命令ごとに呼ぶ）
 
-    /// 時間で変化するデバイス（PIT・キーボード・シリアル）の IRQ を PIC へ伝える。
+    /// 時間で変化するデバイス（PIT・キーボード・シリアル）の IRQ を PIC と
+    /// IOAPIC へ伝え、LAPIC タイマを進める。
     func updateDevices(now: UInt64) {
+        lastNow = now
         if pit.update(now: now) {
             pic.pulse(line: 0)
+            ioapic.pulsePin(2) // 実機では PIT は IOAPIC のピン 2 に接続される
         }
         pic.setLine(1, keyboard.hasData)
-        pic.setLine(4, serialIER & 0x01 != 0 && (cpu?.hasInput ?? false))
+        ioapic.setPinLevel(1, keyboard.hasData)
+        let serialAsserted = serialIER & 0x01 != 0 && (cpu?.hasInput ?? false)
+        pic.setLine(4, serialAsserted)
+        ioapic.setPinLevel(4, serialAsserted)
+        lapic.update(now: now)
+        ioapic.service(lapic: lapic)
+    }
+
+    /// IDE などエッジ型デバイスからの割り込み（PIC と IOAPIC の両方へ）。
+    func pulseInterruptLine(_ irq: Int) {
+        pic.pulse(line: irq)
+        ioapic.pulsePin(irq)
+    }
+
+    // MARK: - MMIO（LAPIC / IOAPIC）
+
+    /// MMIO 領域（LAPIC 0xFEE00000、IOAPIC 0xFEC00000）かどうか。
+    static func isMMIOAddress(_ physical: UInt64) -> Bool {
+        (physical >= 0xFEE00000 && physical < 0xFEE01000)
+            || (physical >= 0xFEC00000 && physical < 0xFEC01000)
+    }
+
+    /// MMIO 読み取り。レジスタは 32 ビット単位で、バイトレーンを切り出す。
+    func readMMIO(physical: UInt64, size: Int) -> UInt64 {
+        let isLAPIC = physical >= 0xFEE00000
+        let offset = Int(physical - (isLAPIC ? 0xFEE00000 : 0xFEC00000))
+        let registerOffset = offset & ~3
+        let lane = offset & 3
+        let raw: UInt32
+        if isLAPIC {
+            raw = lapic.readRegister(registerOffset)
+        } else if registerOffset == 0 {
+            raw = ioapic.selectedRegister
+        } else if registerOffset == 0x10 {
+            raw = ioapic.readRegister()
+        } else {
+            raw = 0
+        }
+        let shifted = UInt64(raw) >> (lane * 8)
+        if size >= 4 { return UInt64(raw) }
+        return shifted & ((UInt64(1) << (size * 8)) - 1)
+    }
+
+    /// MMIO 書き込み。部分書き込みはレジスタ値へマージする。
+    func writeMMIO(physical: UInt64, size: Int, _ value: UInt64) {
+        let isLAPIC = physical >= 0xFEE00000
+        let offset = Int(physical - (isLAPIC ? 0xFEE00000 : 0xFEC00000))
+        let registerOffset = offset & ~3
+        let lane = offset & 3
+        func merged(_ current: UInt32) -> UInt32 {
+            if size >= 4 { return UInt32(value & 0xFFFFFFFF) }
+            let laneMask: UInt32 = UInt32((UInt64(1) << (size * 8)) - 1) << (lane * 8)
+            return (current & ~laneMask) | (UInt32(value) << (lane * 8))
+        }
+        if isLAPIC {
+            lapic.writeRegister(registerOffset, merged(lapic.readRegister(registerOffset)), now: lastNow)
+        } else if registerOffset == 0 {
+            ioapic.selectedRegister = merged(ioapic.selectedRegister)
+        } else if registerOffset == 0x10 {
+            ioapic.writeRegister(merged(ioapic.readRegister()))
+        }
     }
 
     // MARK: - ポート読み取り
@@ -948,7 +1017,7 @@ final class X86IDEController {
 
     private func raiseInterrupt() {
         if !noInterrupt {
-            bus?.pic.pulse(line: 14)
+            bus?.pulseInterruptLine(14)
         }
     }
 
@@ -1055,5 +1124,236 @@ final class X86IDEController {
         word(60, UInt16(totalSectors & 0xFFFF))
         word(61, UInt16((totalSectors >> 16) & 0xFFFF))
         return block
+    }
+}
+
+
+/// ローカル APIC（MMIO 0xFEE00000）。タイマ割り込み、TPR、EOI、
+/// 割り込み保留（IRR）/ 処理中（ISR）の管理を行う。
+/// バスクロックは 100 MHz 相当として時間を数える。
+final class X86LAPIC {
+    private(set) var id: UInt32 = 0
+    var tpr: UInt32 = 0
+    private(set) var svr: UInt32 = 0x000000FF // リセット時: ベクタ 0xFF、無効
+    private var isr: [UInt32] = [UInt32](repeating: 0, count: 8)
+    private var irr: [UInt32] = [UInt32](repeating: 0, count: 8)
+    private var lvtTimer: UInt32 = 0x00010000
+    private var lvtLint0: UInt32 = 0x00010000
+    private var lvtLint1: UInt32 = 0x00010000
+    private var lvtError: UInt32 = 0x00010000
+    private var icrLow: UInt32 = 0
+    private var icrHigh: UInt32 = 0
+    private var timerDivide: UInt32 = 0
+    private var timerInitial: UInt32 = 0
+    private var timerDeadline: UInt64 = 0
+    private var timerArmed = false
+    private var currentNow: UInt64 = 0
+
+    var enabled: Bool { svr & 0x100 != 0 }
+
+    func reset() {
+        id = 0
+        tpr = 0
+        svr = 0x000000FF
+        isr = [UInt32](repeating: 0, count: 8)
+        irr = [UInt32](repeating: 0, count: 8)
+        lvtTimer = 0x00010000
+        lvtLint0 = 0x00010000
+        lvtLint1 = 0x00010000
+        lvtError = 0x00010000
+        icrLow = 0
+        icrHigh = 0
+        timerDivide = 0
+        timerInitial = 0
+        timerArmed = false
+    }
+
+    /// 分周値（Divide Configuration のエンコーディング → 分周比）。
+    private var timerDivisor: UInt64 {
+        let table: [UInt64] = [2, 4, 8, 16, 32, 64, 128, 1]
+        let index = Int(((timerDivide >> 1) & 0x6) | (timerDivide & 0x1))
+        return table[index]
+    }
+
+    /// 1 カウントの長さ（ナノ秒）。バス 100 MHz（10 ns）× 分周比。
+    private var timerPeriodNanos: UInt64 { timerDivisor * 10 }
+
+    func update(now: UInt64) {
+        currentNow = now
+        guard timerArmed, timerInitial > 0, now >= timerDeadline else { return }
+        let periodic = (lvtTimer >> 17) & 0x3 == 1
+        if lvtTimer & 0x10000 == 0 {
+            requestInterrupt(vector: UInt8(lvtTimer & 0xFF))
+        }
+        if periodic {
+            let period = timerPeriodNanos * UInt64(timerInitial)
+            let steps = (now - timerDeadline) / period + 1
+            timerDeadline += steps * period
+        } else {
+            timerArmed = false
+        }
+    }
+
+    /// 割り込みを保留する（IRR ビットを立てる）。
+    func requestInterrupt(vector: UInt8) {
+        irr[Int(vector) / 32] |= UInt32(1) << (vector % 32)
+    }
+
+    private func highestSetBit(_ registers: [UInt32]) -> Int? {
+        for index in stride(from: 7, through: 0, by: -1) where registers[index] != 0 {
+            return index * 32 + (31 - registers[index].leadingZeroBitCount)
+        }
+        return nil
+    }
+
+    /// 配送可能な割り込みベクタ（優先度と TPR を考慮）。
+    func pendingInterrupt() -> UInt8? {
+        guard enabled, let candidate = highestSetBit(irr) else { return nil }
+        let candidatePriority = candidate >> 4
+        if let inService = highestSetBit(isr), candidatePriority <= (inService >> 4) { return nil }
+        if candidatePriority <= (Int(tpr) >> 4) { return nil }
+        return UInt8(candidate)
+    }
+
+    /// CPU が受け付けたときに呼ぶ（IRR → ISR）。
+    func acknowledge(vector: UInt8) {
+        irr[Int(vector) / 32] &= ~(UInt32(1) << (vector % 32))
+        isr[Int(vector) / 32] |= UInt32(1) << (vector % 32)
+    }
+
+    private var processorPriority: UInt32 {
+        var priority = Int(tpr) >> 4
+        if let inService = highestSetBit(isr) {
+            priority = max(priority, inService >> 4)
+        }
+        return UInt32(priority << 4)
+    }
+
+    func readRegister(_ offset: Int) -> UInt32 {
+        switch offset {
+        case 0x020: return id << 24
+        case 0x030: return 0x00050014 // バージョン 0x14、LVT 数 5
+        case 0x080: return tpr
+        case 0x0A0: return processorPriority
+        case 0x0D0: return 0 // LDR
+        case 0x0E0: return 0xFFFFFFFF // DFR（フラットモデル）
+        case 0x0F0: return svr
+        case 0x100...0x170 where (offset & 0xF) == 0: return isr[(offset - 0x100) / 16]
+        case 0x200...0x270 where (offset & 0xF) == 0: return irr[(offset - 0x200) / 16]
+        case 0x300: return icrLow
+        case 0x310: return icrHigh
+        case 0x320: return lvtTimer
+        case 0x350: return lvtLint0
+        case 0x360: return lvtLint1
+        case 0x370: return lvtError
+        case 0x380: return timerInitial
+        case 0x390:
+            guard timerArmed, timerInitial > 0, timerDeadline > currentNow else { return 0 }
+            let remaining = (timerDeadline - currentNow + timerPeriodNanos - 1) / timerPeriodNanos
+            return UInt32(min(remaining, UInt64(timerInitial)))
+        case 0x3E0: return timerDivide
+        default: return 0
+        }
+    }
+
+    func writeRegister(_ offset: Int, _ value: UInt32, now: UInt64) {
+        switch offset {
+        case 0x020: id = (value >> 24) & 0xFF
+        case 0x080: tpr = value & 0xFF
+        case 0x0B0: // EOI: 最上位の ISR ビットを落とす
+            if let inService = highestSetBit(isr) {
+                isr[inService / 32] &= ~(UInt32(1) << (inService % 32))
+            }
+        case 0x0F0: svr = value
+        case 0x300: icrLow = value // IPI は単一 CPU のため配送先なし（値のみ保持）
+        case 0x310: icrHigh = value
+        case 0x320: lvtTimer = value
+        case 0x350: lvtLint0 = value
+        case 0x360: lvtLint1 = value
+        case 0x370: lvtError = value
+        case 0x380:
+            timerInitial = value
+            currentNow = now
+            if value > 0 {
+                timerDeadline = now + timerPeriodNanos * UInt64(value)
+                timerArmed = true
+            } else {
+                timerArmed = false
+            }
+        case 0x3E0: timerDivide = value & 0xB
+        default: break
+        }
+    }
+}
+
+/// I/O APIC（MMIO 0xFEC00000）。IOREGSEL / IOWIN 経由のレジスタ
+/// アクセスと、リダイレクションテーブルによる割り込みの LAPIC への
+/// 配送を行う。ピンは IRQ 番号に対応し、PIT だけは実機どおりピン 2。
+final class X86IOAPIC {
+    var selectedRegister: UInt32 = 0
+    private(set) var id: UInt32 = 0
+    private var redirectionLow: [UInt32] = [UInt32](repeating: 0x00010000, count: 24)
+    private var redirectionHigh: [UInt32] = [UInt32](repeating: 0, count: 24)
+    private var pinLevels: [Bool] = [Bool](repeating: false, count: 24)
+    private var edgeLatch: [Bool] = [Bool](repeating: false, count: 24)
+
+    func reset() {
+        selectedRegister = 0
+        redirectionLow = [UInt32](repeating: 0x00010000, count: 24)
+        redirectionHigh = [UInt32](repeating: 0, count: 24)
+        pinLevels = [Bool](repeating: false, count: 24)
+        edgeLatch = [Bool](repeating: false, count: 24)
+    }
+
+    /// レベル型デバイスのライン状態を伝える。立ち上がりエッジは
+    /// エッジトリガ設定のエントリ用にもラッチする。
+    func setPinLevel(_ pin: Int, _ asserted: Bool) {
+        guard pin >= 0, pin < 24 else { return }
+        if asserted && !pinLevels[pin] { edgeLatch[pin] = true }
+        pinLevels[pin] = asserted
+    }
+
+    /// エッジ型デバイスのパルスを伝える。
+    func pulsePin(_ pin: Int) {
+        guard pin >= 0, pin < 24 else { return }
+        edgeLatch[pin] = true
+    }
+
+    /// 保留中の割り込みを LAPIC へ配送する。
+    func service(lapic: X86LAPIC) {
+        for pin in 0..<24 {
+            let low = redirectionLow[pin]
+            guard low & 0x10000 == 0 else { continue } // マスク中
+            let levelTriggered = low & 0x8000 != 0
+            let active = levelTriggered ? pinLevels[pin] : edgeLatch[pin]
+            guard active else { continue }
+            lapic.requestInterrupt(vector: UInt8(low & 0xFF))
+            if !levelTriggered { edgeLatch[pin] = false }
+        }
+    }
+
+    func readRegister() -> UInt32 {
+        switch selectedRegister {
+        case 0x00: return id << 24
+        case 0x01: return 0x00170011 // バージョン 0x11、エントリ数 24
+        case 0x10...0x3F:
+            let pin = Int((selectedRegister - 0x10) / 2)
+            return selectedRegister & 1 == 0 ? redirectionLow[pin] : redirectionHigh[pin]
+        default: return 0
+        }
+    }
+
+    func writeRegister(_ value: UInt32) {
+        switch selectedRegister {
+        case 0x00: id = (value >> 24) & 0xF
+        case 0x10...0x3F:
+            let pin = Int((selectedRegister - 0x10) / 2)
+            if selectedRegister & 1 == 0 {
+                redirectionLow[pin] = value
+            } else {
+                redirectionHigh[pin] = value
+            }
+        default: break
+        }
     }
 }

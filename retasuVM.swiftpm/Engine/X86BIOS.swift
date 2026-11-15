@@ -361,10 +361,64 @@ final class X86BIOS {
             cpu.setFlag(X86CPU.flagCarry, false)
         case 0x86: // ウェイト（即時復帰）
             cpu.setFlag(X86CPU.flagCarry, false)
+        case 0xE8: // メモリマップ取得（E820 / E801）
+            if cpu.register32(0) == 0x0000E820 {
+                handleE820()
+            } else if cpu.register32(0) & 0xFFFF == 0xE801 {
+                // 拡張メモリ: AX = 1〜16 MiB の KB 数、BX = 16 MiB 以上の 64 KB 数
+                cpu.setRegister16(0, 15360)
+                cpu.setRegister16(3, 0)
+                cpu.setFlag(X86CPU.flagCarry, false)
+            } else {
+                cpu.setFlag(X86CPU.flagCarry, true)
+                cpu.setRegister8(4, 0x86)
+            }
         default:
             cpu.setFlag(X86CPU.flagCarry, true)
             cpu.setRegister8(4, 0x86)
         }
         return .handled
+    }
+
+    /// INT 15h AX=E820: メモリマップを 1 件ずつ返す（EBX が継続値）。
+    private func handleE820() {
+        guard let cpu else { return }
+        guard cpu.register32(2) == 0x534D4150 else { // EDX = "SMAP"
+            cpu.setFlag(X86CPU.flagCarry, true)
+            cpu.setRegister8(4, 0x86)
+            return
+        }
+        let memorySize = UInt64(cpu.memory.count)
+        let entries: [(base: UInt64, length: UInt64, type: UInt32)] = [
+            (0, 0xA0000, 1), // 通常メモリ
+            (0xE0000, 0x20000, 2), // BIOS / ACPI 領域（予約）
+            (0x100000, memorySize - 0x100000, 1), // 拡張メモリ
+        ]
+        let index = Int(cpu.register32(3))
+        guard index < entries.count else {
+            cpu.setFlag(X86CPU.flagCarry, true)
+            cpu.setRegister8(4, 0x86)
+            return
+        }
+        let entry = entries[index]
+        let address = cpu.physicalAddress(segment: cpu.segment(0), offset: UInt32(cpu.register16(7)))
+        func write64(_ value: UInt64, at offset: Int) {
+            for i in 0..<8 {
+                try? cpu.writeMemory8(at: address + offset + i, UInt8((value >> (8 * i)) & 0xFF))
+            }
+        }
+        func write32(_ value: UInt32, at offset: Int) {
+            for i in 0..<4 {
+                try? cpu.writeMemory8(at: address + offset + i, UInt8((value >> (8 * i)) & 0xFF))
+            }
+        }
+        write64(entry.base, at: 0)
+        write64(entry.length, at: 8)
+        write32(entry.type, at: 16)
+        write32(1, at: 20) // ACPI 3.0 拡張属性（有効）
+        cpu.setRegister32(0, 0x534D4150)
+        cpu.setRegister32(3, index + 1 < entries.count ? UInt32(index + 1) : 0)
+        cpu.setRegister32(1, 24)
+        cpu.setFlag(X86CPU.flagCarry, false)
     }
 }
