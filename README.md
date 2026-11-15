@@ -3,7 +3,7 @@
 retasuVM は、iPhone と iPad で仮想マシンを管理するための SwiftUI アプリです。
 Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgrounds でそのまま開けるプロジェクト形式（`.swiftpm`）で配布します。
 
-> **現在の実行エンジンについて**: v0.13.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード + x87 FPU / MMX / SSE / SSE2 / SSE3 / SSSE3 / SSE4.1 + 自作 BIOS / 最小 UEFI + 周辺デバイス群）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、ロングモードへの移行、APIC 割り込み、ACPI テーブルの読み取り、UEFI アプリケーション（.efi）の実行が可能です。UEFI はプロトコルデータベース、Loaded Image プロトコル、LoadImage / StartImage / Exit（デバイスパス経由の読み込み対応）、イベント / タイマと通知関数の呼び出し、Driver Binding プロトコルによるドライバ接続、ConIn（キー入力）、GOP（3 モードのフレームバッファ。アプリの画面表示に描画）、本物のメモリアロケータ、Secure Boot（イメージハッシュ方式）、SetVirtualAddressMap、Block I/O、Simple File System（FAT12 / 16 / 32 の読み書き、ロングファイル名の書き込み対応）、永続化される変数サービスまで備えました。v0.13.0 では macOS の起動基盤として、CPUID の GenuineIntel / Coffee Lake 化、HPET、Apple SMC、AHCI (SATA)、SMBIOS を追加しましたが、証明書方式の Secure Boot や TPM などは未提供のため、Windows や現在の Linux のような一般の OS、および macOS はまだ実行できません。
+> **現在の実行エンジンについて**: v0.14.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 4 種類です。RISC-V（RV32IM）、x86（リアルモード + 32 ビット プロテクトモード + 64 ビット ロングモード + x87 FPU / MMX / SSE / SSE2 / SSE3 / SSSE3 / SSE4.1 + 自作 BIOS / 最小 UEFI + 周辺デバイス群）、ARM（ARMv7-A サブセット）、ARM64（AArch64、EL0 / EL1 + 段 1 MMU + GIC + 仮想タイマ）を VM ごとに選べます。v0.14.0 では、配布しているサンプル（x86 カーネル / UEFI アプリ / BIOS ブート ISO / RISC-V サンプル ISO の 17 種）をすべてアプリに内蔵し、ファイルを用意しなくても VM の編集画面から選んでそのまま起動できるようにしました。ARM64 エンジンは、iOS / iPadOS 上で Mac を動かす Henge の方式（ARM64 の Apple Silicon Mac エミュレーション + Apple 公式リストアイメージの取得）を参考に、macOS 実行へ向けた基盤として追加したものです。x86 は El Torito 対応 ISO から BIOS ブートできるほか、Multiboot 対応カーネル（ELF32）をプロテクトモードで直接起動でき、ロングモードへの移行、APIC 割り込み、ACPI テーブルの読み取り、UEFI アプリケーション（.efi）の実行が可能です。UEFI はプロトコルデータベース、Loaded Image プロトコル、LoadImage / StartImage / Exit（デバイスパス経由の読み込み対応）、イベント / タイマと通知関数の呼び出し、Driver Binding プロトコルによるドライバ接続、ConIn（キー入力）、GOP（3 モードのフレームバッファ。アプリの画面表示に描画）、本物のメモリアロケータ、Secure Boot（イメージハッシュ方式）、SetVirtualAddressMap、Block I/O、Simple File System（FAT12 / 16 / 32 の読み書き、ロングファイル名の書き込み対応）、永続化される変数サービスまで備えました。v0.13.0 では macOS の起動基盤として、CPUID の GenuineIntel / Coffee Lake 化、HPET、Apple SMC、AHCI (SATA)、SMBIOS を追加しましたが、証明書方式の Secure Boot や TPM などは未提供のため、Windows や現在の Linux のような一般の OS、および macOS はまだ実行できません。
 
 ## 主な機能
 
@@ -34,6 +34,17 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
   - シリアルポート（COM1）とポート 0xE9 デバッグコンソールをコンソールに接続
 - ARM エミュレータ（ARMv7-A、A32 命令サブセット + 自作アセンブラ）
   - デモゲスト「ArmDemoOS」（help / fact / echo / quit）
+- ARM64 エミュレータ（AArch64 + 自作アセンブラ）
+  - EL0 / EL1 特権レベル、例外ベクタ（同期 / IRQ）、ERET による復帰
+  - 段 1 MMU（4KB グラニュール、TTBR0 / TTBR1、権限・アクセスフラグ・変換フォールトの配送）
+  - GIC ライト（ディストリビュータ + CPU インタフェース）と仮想タイマ（CNTP / CNTV、INTID 30）
+  - アトミック命令（LDADD 系 / SWP / CAS / 独占アクセス）、ELF64 ローダ、PL011 風 UART
+  - デモゲスト「Arm64DemoOS」（help / fact / echo / quit）
+  - macOS 実行へ向けた基盤（Henge の方式を参考）。デバイツリー / iBoot / NVMe / 仮想 GPU は今後の段階で実装する
+- 内蔵サンプル（ファイル不要で起動可能）
+  - x86: Multiboot カーネル、ロングモード / 特権リング / 周辺デバイス / DMA / タスクスイッチ / FPU・SSE / CPU 拡張 / macOS 基盤の各検証カーネル、BIOS ブート ISO、UEFI アプリ 6 種（基本 / プロトコル・FAT / Loaded Image・変数 / ConIn・通知・ドライバ / アロケータ・Secure Boot / FAT ロングファイル名）
+  - RISC-V: BOOT.BIN 入りサンプル ISO
+  - VM の編集画面で「内蔵サンプル」を選ぶだけ。従来どおりファイルからも起動できる
 - 対話型コンソール画面（コマンド入力・イメージ連動のクイックコマンド・リアルタイム出力）と画面表示（GOP フレームバッファ / VGA テキスト画面 / VGA モード 13h をコンソールと切り替えて表示。変更通知で即時更新）
 - 設定は端末内に自動保存され、再起動後も保持
 - iPad ではサイドバー付きスプリットビュー、iPhone ではタブバー＋スタック遷移
@@ -93,14 +104,14 @@ Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます�
 
 ### x86（UEFI アプリケーション）
 
-1. Release から `retasuVM-sample-uefi.efi`（試作用サンプル）をダウンロードします。
-2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にして、ダウンロードした .efi を選びます。
+1. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にします。イメージの場所で「内蔵サンプル」を選び、「UEFI アプリ（基本）」を選択します（v0.14.0 以降はサンプルがアプリに内蔵されているため、ダウンロードは不要です。Release から `retasuVM-sample-uefi.efi` をダウンロードしてファイルから選ぶこともできます）。
 3. VM を起動すると、最小 UEFI ファームウェアが PE32+ イメージを読み込み、ロングモードでエントリポイントを呼びます（RCX = ImageHandle、RDX = SystemTable）。サンプルは ConOut へ挨拶を表示し、GetMemoryMap と ExitBootServices を呼んだあと、シリアルポートへ直接出力して停止します。
 
 自作 UEFI アプリの条件: x86-64 の PE32+ イメージ（サブシステム: EFI アプリケーション / ブートサービスドライバ / ランタイムドライバ）。ImageBase は 16 MiB の RAM 内に収まる必要があります。使えるサービスは ConOut（OutputString など）と ConIn（ReadKeyStroke / WaitForEvent。アプリのコンソール入力がキーとして届きます）、ブートサービス（AllocatePages / AllocatePool / GetMemoryMap / ExitBootServices / Stall / CopyMem / SetMem / CalculateCrc32 / LoadImage / StartImage / Exit / UnloadImage / CreateEvent / SetTimer / WaitForEvent / CheckEvent など）、プロトコル関連サービス（InstallProtocolInterface / HandleProtocol / OpenProtocol / LocateProtocol / LocateHandle / LocateHandleBuffer / LocateDevicePath など）、イベント通知関数（SignalEvent / タイマ / プロトコルインストール / ExitBootServices などのイベントグループで呼び出されます）、ConnectController / DisconnectController（Driver Binding プロトコルの Supported / Start / Stop を呼びます）、LoadImage のデバイスパス経由の読み込み（FilePath ノード → Simple File System 上のファイル）、Loaded Image プロトコル、GOP（Graphics Output、640×400 フレームバッファ + Blt）、Block I/O プロトコル、Simple File System プロトコル（FAT ボリュームの読み書き、ロングファイル名対応。ディスク未接続時は RAM 上の FAT12 フロッピーが対象）、変数サービス（GetVariable / SetVariable / GetNextVariableName / QueryVariableInfo。変数は VM の構成に保存され、次回起動時に引き継がれます）、ランタイムサービス（GetTime / GetVariable 群 / ResetSystem など）です。ExitBootServices の後はブートサービスが無効化されます。一方で Secure Boot などは未提供のため、Windows Boot Manager や GRUB のような本格的なブートローダの起動はまだ保証できません。GOP のフレームバッファはアプリの画面表示に描画されます。
 
 ## 現在の開発状況
 
+- v0.14.0: サンプルをすべてアプリに内蔵し（x86 カーネル / UEFI アプリ / BIOS ブート ISO / RISC-V サンプル ISO の 17 種。VM 編集画面で「内蔵サンプル」から選択可能。内蔵データの SHA-256 が配布物と一致することをテストで検証）、ARM64（AArch64）エンジンを追加した。iOS / iPadOS 上で Mac を動かす Henge の方式（ARM64 の Apple Silicon Mac エミュレーション + Apple 公式リストアイメージの取得）を参考に、macOS 実行の基盤として EL0 / EL1、段 1 MMU、GIC、仮想タイマ、アトミック命令、ELF64 ローダ、自作アセンブラ、デモゲスト「Arm64DemoOS」を実装。あわせて全ファイルのバグ監査を行い、命令デコードの取り違え（条件分岐の条件フィールド、LSE アトミックとレジスタオフセット形式の衝突、LDR リテラルのサイズ指定、ペア命令のモード、CCMP の照合パターン、タイマのシステムレジスタキー、CAS の書き戻し先など）とアセンブラの不具合を修正した。新規統合テスト（ARM64 カーネル: 算術 / アトミック / タイマ割り込み / MMU フォールト処理 / EL0 実行、アセンブラ出力と clang の完全一致、内蔵サンプルのハッシュ一致）と全回帰テストで検証済み。macOS 自体の起動にはデバイツリー（ADT）、iBoot / リストア手順、NVMe、仮想 GPU が別途必要で、まだ起動しない。本バージョンから、リリースは正式リリースとして公開する。
 - v0.13.0: macOS の起動基盤を実装した。CPUID を GenuineIntel / Coffee Lake 世代（ブランド文字列付き）に変更し、XNU が必須とする HPET（ACPI テーブルと DSDT 宣言を含む）、Apple SMC（OSK0 / OSK1 キーを含むキープロトコル）、AHCI (SATA) コントローラ、SMBIOS テーブル（iMac19,1 として提示、UEFI 構成テーブル登録）を追加。新規統合テスト（macOS 基盤カーネル）と全回帰テストで検証済み。macOS 自体の起動には boot.efi 互換と XNU 向けの調整が別途必要で、まだ起動しない。
 - v0.12.0: 残りの不足機能を実装した。x86 に MMX、SSE3 / SSSE3 / SSE4.1、POPCNT / MOVBE / RDTSC・RDTSCP / CMPXCHG8B・16B、XSAVE / XRSTOR、CR0.TS の #NM、FNSAVE / FRSTOR を追加。UEFI に本物のメモリアロケータ（FreePages / FreePool / アドレス指定確保 / UnloadImage 回収）、Secure Boot（イメージハッシュ方式、SetupMode / PK / db / dbx）、GOP の追加モード（800×600 / 1024×768）、CreateEventEx のイベントグループ、SetVirtualAddressMap（仮想アドレス経由のランタイム呼び出し）を追加。VGA モード 13h（DAC パレット付き）の描画、アプリ画面の変更通知、アプリアイコンにも対応。テストで見つかった実バグ（CLTS、SSSE3 水平演算、DPPS / DPPD マスク、80 ビット拡張精度の読み込みほか）も修正。新規統合テスト（CPU 拡張カーネル、UEFI5）と全回帰テストで検証済み。
 - v0.11.0: 残りの不足機能を実装した。x86 に x87 FPU（全形式・超越関数）と SSE / SSE2 サブセット（FXSAVE / FXRSTOR 含む）を追加し、CPUID で申告するようになった。UEFI に ConIn（キー入力プロトコル）、イベント通知関数（NotifyFunction）の実際の呼び出し、ConnectController / DisconnectController での Driver Binding（Supported / Start / Stop）、LoadImage のデバイスパス経由の読み込みを追加。アプリのコンソールに画面表示を追加し、GOP フレームバッファと VGA テキスト画面を描画できるようになった。あわせてセッションの実行チャンクを広げ、スピン待ちするゲストの実行速度を大幅に改善した。新規統合テスト（FPU / SSE 検証カーネル、UEFI4）と全回帰テストで検証済み。
@@ -119,9 +130,10 @@ Multiboot 起動時は IDE に 16 MiB の RAM ディスクが接続されます�
 
 ## 既知の制約
 
-- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード / ロングモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）、最小 UEFI で動く PE32+ アプリケーション（.efi）です。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（証明書方式の Secure Boot や TPM などが未提供のため）。macOS についても、起動基盤（HPET / SMC / AHCI / SMBIOS / CPUID）は備えましたが、boot.efi の互換性検証と XNU のハードウェアチェックへの対応が未完のため、まだ起動しません。
+- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS + Arm64DemoOS）、アプリ内蔵サンプル 17 種（x86 カーネル / UEFI アプリ / BIOS ブート ISO / RISC-V サンプル ISO）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード / プロテクトモード / ロングモード ブートプログラム（El Torito ISO / raw イメージ）、Multiboot 対応カーネル（ELF32）、最小 UEFI で動く PE32+ アプリケーション（.efi）、ARM64 の ELF64 カーネルです。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（証明書方式の Secure Boot や TPM などが未提供のため）。macOS については、x86 側の起動基盤（HPET / SMC / AHCI / SMBIOS / CPUID）に加えて ARM64 基盤（CPU / MMU / GIC / タイマ）を備えましたが、デバイツリー（ADT）、iBoot / リストア手順、NVMe、仮想 GPU が未実装のため、まだ起動しません。
 - x86 の特権リング、TSS タスクスイッチ、SWAPGS、SYSCALL / SYSRET に対応しました。x87 FPU、MMX、SSE / SSE2 / SSE3 / SSSE3 / SSE4.1 はサブセット実装です（SSE4.2 の文字列命令、PCLMULQDQ、AVX は未実装。MMX レジスタは x87 スタックとは別管理、FXSAVE は 32 ビット形式、XSAVE は x87 + SSE コンポーネントのみ、タスクごとの遅延 FPU 状態切替は未対応）。Secure Boot はイメージハッシュ方式（db / dbx の SHA-256 ハッシュ）のみで、証明書（X.509 / PKCS#7）の検証と認証付き変数更新には未対応です（PK 登録後は db 等を更新できません）。SetVirtualAddressMap は対応表の記録とスタブ呼び出しのアドレス変換のみで、ファームウェア側ページテーブルの再構築は行いません。UEFI 変数は VM の構成に保存され永続化されます。FAT はロングファイル名の読み書きに対応しました。Block I/O の対象は接続中のディスクイメージ、未接続時は RAM 上の FAT12 フロッピーです。ExitBootServices の後はブートサービスが無効化されます（ランタイムサービスとコンソール / GOP は継続）。UEFI のイベント通知関数はセッションループの合間に配送されます（同期的ではありません）。LoadImage のデバイスパス解決は Simple File System ボリューム上のファイルを対象とします。GOP のフレームバッファ、VGA テキスト画面、VGA モード 13h はアプリの画面表示に描画されます（モード 12h のプレーナ描画は未対応）。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。大きな ISO は起動時に全体をメモリへ読み込みます。
-- エミュレータは固定スペック（RISC-V: RV32IM / 1 MiB、x86: リアルモード / 16 MiB、ARM: ARMv7-A サブセット / 4 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
+- エミュレータは固定スペック（RISC-V: RV32IM / 1 MiB、x86: リアルモード / 16 MiB、ARM: ARMv7-A サブセット / 4 MiB、ARM64: AArch64 / 64 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
+- ARM64 エンジンはインタプリタ方式で、SIMD / 浮動小数点、EL2 / EL3、LDXP / STXP（独占ペア）、ポインタ認証は未実装です。変換はアクセスごとにウォークするため ASID の区別はなく、アライメントチェックも行いません。LDTR / STTR は通常アクセスとして扱います。
 - ゲスト画面はコンソールのテキスト表示と画面表示（GOP フレームバッファ / VGA テキスト）を切り替えられます。画面表示は変更通知と 500 ミリ秒間隔ポーリングの併用で更新されます。
 - VM の設定データは端末内にのみ保存されます（同期機能はありません）。
 - 実機の Swift Playgrounds での動作検証は未実施です。

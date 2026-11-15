@@ -54,7 +54,13 @@ retasuVM.swiftpm/
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ
 │   ├── ARMDemoOS.swift        … ARM デモゲスト「ArmDemoOS」
-│   └── ARMSession.swift       … ARM 実行セッション
+│   ├── ARMSession.swift       … ARM 実行セッション
+│   ├── ARM64CPU.swift         … ARM64 (AArch64) CPU エミュレータ（EL0 / EL1 + 段 1 MMU + GIC + 仮想タイマ）
+│   ├── ARM64Assembler.swift   … ARM64 ゲスト用アセンブラ
+│   ├── ARM64DemoOS.swift      … ARM64 デモゲスト「Arm64DemoOS」
+│   ├── ARM64Session.swift     … ARM64 実行セッション
+│   ├── BuiltInSamples.swift   … 内蔵サンプルの定義（種類・名前・SHA-256・データ復号）
+│   └── BuiltInSampleData.swift … 内蔵サンプルのバイナリ（Base64、生成ファイル）
 ├── Views/
 │   ├── VMListView.swift       … 一覧
 │   ├── VMDetailView.swift     … 詳細・操作
@@ -107,4 +113,4 @@ Xcode 環境がある場合はビルド確認を行います。
 - 新機能 / 修正内容 / 既知の問題
 - 動作確認環境（検証した OS・機種・Swift Playgrounds のバージョン、または未検証である旨）
 
-開発版は Pre-release として公開し、安定版と区別します。
+リリースは正式リリースとして公開します（2026-11-15 の方針変更。以後は Pre-release にしません）。
