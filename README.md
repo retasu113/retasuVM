@@ -3,7 +3,7 @@
 retasuVM は、iPhone と iPad で仮想マシンを管理するための SwiftUI アプリです。
 Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgrounds でそのまま開けるプロジェクト形式（`.swiftpm`）で配布します。
 
-> **現在の実行エンジンについて**: v0.4.0 の実行エンジンは RISC-V RV32IM ソフトウェア CPU エミュレータです。起動するゲスト OS イメージを VM ごとに選べるほか、ISO ファイル（ISO 9660、ルート直下に BOOT.BIN を置く retasuVM 形式）からも起動できます。iOS / iPadOS ではハードウェア仮想化がアプリに提供されないため、Linux や Windows のような一般の OS やそのインストール ISO は実行できません。
+> **現在の実行エンジンについて**: v0.5.0 の実行エンジンは、すべて自作のソフトウェア CPU エミュレータ 3 種類です。RISC-V（RV32IM）、x86（16 ビット リアルモード + 自作 BIOS）、ARM（ARMv7-A サブセット）を VM ごとに選べます。x86 は El Torito 対応 ISO から BIOS ブートでき、ブートセクタやリアルモードの小さな OS が動きます。iOS / iPadOS ではハードウェア仮想化がアプリに提供されないため、Windows や現在の Linux のような一般の OS（プロテクトモード / ロングモード必須）は実行できません。
 
 ## 主な機能
 
@@ -17,6 +17,13 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
   - PlayOS: 数当てゲームとサイコロ（guess / dice / help / quit）
   - CalcOS: スタック式（RPN）計算機（+ - * / % / dup / drop / swap / p など）
 - ISO ファイルからの起動（ISO 9660 を解析し BOOT.BIN を実行。ISO 全体はディスクとしてゲストから読み取り可能）
+- x86 エミュレータ（16 ビット リアルモード CPU + 自作 BIOS サービス）
+  - El Torito 対応 ISO から BIOS ブート（フロッピー / ハードディスク エミュレーション）
+  - ブートセクタ付き raw イメージ（.img）からもブート可能
+  - BIOS コール対応: INT 10h（画面）/ INT 13h（ディスク、CHS・LBA）/ INT 16h（キーボード）/ INT 12h / INT 1Ah / INT 15h
+  - シリアルポート（COM1）もコンソールに接続
+- ARM エミュレータ（ARMv7-A、A32 命令サブセット + 自作アセンブラ）
+  - デモゲスト「ArmDemoOS」（help / fact / echo / quit）
 - 対話型コンソール画面（コマンド入力・イメージ連動のクイックコマンド・リアルタイム出力）
 - 設定は端末内に自動保存され、再起動後も保持
 - iPad ではサイドバー付きスプリットビュー、iPhone ではタブバー＋スタック遷移
@@ -48,14 +55,25 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
 
 ## ISO ファイルから起動する
 
+### RISC-V（BOOT.BIN 形式）
+
 1. Release から `retasuVM-sample.iso`（試作用サンプル）をダウンロードします。
-2. アプリで VM を作成（または編集）し、起動方法を「ISO ファイル」にして、ダウンロードした .iso を選びます。
+2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「RISC-V」、起動方法を「ISO ファイル」にして、ダウンロードした .iso を選びます。
 3. VM を起動すると、ISO 内のゲスト OS「IsoDemoOS」がブートします。コンソールで `info` と入力すると、ディスクの容量やボリュームラベルが表示されます。
 
 自作 ISO の規約: ISO 9660 のルート直下に `BOOT.BIN`（RISC-V RV32IM フラットバイナリ、最大 1 MiB）を置きます。ISO 全体はディスクとして装着され、ゲストはシステムコール（a7=20/21/22）でセクタ読み取りできます。詳細はサンプル ISO 内の README.TXT と `Engine/RISCVCPU.swift` を参照してください。
 
+### x86（BIOS / El Torito 形式）
+
+1. Release から `retasuVM-sample-x86.iso`（試作用サンプル）をダウンロードします。
+2. アプリで VM を作成（または編集）し、CPU アーキテクチャを「x86」にして、ダウンロードした .iso を選びます。
+3. VM を起動すると、内蔵 BIOS が El Torito ブートイメージ（1.44 MB フロッピー）からブートセクタを読み込んで実行します。デモはブートドライブ番号の表示、INT 13h でのセクタ読み取り、キーエコー（ESC で停止）を行います。
+
+x86 で起動できるのは、El Torito 対応 ISO（フロッピー / ハードディスク エミュレーション、エミュレーションなし）と、ブートセクタ（55 AA）付きの raw イメージです。ゲストは 16 ビット リアルモードで動作し、BIOS コール（INT 10h / 13h / 16h など）とシリアルポート（COM1）が使えます。Windows や現在の Linux など、プロテクトモードを必要とする OS は起動できません。
+
 ## 現在の開発状況
 
+- v0.5.0: x86（リアルモード CPU + 自作 BIOS + El Torito ブート）と ARM（ARMv7-A サブセット + 自作アセンブラ + ArmDemoOS）の 2 エンジンを追加。アーキテクチャは VM ごとに選択可能。全 Swift ファイルの文法チェックと、3 エンジンすべての実行テストを実施済み。
 - v0.4.0: ISO 9660 イメージからの起動に対応（BOOT.BIN 形式）。サンプル ISO と IsoDemoOS を同梱。全 Swift ファイルの文法チェックと、ISO ブートを含む実行テストを実施済み。
 - v0.3.0: ゲストイメージを 3 種類に拡充（retasuOS / PlayOS / CalcOS）、CPU に M 拡張（乗除算）と乱数を追加。
 - v0.2.0: RISC-V RV32I エミュレータとゲスト OS「retasuOS」を実装。
@@ -65,8 +83,9 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
 
 ## 既知の制約
 
-- 実行できるゲストは同梱の 3 イメージと、retasuVM 形式の ISO（BOOT.BIN 入り）のみです。一般の OS（Linux / Windows など）や、そのインストール ISO は実行できません。
-- エミュレータは固定スペック（RV32IM、メモリ 1 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
+- 実行できるゲストは、同梱イメージ（RISC-V 3 種 + ArmDemoOS）、retasuVM 形式の ISO（BOOT.BIN 入り）、x86 のリアルモード ブートプログラム（El Torito ISO / raw イメージ）のみです。一般の OS（Windows / 現在の Linux など）や、そのインストール ISO は実行できません（プロテクトモード / ロングモードと PC 全体のデバイスエミュレーションが必要なため）。
+- x86 エンジンはリアルモードのみで、UEFI は未実装です（ファームウェア相当は自作 BIOS サービス層が担います）。ARM エンジンは命令サブセットのみで、MMU や実機向け OS のブートには対応しません。
+- エミュレータは固定スペック（RISC-V: RV32IM / 1 MiB、x86: リアルモード / 16 MiB、ARM: ARMv7-A サブセット / 4 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
 - ゲスト画面はテキストコンソールのみです（グラフィカル表示はありません）。
 - VM の設定データは端末内にのみ保存されます（同期機能はありません）。
 - 実機の Swift Playgrounds での動作検証は未実施です。

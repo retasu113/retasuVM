@@ -28,9 +28,10 @@ retasuVM.swiftpm/
 │   ├── VirtualMachine.swift … VM・構成・状態のモデル
 │   └── VMStore.swift          … 一覧管理・状態遷移・永続化
 ├── Engine/
+│   ├── GuestSession.swift     … セッション共通インターフェース
 │   ├── RISCVCPU.swift         … RISC-V RV32IM CPU エミュレータ
-│   ├── RISCVAssembler.swift   … ゲスト用アセンブラ
-│   ├── GuestRuntime.swift     … ゲスト共通ランタイム（_start と基本ルーチン）
+│   ├── RISCVAssembler.swift   … RISC-V ゲスト用アセンブラ
+│   ├── GuestRuntime.swift     … RISC-V ゲスト共通ランタイム（_start と基本ルーチン）
 │   ├── RetasuOS.swift         … ゲスト OS「retasuOS」（対話型モニタ）
 │   ├── PlayOS.swift           … ゲスト OS「PlayOS」（数当てゲーム・サイコロ）
 │   ├── CalcOS.swift           … ゲスト OS「CalcOS」（RPN 計算機）
@@ -38,7 +39,15 @@ retasuVM.swiftpm/
 │   ├── ISO9660.swift          … ISO 9660 パーサ（BOOT.BIN の取り出し）
 │   ├── IsoDemoOS.swift        … ISO ブート確認用ゲスト（サンプル ISO に収録）
 │   ├── GuestOS.swift          … 旧ファイル名の名残（空。RetasuOS.swift に改名済み）
-│   └── VMEngine.swift         … EmulatorSession（実行セッション管理）
+│   ├── VMEngine.swift         … EmulatorSession（RISC-V 実行セッション管理）
+│   ├── X86CPU.swift           … x86 リアルモード CPU エミュレータ
+│   ├── X86BIOS.swift          … x86 BIOS サービス層とブート処理
+│   ├── ElTorito.swift         … El Torito ブート拡張パーサ（x86 ISO ブート）
+│   ├── X86Session.swift       … x86 実行セッション
+│   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
+│   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ
+│   ├── ARMDemoOS.swift        … ARM デモゲスト「ArmDemoOS」
+│   └── ARMSession.swift       … ARM 実行セッション
 ├── Views/
 │   ├── VMListView.swift       … 一覧
 │   ├── VMDetailView.swift     … 詳細・操作
