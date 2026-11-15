@@ -44,6 +44,7 @@ retasuVM.swiftpm/
 │   ├── X86BIOS.swift          … x86 BIOS サービス層とブート処理
 │   ├── ElTorito.swift         … El Torito ブート拡張パーサ（x86 ISO ブート）
 │   ├── Multiboot.swift        … Multiboot ブートローダ（ELF32 カーネル起動）
+│   ├── X86Devices.swift       … 周辺デバイスバス（PIC / PIT / RTC / キーボード / PCI / IDE）
 │   ├── X86Session.swift       … x86 実行セッション
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ
