@@ -189,14 +189,22 @@ struct VMDetailView: View {
             NavigationLink {
                 VMConsoleView(vmID: vm.id)
             } label: {
-                Label("コンソールを表示", systemImage: "terminal")
+                Label("コンソールを開く", systemImage: "terminal")
             }
-            let recent = store.log(for: vm.id).suffix(3)
-            ForEach(Array(recent)) { line in
-                Text(line.text)
-                    .font(.caption.monospaced())
+            let tail = store.terminalText(for: vm.id)
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .suffix(4)
+            if tail.isEmpty {
+                Text("コンソール出力はまだありません。起動するとゲスト OS（retasuOS）を操作できます。")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+            } else {
+                ForEach(Array(tail.enumerated()), id: \.offset) { _, line in
+                    Text(String(line))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
         }
     }

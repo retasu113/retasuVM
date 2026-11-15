@@ -53,10 +53,10 @@ struct VMEditorView: View {
                     Stepper(value: $cpuCount, in: 1...16) {
                         LabeledContent("CPU", value: "\(cpuCount) コア")
                     }
-                    Stepper(value: $memoryMB, in: 512...32768, step: 512) {
+                    Stepper(value: $memoryMB, in: 1...32768, step: 256) {
                         LabeledContent("メモリ", value: memoryText)
                     }
-                    Stepper(value: $diskGB, in: 8...512, step: 8) {
+                    Stepper(value: $diskGB, in: 1...512, step: 1) {
                         LabeledContent("ディスク", value: "\(diskGB) GB")
                     }
                 }

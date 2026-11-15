@@ -2,95 +2,131 @@ import SwiftUI
 
 /// 仮想マシンのコンソール画面。
 ///
-/// ゲスト画面のプレースホルダと、操作ログを表示する。
-/// Reduce Motion が有効な場合はカーソルの点滅アニメーションを行わない。
+/// RISC-V エミュレータ上で動くゲスト OS（retasuOS）の入出力を表示する
+/// 対話型ターミナル。コマンドを入力するとゲストが実際に実行する。
+/// Reduce Motion が有効な場合はスクロールアニメーションを行わない。
 struct VMConsoleView: View {
     @EnvironmentObject private var store: VMStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let vmID: VirtualMachine.ID
 
+    @State private var inputText = ""
+    @FocusState private var inputFocused: Bool
+
     private var vm: VirtualMachine? {
         store.machine(id: vmID)
     }
 
+    private var isRunning: Bool {
+        vm?.state == .running || vm?.state == .paused
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            guestScreen
+            terminal
             Divider()
-            logList
+            if isRunning {
+                quickCommands
+                inputBar
+            } else {
+                stoppedBar
+            }
         }
         .navigationTitle("コンソール")
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    // MARK: - ゲスト画面（プレースホルダ）
+    // MARK: - ターミナル表示
 
-    private var guestScreen: some View {
-        ZStack {
-            Color.black
-            if let vm {
-                VStack(spacing: 10) {
-                    Image(systemName: vm.state.systemImage)
-                        .font(.system(size: 44))
-                        .foregroundStyle(.white.opacity(0.9))
-                    Text(vm.name)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                    Text(vm.state.label)
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.75))
-                    if vm.state == .running {
-                        Text("ゲスト画面はシミュレーションです。実際の画面描画は今後の実装で対応します。")
-                            .font(.footnote)
-                            .foregroundStyle(.white.opacity(0.6))
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 24)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(vm.name)、状態は\(vm.state.label)")
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 240)
-    }
-
-    // MARK: - ログ
-
-    private var logList: some View {
+    private var terminal: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    let lines = store.log(for: vmID)
-                    if lines.isEmpty {
-                        Text("ログはまだありません。仮想マシンを起動すると、ここに記録されます。")
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(lines) { line in
-                        HStack(alignment: .top, spacing: 8) {
-                            Text(line.date.formatted(date: .omitted, time: .standard))
-                                .foregroundStyle(.secondary)
-                            Text(line.text)
-                        }
-                        .font(.footnote.monospaced())
-                        .id(line.id)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12)
+                Text(store.terminalText(for: vmID).isEmpty
+                     ? "（コンソール出力はまだありません）"
+                     : store.terminalText(for: vmID))
+                    .font(.footnote.monospaced())
+                    .foregroundStyle(.green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .textSelection(.enabled)
+                    .id("terminal-bottom")
+                    .accessibilityLabel("コンソール出力")
             }
-            .background(Color(.secondarySystemBackground))
-            .onChange(of: store.log(for: vmID).count) { _, _ in
-                guard let last = store.log(for: vmID).last else { return }
+            .background(Color.black)
+            .onChange(of: store.terminalText(for: vmID)) { _, _ in
                 if reduceMotion {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                    proxy.scrollTo("terminal-bottom", anchor: .bottom)
                 } else {
                     withAnimation {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        proxy.scrollTo("terminal-bottom", anchor: .bottom)
                     }
                 }
             }
         }
+    }
+
+    // MARK: - クイックコマンド
+
+    private var quickCommands: some View {
+        HStack(spacing: 8) {
+            ForEach(["help", "fib 10", "about", "clear"], id: \.self) { command in
+                Button(command) {
+                    send(command + "\n")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+    }
+
+    // MARK: - 入力バー
+
+    private var inputBar: some View {
+        HStack(spacing: 8) {
+            TextField("コマンドを入力（例: fib 10）", text: $inputText)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($inputFocused)
+                .onSubmit { submit() }
+                .accessibilityLabel("コマンド入力")
+            Button {
+                submit()
+            } label: {
+                Label("送信", systemImage: "paperplane.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(inputText.isEmpty)
+        }
+        .padding(12)
+    }
+
+    private var stoppedBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "stop.circle")
+                .foregroundStyle(.secondary)
+            Text("仮想マシンが停止しています。詳細画面から起動すると、ここでゲスト OS を操作できます。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    // MARK: - 送信
+
+    private func submit() {
+        let line = inputText
+        inputText = ""
+        send(line + "\n")
+        inputFocused = true
+    }
+
+    private func send(_ text: String) {
+        guard let vm else { return }
+        store.sendInput(vm, text: text)
     }
 }

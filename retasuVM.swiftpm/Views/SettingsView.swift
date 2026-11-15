@@ -6,9 +6,10 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("retasuVM について") {
-                    LabeledContent("バージョン", value: "0.1.0")
+                    LabeledContent("バージョン", value: "0.2.0")
                     LabeledContent("対応 OS", value: "iOS 17 / iPadOS 17 以降")
-                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。現在のバージョンの実行エンジンはシミュレーションであり、実際の仮想化は行いません。")
+                    LabeledContent("エミュレータ", value: "RISC-V RV32I（メモリ 1 MiB）")
+                    Text("retasuVM は、iPhone と iPad で仮想マシンを管理するためのアプリです。実行エンジンは RISC-V CPU のソフトウェアエミュレータで、ゲスト OS「retasuOS」が実際に動作します。iOS ではハードウェア仮想化が使えないため、Linux や Windows のような一般の OS は実行できません。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
