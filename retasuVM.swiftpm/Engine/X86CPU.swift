@@ -1012,6 +1012,22 @@ final class X86CPU {
     /// 現在デコード中の命令の REX プリフィクス（0 = なし）。64 ビット
     /// モードでのみ現れる。
     private(set) var decodeREX: UInt8 = 0
+    /// 現在デコード中の命令の REP プレフィクス（0 / 0xF2 / 0xF3）と
+    /// 0x66 プレフィクスの有無。SSE のバリアント判定に使う。
+    private(set) var decodeRepeatPrefix: UInt8 = 0
+    private(set) var decodePrefix66 = false
+
+    // MARK: - x87 FPU / SSE 状態
+
+    /// x87 レジスタスタック（物理レジスタ列、fpuTop が ST(0)）。
+    var fpuRegisters = [Double](repeating: 0, count: 8)
+    var fpuValid = [Bool](repeating: false, count: 8)
+    var fpuTop = 0
+    var fpuControlWord: UInt16 = 0x037F
+    var fpuConditionCodes: (c0: Bool, c1: Bool, c2: Bool, c3: Bool) = (false, false, false, false)
+    /// XMM レジスタ（16 本 × 16 バイト）と MXCSR。
+    var xmmRegisters = [[UInt8]](repeating: [UInt8](repeating: 0, count: 16), count: 16)
+    var mxcsr: UInt32 = 0x1F80
 
     private struct ModRM {
         var reg: Int
@@ -1420,6 +1436,7 @@ final class X86CPU {
         var segmentOverride: Int?
         var repeatPrefix: UInt8 = 0
         var rex: UInt8 = 0
+        var has66 = false
         while true {
             let byte = try fetch8()
             // REX の直後が別のプレフィクスバイトなら、その REX は無効になる
@@ -1431,7 +1448,9 @@ final class X86CPU {
                 }
             }
             switch byte {
-            case 0x66: operandSize = operandSize == defaultOperand ? (defaultOperand == 2 ? 4 : 2) : defaultOperand
+            case 0x66:
+                operandSize = operandSize == defaultOperand ? (defaultOperand == 2 ? 4 : 2) : defaultOperand
+                has66 = true
             case 0x67: addressSize = addressSize == defaultAddress ? (defaultAddress == 8 ? 4 : (defaultAddress == 2 ? 4 : 2)) : defaultAddress
             case 0x26: segmentOverride = 0
             case 0x2E: segmentOverride = 1
@@ -1450,6 +1469,8 @@ final class X86CPU {
                 decodeAddressSize = addressSize
                 decodeSegmentOverride = segmentOverride
                 decodeREX = rex
+                decodeRepeatPrefix = repeatPrefix
+                decodePrefix66 = has66
                 defer { decodeREX = 0 }
                 try execute(opcode: byte, operandSize: operandSize, repeatPrefix: repeatPrefix, startIP: startIP)
                 return
@@ -1947,15 +1968,8 @@ final class X86CPU {
             let count = (opcode == 0xD0 || opcode == 0xD1) ? 1 : Int(register8(1))
             let value = try readOperand(modRM, size: size)
             try writeOperand(modRM, size: size, shift(modRM.reg, value, count, size: size))
-        case 0xD8...0xDF: // FPU エスケープ（最小限のスタブ: FNSTCW / FNSTSW のみ実データ）
-            let modRM = try decodeModRM()
-            if !modRM.isRegister {
-                if opcode == 0xD9 && modRM.reg == 7 { // FNSTCW
-                    try writeOperand(modRM, size: 2, 0x037F)
-                } else if opcode == 0xDD && modRM.reg == 7 { // FNSTSW
-                    try writeOperand(modRM, size: 2, 0)
-                }
-            }
+        case 0xD8...0xDF: // x87 FPU
+            try executeX87(opcode: opcode, address: startIP)
         case 0xD4: // AAM（64 ビットモードでは #UD）
             guard !inLongMode else { throw opcodeFault(opcode, address: address) }
             let base = UInt64(try fetch8())
@@ -2355,7 +2369,7 @@ final class X86CPU {
                 registers[0] = 0x00000611
                 registers[3] = 0
                 registers[1] = 0 // ECX: SSE3 等は未実装のため広告しない
-                registers[2] = 0x00000179 // FPU / PSE / TSC / MSR / PAE / CX8 / APIC
+                registers[2] = 0x07000379 // FPU / PSE / TSC / MSR / PAE / CX8 / APIC / FXSR / SSE / SSE2
             case 0x80000000:
                 registers[0] = 0x80000008
                 registers[3] = 0
@@ -2395,6 +2409,14 @@ final class X86CPU {
             } else {
                 setRegister32(index, register32(index).byteSwapped)
             }
+        case 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E, 0x2F, 0x50,
+             0x51, 0x52, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5C, 0x5D, 0x5E, 0x5F,
+             0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
+             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x7E, 0x7F, 0xAE, 0xC2, 0xC4, 0xC5, 0xC6, 0xD1, 0xD2, 0xD3,
+             0xD4, 0xD5, 0xD6, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6,
+             0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6,
+             0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE: // SSE / SSE2
+            try executeSSE(opcode: opcode, operandSize: operandSize, address: address)
         default:
             throw opcodeFault(opcode, address: address)
         }
@@ -2762,6 +2784,1142 @@ final class X86CPU {
         if handler(vector) == .needsInput {
             instructionPointer = startIP
             waitingForInput = true
+        }
+    }
+
+    // MARK: - バイト列オペランド
+
+    /// メモリオペランドをバイト列として読む（m80 / m128 / FXSAVE 用）。
+    private func readOperandBytes(_ operand: ModRM, count: Int) throws -> [UInt8] {
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(count)
+        var done = 0
+        while done < count {
+            let remaining = count - done
+            let chunk = remaining >= 8 ? 8 : (remaining >= 4 ? 4 : (remaining >= 2 ? 2 : 1))
+            let value = try readGuest(segmentIndex: operand.segmentIndex, offset: resolvedOffset(operand) &+ UInt64(done), size: chunk)
+            for i in 0..<chunk { bytes.append(UInt8((value >> (8 * i)) & 0xFF)) }
+            done += chunk
+        }
+        return bytes
+    }
+
+    private func writeOperandBytes(_ operand: ModRM, _ bytes: [UInt8]) throws {
+        var done = 0
+        while done < bytes.count {
+            let remaining = bytes.count - done
+            let chunk = remaining >= 8 ? 8 : (remaining >= 4 ? 4 : (remaining >= 2 ? 2 : 1))
+            var value: UInt64 = 0
+            for i in 0..<chunk { value |= UInt64(bytes[done + i]) << (8 * i) }
+            try writeGuest(segmentIndex: operand.segmentIndex, offset: resolvedOffset(operand) &+ UInt64(done), size: chunk, value)
+            done += chunk
+        }
+    }
+
+    private func le32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8 | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+    }
+
+    private func le64(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
+        UInt64(le32(bytes, offset)) | UInt64(le32(bytes, offset + 4)) << 32
+    }
+
+    private func putLE32(_ bytes: inout [UInt8], _ offset: Int, _ value: UInt32) {
+        for i in 0..<4 { bytes[offset + i] = UInt8((value >> (8 * i)) & 0xFF) }
+    }
+
+    private func putLE64(_ bytes: inout [UInt8], _ offset: Int, _ value: UInt64) {
+        putLE32(&bytes, offset, UInt32(value & 0xFFFFFFFF))
+        putLE32(&bytes, offset + 4, UInt32(value >> 32))
+    }
+
+    // MARK: - x87 FPU
+
+    private func fpuST(_ index: Int) -> Double { fpuRegisters[(fpuTop + index) & 7] }
+
+    private func fpuSetST(_ index: Int, _ value: Double) {
+        let physical = (fpuTop + index) & 7
+        fpuRegisters[physical] = value
+        fpuValid[physical] = true
+    }
+
+    private func fpuPush(_ value: Double) {
+        fpuTop = (fpuTop - 1) & 7
+        fpuRegisters[fpuTop] = value
+        fpuValid[fpuTop] = true
+    }
+
+    private func fpuPop() {
+        fpuValid[fpuTop] = false
+        fpuTop = (fpuTop + 1) & 7
+    }
+
+    private var fpuStatusWord: UInt16 {
+        var word = UInt16(fpuTop & 7) << 11
+        if fpuConditionCodes.c0 { word |= 0x0100 }
+        if fpuConditionCodes.c1 { word |= 0x0200 }
+        if fpuConditionCodes.c2 { word |= 0x0400 }
+        if fpuConditionCodes.c3 { word |= 0x4000 }
+        return word
+    }
+
+    private func fpuCompare(_ a: Double, _ b: Double) {
+        if a.isNaN || b.isNaN { fpuConditionCodes = (true, false, true, true) }
+        else if a > b { fpuConditionCodes = (false, false, false, false) }
+        else if a < b { fpuConditionCodes = (true, false, false, false) }
+        else { fpuConditionCodes = (false, false, false, true) }
+    }
+
+    /// FUCOMI / FCOMI 用に EFLAGS（ZF / PF / CF）へ比較結果を反映する。
+    private func fpuCompareFlags(_ a: Double, _ b: Double) {
+        if a.isNaN || b.isNaN {
+            setFlag(Self.flagZero, true); setFlag(Self.flagParity, true); setFlag(Self.flagCarry, true)
+        } else if a > b {
+            setFlag(Self.flagZero, false); setFlag(Self.flagParity, false); setFlag(Self.flagCarry, false)
+        } else if a < b {
+            setFlag(Self.flagZero, false); setFlag(Self.flagParity, false); setFlag(Self.flagCarry, true)
+        } else {
+            setFlag(Self.flagZero, true); setFlag(Self.flagParity, false); setFlag(Self.flagCarry, false)
+        }
+    }
+
+    private func fpuRoundedInteger(_ value: Double) -> Double {
+        if value.isNaN || value.isInfinite { return value }
+        switch (fpuControlWord >> 10) & 3 {
+        case 1: return value.rounded(.down)
+        case 2: return value.rounded(.up)
+        case 3: return value.rounded(.towardZero)
+        default: return value.rounded(.toNearestOrEven)
+        }
+    }
+
+    private func fpuStoreInt(_ operand: ModRM, size: Int, popAfter: Bool) throws {
+        let rounded = fpuRoundedInteger(fpuST(0))
+        let value: UInt64
+        if rounded.isNaN || rounded >= 9.223372036854776e18 || rounded < -9.223372036854776e18 {
+            value = size == 8 ? 0x8000000000000000 : (size == 4 ? 0x80000000 : 0x8000) // 整数不定値
+        } else {
+            value = UInt64(bitPattern: Int64(rounded)) & mask(forSize: size)
+        }
+        try writeOperand(operand, size: size, value)
+        if popAfter { fpuPop() }
+    }
+
+    /// 二項演算（operation: 0 加算 / 1 乗算 / 2 比較 / 3 比較+ポップ /
+    /// 4 減算 ST−v / 5 減算 v−ST / 6 除算 ST÷v / 7 除算 v÷ST）。
+    private func fpuBinaryOp(_ operation: Int, operand value: Double) {
+        switch operation {
+        case 0: fpuSetST(0, fpuST(0) + value)
+        case 1: fpuSetST(0, fpuST(0) * value)
+        case 2: fpuCompare(fpuST(0), value)
+        case 3: fpuCompare(fpuST(0), value); fpuPop()
+        case 4: fpuSetST(0, fpuST(0) - value)
+        case 5: fpuSetST(0, value - fpuST(0))
+        case 6: fpuSetST(0, fpuST(0) / value)
+        case 7: fpuSetST(0, value / fpuST(0))
+        default: break
+        }
+    }
+
+    /// DC 形式（ST(i) が宛先の逆向き形式）。
+    private func fpuBinaryOpReversed(_ operation: Int, index: Int) {
+        let st = fpuST(0), sti = fpuST(index)
+        switch operation {
+        case 0: fpuSetST(index, sti + st)
+        case 1: fpuSetST(index, sti * st)
+        case 2: fpuCompare(st, sti)
+        case 3: fpuCompare(st, sti); fpuPop()
+        case 4: fpuSetST(index, st - sti) // FSUBR ST(i), ST
+        case 5: fpuSetST(index, sti - st) // FSUB ST(i), ST
+        case 6: fpuSetST(index, st / sti) // FDIVR ST(i), ST
+        case 7: fpuSetST(index, sti / st) // FDIV ST(i), ST
+        default: break
+        }
+    }
+
+    /// DE 形式（結果を ST(i) に入れてポップする形式）。
+    private func fpuBinaryOpPop(_ operation: Int, index: Int) {
+        let st = fpuST(0), sti = fpuST(index)
+        switch operation {
+        case 0: fpuSetST(index, sti + st)
+        case 1: fpuSetST(index, sti * st)
+        case 4: fpuSetST(index, st - sti) // FSUBRP
+        case 5: fpuSetST(index, sti - st) // FSUBP
+        case 6: fpuSetST(index, st / sti) // FDIVRP
+        case 7: fpuSetST(index, sti / st) // FDIVP
+        default: break
+        }
+        fpuPop()
+    }
+
+    /// 80 ビット拡張倍精度を Double へ変換する。
+    private func loadExtended(_ bytes: [UInt8]) -> Double {
+        let mantissa = le64(bytes, 0)
+        let field = bytes[8] | UInt8(bytes[9] & 0x7F) << 8
+        let exponentField = Int(field)
+        let negative = bytes[9] & 0x80 != 0
+        if exponentField == 0 { return negative ? -0.0 : 0.0 }
+        if exponentField == 0x7FFF {
+            return mantissa == 0x8000000000000000 ? (negative ? -.infinity : .infinity) : .nan
+        }
+        let significand = Double(mantissa) / 9223372036854775808.0 // 2^63
+        return Double(sign: negative ? .minus : .plus, exponent: exponentField - 16383, significand: significand)
+    }
+
+    /// Double を 80 ビット拡張倍精度へ変換する（精度は Double の範囲）。
+    private func storeExtended(_ value: Double) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: 10)
+        if value.isNaN {
+            putLE64(&bytes, 0, 0xC000000000000000)
+            bytes[8] = 0xFF; bytes[9] = 0xFF
+            return bytes
+        }
+        let negative = value.sign == .minus
+        let magnitude = abs(value)
+        if magnitude.isInfinite {
+            putLE64(&bytes, 0, 0x8000000000000000)
+            bytes[8] = 0xFF; bytes[9] = negative ? 0xFF : 0x7F
+            return bytes
+        }
+        if magnitude == 0 { return bytes }
+        let scaled = (magnitude.significand * 9223372036854775808.0).rounded()
+        let mantissa = scaled >= 18446744073709551616.0 ? UInt64.max : UInt64(scaled)
+        let exponentField = magnitude.exponent + 16383
+        putLE64(&bytes, 0, mantissa)
+        bytes[8] = UInt8(exponentField & 0xFF)
+        bytes[9] = UInt8((exponentField >> 8) & 0x7F) | (negative ? 0x80 : 0)
+        return bytes
+    }
+
+    private func executeX87(opcode: UInt8, address: UInt64) throws {
+        if controlRegisters[0] & 0x4 != 0 { // CR0.EM → #NM
+            throw CPUTrap.exception(vector: 7, errorCode: nil)
+        }
+        let modRM = try decodeModRM()
+        let reg = modRM.reg & 7
+        let rm = modRM.registerIndex & 7
+        if modRM.isRegister {
+            try executeX87Register(opcode: opcode, reg: reg, rm: rm, address: address)
+            return
+        }
+        switch opcode {
+        case 0xD8:
+            fpuBinaryOp(reg, operand: Double(Float(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
+        case 0xD9:
+            switch reg {
+            case 0: fpuPush(Double(Float(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
+            case 2: try writeOperand(modRM, size: 4, UInt64(Float(fpuST(0)).bitPattern))
+            case 3: try writeOperand(modRM, size: 4, UInt64(Float(fpuST(0)).bitPattern)); fpuPop()
+            case 4: fpuControlWord = UInt16(try readOperand(modRM, size: 2) & 0xFFFF) // FLDENV（制御ワードのみ復元）
+            case 5: fpuControlWord = UInt16(try readOperand(modRM, size: 2) & 0xFFFF) // FLDCW
+            case 6: // FNSTENV（制御 / 状態ワードのみ書く）
+                try writeOperand(modRM, size: 2, UInt64(fpuControlWord))
+                try writeGuest(segmentIndex: modRM.segmentIndex, offset: resolvedOffset(modRM) &+ 2, size: 2, UInt64(fpuStatusWord))
+            case 7: try writeOperand(modRM, size: 2, UInt64(fpuControlWord)) // FNSTCW
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDA:
+            fpuBinaryOp(reg, operand: Double(Int32(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
+        case 0xDB:
+            switch reg {
+            case 0: fpuPush(Double(Int32(bitPattern: UInt32(try readOperand(modRM, size: 4)))))
+            case 2: try fpuStoreInt(modRM, size: 4, popAfter: false)
+            case 3: try fpuStoreInt(modRM, size: 4, popAfter: true)
+            case 5: fpuPush(loadExtended(try readOperandBytes(modRM, count: 10)))
+            case 7: try writeOperandBytes(modRM, storeExtended(fpuST(0))); fpuPop()
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDC:
+            fpuBinaryOp(reg, operand: Double(bitPattern: try readOperand(modRM, size: 8)))
+        case 0xDD:
+            switch reg {
+            case 0: fpuPush(Double(bitPattern: try readOperand(modRM, size: 8)))
+            case 2: try writeOperand(modRM, size: 8, fpuST(0).bitPattern)
+            case 3: try writeOperand(modRM, size: 8, fpuST(0).bitPattern); fpuPop()
+            case 4: fpuCompare(fpuST(0), Double(bitPattern: try readOperand(modRM, size: 8)))
+            case 5: fpuCompare(fpuST(0), Double(bitPattern: try readOperand(modRM, size: 8))); fpuPop()
+            case 7: try writeOperand(modRM, size: 2, UInt64(fpuStatusWord)) // FNSTSW m16
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDE:
+            fpuBinaryOp(reg, operand: Double(Int16(bitPattern: UInt16(try readOperand(modRM, size: 2)))))
+        case 0xDF:
+            switch reg {
+            case 0: fpuPush(Double(Int16(bitPattern: UInt16(try readOperand(modRM, size: 2)))))
+            case 2: try fpuStoreInt(modRM, size: 2, popAfter: false)
+            case 3: try fpuStoreInt(modRM, size: 2, popAfter: true)
+            case 5: fpuPush(Double(Int64(bitPattern: try readOperand(modRM, size: 8))))
+            case 7: try fpuStoreInt(modRM, size: 8, popAfter: true)
+            default: throw opcodeFault(opcode, address: address)
+            }
+        default: throw opcodeFault(opcode, address: address)
+        }
+    }
+
+    private func executeX87Register(opcode: UInt8, reg: Int, rm: Int, address: UInt64) throws {
+        switch opcode {
+        case 0xD8: fpuBinaryOp(reg, operand: fpuST(rm))
+        case 0xD9:
+            switch reg {
+            case 0: fpuPush(fpuST(rm)) // FLD ST(i)
+            case 1: // FXCH ST(i)
+                let a = fpuST(0), b = fpuST(rm)
+                fpuSetST(0, b); fpuSetST(rm, a)
+            case 2:
+                guard rm == 0 else { throw opcodeFault(opcode, address: address) } // FNOP
+            case 4:
+                switch rm {
+                case 0: fpuSetST(0, -fpuST(0)) // FCHS
+                case 1: fpuSetST(0, abs(fpuST(0))) // FABS
+                case 4: fpuCompare(fpuST(0), 0) // FTST
+                case 5: // FXAM（大まかな分類のみ）
+                    let value = fpuST(0)
+                    if value.isNaN { fpuConditionCodes = (true, false, false, false) }
+                    else if value.isInfinite { fpuConditionCodes = (true, true, false, false) }
+                    else if value == 0 { fpuConditionCodes = (false, false, false, true) }
+                    else { fpuConditionCodes = (false, true, false, false) }
+                default: throw opcodeFault(opcode, address: address)
+                }
+            case 6:
+                switch rm {
+                case 1: fpuSetST(1, fpuST(1) * log2(fpuST(0))); fpuPop() // FYL2X
+                case 2: fpuSetST(0, tan(fpuST(0))); fpuPush(1.0) // FPTAN
+                case 3: fpuSetST(1, atan2(fpuST(1), fpuST(0))); fpuPop() // FPATAN
+                case 4: // FXTRACT: ST(0) を指数に置き換え、仮数をプッシュ
+                    let value = fpuST(0)
+                    if value == 0 {
+                        fpuSetST(0, 0); fpuPush(0)
+                    } else {
+                        let significand = value.significand * (value < 0 ? -1 : 1)
+                        fpuSetST(0, Double(value.exponent))
+                        fpuPush(significand)
+                    }
+                case 5: // FPREM1
+                    let divisor = fpuST(1)
+                    if divisor != 0 {
+                        let quotient = (fpuST(0) / divisor).rounded(.toNearestOrEven)
+                        fpuSetST(0, fpuST(0) - quotient * divisor)
+                    }
+                case 6: fpuTop = (fpuTop - 1) & 7 // FDECSTP
+                case 7: fpuTop = (fpuTop + 1) & 7 // FINCSTP
+                default: throw opcodeFault(opcode, address: address)
+                }
+            case 7:
+                switch rm {
+                case 0: // FPREM
+                    let divisor = fpuST(1)
+                    if divisor != 0 {
+                        let quotient = (fpuST(0) / divisor).rounded(.towardZero)
+                        fpuSetST(0, fpuST(0) - quotient * divisor)
+                    }
+                case 1: fpuSetST(1, fpuST(1) * log2(fpuST(0) + 1)); fpuPop() // FYL2XP1
+                case 2: fpuSetST(0, sqrt(fpuST(0))) // FSQRT
+                case 3: // FSINCOS
+                    let value = fpuST(0)
+                    fpuSetST(0, sin(value)); fpuPush(cos(value))
+                case 4: fpuSetST(0, fpuRoundedInteger(fpuST(0))) // FRNDINT
+                case 5: fpuSetST(0, fpuST(0) * pow(2.0, fpuST(1).rounded(.towardZero))) // FSCALE
+                case 6: fpuSetST(0, sin(fpuST(0))) // FSIN
+                case 7: fpuSetST(0, cos(fpuST(0))) // FCOS
+                default: throw opcodeFault(opcode, address: address)
+                }
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDA:
+            switch reg {
+            case 0: if flag(Self.flagCarry) { fpuSetST(0, fpuST(rm)) } // FCMOVB
+            case 1: if flag(Self.flagZero) { fpuSetST(0, fpuST(rm)) } // FCMOVE
+            case 2: if flag(Self.flagCarry) || flag(Self.flagZero) { fpuSetST(0, fpuST(rm)) } // FCMOVBE
+            case 3: if flag(Self.flagParity) { fpuSetST(0, fpuST(rm)) } // FCMOVU
+            case 5:
+                guard rm == 1 else { throw opcodeFault(opcode, address: address) } // FUCOMPP
+                fpuCompare(fpuST(0), fpuST(1)); fpuPop(); fpuPop()
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDB:
+            switch reg {
+            case 0: if !flag(Self.flagCarry) { fpuSetST(0, fpuST(rm)) } // FCMOVNB
+            case 1: if !flag(Self.flagZero) { fpuSetST(0, fpuST(rm)) } // FCMOVNE
+            case 2: if !flag(Self.flagCarry) && !flag(Self.flagZero) { fpuSetST(0, fpuST(rm)) } // FCMOVNBE
+            case 3: if !flag(Self.flagParity) { fpuSetST(0, fpuST(rm)) } // FCMOVNU
+            case 4:
+                switch rm {
+                case 2: fpuConditionCodes = (false, false, false, false) // FNCLEX
+                case 3: // FNINIT
+                    fpuTop = 0
+                    fpuValid = [Bool](repeating: false, count: 8)
+                    fpuControlWord = 0x037F
+                    fpuConditionCodes = (false, false, false, false)
+                default: break // FNENI / FNDISI / FNSETPM は NOP
+                }
+            case 5: fpuCompareFlags(fpuST(0), fpuST(rm)) // FUCOMI
+            case 6: fpuCompareFlags(fpuST(0), fpuST(rm)) // FCOMI
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDC: fpuBinaryOpReversed(reg, index: rm)
+        case 0xDD:
+            switch reg {
+            case 0: fpuValid[(fpuTop + rm) & 7] = false // FFREE
+            case 2: fpuSetST(rm, fpuST(0)) // FST ST(i)
+            case 3: fpuSetST(rm, fpuST(0)); fpuPop() // FSTP ST(i)
+            case 4: fpuCompare(fpuST(0), fpuST(rm)) // FUCOM
+            case 5: fpuCompare(fpuST(0), fpuST(rm)); fpuPop() // FUCOMP
+            default: throw opcodeFault(opcode, address: address)
+            }
+        case 0xDE:
+            if reg == 3 {
+                guard rm == 1 else { throw opcodeFault(opcode, address: address) } // FCOMPP
+                fpuCompare(fpuST(0), fpuST(1)); fpuPop(); fpuPop()
+            } else if reg == 2 {
+                throw opcodeFault(opcode, address: address)
+            } else {
+                fpuBinaryOpPop(reg, index: rm)
+            }
+        case 0xDF:
+            switch reg {
+            case 0: fpuValid[(fpuTop + rm) & 7] = false; fpuPop() // FFREEP
+            case 4:
+                guard rm == 0 else { throw opcodeFault(opcode, address: address) } // FNSTSW AX
+                registers[0] = (registers[0] & ~0xFFFF) | UInt64(fpuStatusWord)
+            case 5: fpuCompareFlags(fpuST(0), fpuST(rm)); fpuPop() // FUCOMIP
+            case 6: fpuCompareFlags(fpuST(0), fpuST(rm)); fpuPop() // FCOMIP
+            default: throw opcodeFault(opcode, address: address)
+            }
+        default: throw opcodeFault(opcode, address: address)
+        }
+    }
+
+    // MARK: - SSE / SSE2
+
+    private enum SSEVariant { case ps, pd, ss, sd }
+
+    private var sseVariant: SSEVariant {
+        if decodeRepeatPrefix == 0xF3 { return .ss }
+        if decodeRepeatPrefix == 0xF2 { return .sd }
+        return decodePrefix66 ? .pd : .ps
+    }
+
+    private func readXMMOperand(_ operand: ModRM) throws -> [UInt8] {
+        if operand.isRegister { return xmmRegisters[operand.registerIndex & 15] }
+        return try readOperandBytes(operand, count: 16)
+    }
+
+    private func writeXMMOperand(_ operand: ModRM, _ bytes: [UInt8]) throws {
+        if operand.isRegister { xmmRegisters[operand.registerIndex & 15] = bytes }
+        else { try writeOperandBytes(operand, bytes) }
+    }
+
+    private func executeSSE(opcode: UInt8, operandSize: Int, address: UInt64) throws {
+        if controlRegisters[0] & 0x4 != 0 { throw CPUTrap.exception(vector: 7, errorCode: nil) } // CR0.EM → #NM
+        if controlRegisters[4] & 0x200 == 0 { throw opcodeFault(opcode, address: address) } // CR4.OSFXSR なし → #UD
+        let variant = sseVariant
+        let p66 = decodePrefix66
+        switch opcode {
+        case 0xAE:
+            try executeSSEGroupAE(address: address)
+        case 0x71, 0x72, 0x73: // シフト（即値）
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            let count = Int(try fetch8())
+            let index = modRM.registerIndex & 15
+            xmmRegisters[index] = sseShiftImmediate(opcode: opcode, subOperation: modRM.reg & 7, bytes: xmmRegisters[index], count: count)
+        case 0xC2: // CMPPS / CMPPD / CMPSS / CMPSD
+            let modRM = try decodeModRM()
+            let predicate = Int(try fetch8()) & 7
+            let src = try readXMMOperand(modRM)
+            sseCompare(variant: variant, dest: modRM.reg & 15, src: src, predicate: predicate)
+        case 0xC6: // SHUFPS / SHUFPD
+            let modRM = try decodeModRM()
+            let selector = try fetch8()
+            let src = try readXMMOperand(modRM)
+            let dest = xmmRegisters[modRM.reg & 15]
+            var result = [UInt8](repeating: 0, count: 16)
+            if variant == .pd {
+                putLE64(&result, 0, le64(dest, Int(selector & 1) * 8))
+                putLE64(&result, 8, le64(src, Int((selector >> 1) & 1) * 8))
+            } else if variant == .ps {
+                putLE32(&result, 0, le32(dest, Int(selector & 3) * 4))
+                putLE32(&result, 4, le32(dest, Int((selector >> 2) & 3) * 4))
+                putLE32(&result, 8, le32(src, Int((selector >> 4) & 3) * 4))
+                putLE32(&result, 12, le32(src, Int((selector >> 6) & 3) * 4))
+            } else { throw opcodeFault(opcode, address: address) }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0x70: // PSHUFD / PSHUFHW / PSHUFLW
+            let modRM = try decodeModRM()
+            let selector = try fetch8()
+            let src = try readXMMOperand(modRM)
+            var result = src
+            if variant == .pd {
+                for i in 0..<4 { putLE32(&result, i * 4, le32(src, Int((selector >> (2 * i)) & 3) * 4)) }
+            } else if variant == .ss {
+                for i in 0..<4 {
+                    let selected = Int((selector >> (2 * i)) & 3)
+                    result[8 + i * 2] = src[8 + selected * 2]
+                    result[8 + i * 2 + 1] = src[8 + selected * 2 + 1]
+                }
+            } else if variant == .sd {
+                for i in 0..<4 {
+                    let selected = Int((selector >> (2 * i)) & 3)
+                    result[i * 2] = src[selected * 2]
+                    result[i * 2 + 1] = src[selected * 2 + 1]
+                }
+            } else { throw opcodeFault(opcode, address: address) }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0xC4: // PINSRW
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            let lane = Int(try fetch8()) & 7
+            let value = try readOperand(modRM, size: 2)
+            var dest = xmmRegisters[modRM.reg & 15]
+            dest[lane * 2] = UInt8(value & 0xFF)
+            dest[lane * 2 + 1] = UInt8((value >> 8) & 0xFF)
+            xmmRegisters[modRM.reg & 15] = dest
+        case 0xC5: // PEXTRW
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            let lane = Int(try fetch8()) & 7
+            guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            let src = xmmRegisters[modRM.registerIndex & 15]
+            setRegisterValue(modRM.reg, size: 4, UInt64(src[lane * 2]) | UInt64(src[lane * 2 + 1]) << 8)
+        case 0x28: // MOVAPS / MOVAPD（読み込み）
+            let modRM = try decodeModRM()
+            xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
+        case 0x29: // MOVAPS / MOVAPD（書き込み）
+            let modRM = try decodeModRM()
+            try writeXMMOperand(modRM, xmmRegisters[modRM.reg & 15])
+        case 0x10: // MOVUPS / MOVUPD / MOVSS / MOVSD（読み込み）
+            let modRM = try decodeModRM()
+            switch variant {
+            case .ps, .pd:
+                xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
+            case .ss:
+                if modRM.isRegister {
+                    var dest = xmmRegisters[modRM.reg & 15]
+                    putLE32(&dest, 0, le32(xmmRegisters[modRM.registerIndex & 15], 0))
+                    xmmRegisters[modRM.reg & 15] = dest
+                } else {
+                    var dest = [UInt8](repeating: 0, count: 16)
+                    putLE32(&dest, 0, UInt32(try readOperand(modRM, size: 4)))
+                    xmmRegisters[modRM.reg & 15] = dest
+                }
+            case .sd:
+                if modRM.isRegister {
+                    var dest = xmmRegisters[modRM.reg & 15]
+                    putLE64(&dest, 0, le64(xmmRegisters[modRM.registerIndex & 15], 0))
+                    xmmRegisters[modRM.reg & 15] = dest
+                } else {
+                    var dest = [UInt8](repeating: 0, count: 16)
+                    putLE64(&dest, 0, try readOperand(modRM, size: 8))
+                    xmmRegisters[modRM.reg & 15] = dest
+                }
+            }
+        case 0x11: // MOVUPS / MOVUPD / MOVSS / MOVSD（書き込み）
+            let modRM = try decodeModRM()
+            let src = xmmRegisters[modRM.reg & 15]
+            switch variant {
+            case .ps, .pd:
+                try writeXMMOperand(modRM, src)
+            case .ss:
+                if modRM.isRegister {
+                    var dest = xmmRegisters[modRM.registerIndex & 15]
+                    putLE32(&dest, 0, le32(src, 0))
+                    xmmRegisters[modRM.registerIndex & 15] = dest
+                } else {
+                    try writeOperand(modRM, size: 4, UInt64(le32(src, 0)))
+                }
+            case .sd:
+                if modRM.isRegister {
+                    var dest = xmmRegisters[modRM.registerIndex & 15]
+                    putLE64(&dest, 0, le64(src, 0))
+                    xmmRegisters[modRM.registerIndex & 15] = dest
+                } else {
+                    try writeOperand(modRM, size: 8, le64(src, 0))
+                }
+            }
+        case 0x12: // MOVLPS / MOVLPD（読み込み）/ MOVHLPS
+            let modRM = try decodeModRM()
+            if modRM.isRegister {
+                var dest = xmmRegisters[modRM.reg & 15]
+                let src = xmmRegisters[modRM.registerIndex & 15]
+                for i in 0..<8 { dest[i] = src[i + 8] }
+                xmmRegisters[modRM.reg & 15] = dest
+            } else {
+                var dest = xmmRegisters[modRM.reg & 15]
+                putLE64(&dest, 0, try readOperand(modRM, size: 8))
+                xmmRegisters[modRM.reg & 15] = dest
+            }
+        case 0x13: // MOVLPS / MOVLPD（書き込み）
+            let modRM = try decodeModRM()
+            try writeOperand(modRM, size: 8, le64(xmmRegisters[modRM.reg & 15], 0))
+        case 0x16: // MOVHPS / MOVHPD（読み込み）/ MOVLHPS
+            let modRM = try decodeModRM()
+            if modRM.isRegister {
+                var dest = xmmRegisters[modRM.reg & 15]
+                let src = xmmRegisters[modRM.registerIndex & 15]
+                for i in 0..<8 { dest[i + 8] = src[i] }
+                xmmRegisters[modRM.reg & 15] = dest
+            } else {
+                var dest = xmmRegisters[modRM.reg & 15]
+                putLE64(&dest, 8, try readOperand(modRM, size: 8))
+                xmmRegisters[modRM.reg & 15] = dest
+            }
+        case 0x17: // MOVHPS / MOVHPD（書き込み）
+            let modRM = try decodeModRM()
+            try writeOperand(modRM, size: 8, le64(xmmRegisters[modRM.reg & 15], 8))
+        case 0x14, 0x15: // UNPCKLPS / UNPCKHPS / UNPCKLPD / UNPCKHPD
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            let dest = xmmRegisters[modRM.reg & 15]
+            var result = [UInt8](repeating: 0, count: 16)
+            if variant == .pd {
+                let lane = opcode == 0x15 ? 1 : 0
+                putLE64(&result, 0, le64(dest, lane * 8))
+                putLE64(&result, 8, le64(src, lane * 8))
+            } else {
+                let base = opcode == 0x15 ? 2 : 0
+                for i in 0..<2 {
+                    putLE32(&result, i * 8, le32(dest, (base + i) * 4))
+                    putLE32(&result, i * 8 + 4, le32(src, (base + i) * 4))
+                }
+            }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0x6F: // MOVDQA / MOVDQU（読み込み）
+            let modRM = try decodeModRM()
+            xmmRegisters[modRM.reg & 15] = try readXMMOperand(modRM)
+        case 0x7F, 0xE7: // MOVDQA / MOVDQU / MOVNTDQ（書き込み）
+            let modRM = try decodeModRM()
+            try writeXMMOperand(modRM, xmmRegisters[modRM.reg & 15])
+        case 0x6E: // MOVD / MOVQ（GPR・メモリ → XMM）
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            var dest = [UInt8](repeating: 0, count: 16)
+            if operandSize == 8 {
+                putLE64(&dest, 0, try readOperand(modRM, size: 8))
+            } else {
+                putLE32(&dest, 0, UInt32(try readOperand(modRM, size: 4)))
+            }
+            xmmRegisters[modRM.reg & 15] = dest
+        case 0x7E: // MOVD（XMM → GPR・メモリ）/ MOVQ（読み込み）
+            let modRM = try decodeModRM()
+            if variant == .ss { // MOVQ xmm, r/m64（読み込み）
+                var dest = [UInt8](repeating: 0, count: 16)
+                if modRM.isRegister {
+                    putLE64(&dest, 0, le64(xmmRegisters[modRM.registerIndex & 15], 0))
+                } else {
+                    putLE64(&dest, 0, try readOperand(modRM, size: 8))
+                }
+                xmmRegisters[modRM.reg & 15] = dest
+            } else if p66 { // MOVD r/m, xmm
+                let src = xmmRegisters[modRM.reg & 15]
+                if operandSize == 8 {
+                    try writeOperand(modRM, size: 8, le64(src, 0))
+                } else {
+                    try writeOperand(modRM, size: 4, UInt64(le32(src, 0)))
+                }
+            } else { throw opcodeFault(opcode, address: address) }
+        case 0xD6: // MOVQ（書き込み）
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            try writeOperand(modRM, size: 8, le64(xmmRegisters[modRM.reg & 15], 0))
+        case 0x51, 0x52, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F: // 浮動小数点演算
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            sseFloatArithmetic(opcode: opcode, variant: variant, dest: modRM.reg & 15, src: src)
+        case 0x2E, 0x2F: // UCOMISS / COMISS / UCOMISD / COMISD
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            let dest = xmmRegisters[modRM.reg & 15]
+            if variant == .pd {
+                fpuCompareFlags(Double(bitPattern: le64(dest, 0)), Double(bitPattern: le64(src, 0)))
+            } else {
+                fpuCompareFlags(Double(Float(bitPattern: le32(dest, 0))), Double(Float(bitPattern: le32(src, 0))))
+            }
+        case 0x50: // MOVMSKPS / MOVMSKPD
+            let modRM = try decodeModRM()
+            guard modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+            let src = xmmRegisters[modRM.registerIndex & 15]
+            var maskValue: UInt64 = 0
+            if variant == .pd {
+                for lane in 0..<2 where src[lane * 8 + 7] & 0x80 != 0 { maskValue |= UInt64(1 << lane) }
+            } else if variant == .ps {
+                for lane in 0..<4 where src[lane * 4 + 3] & 0x80 != 0 { maskValue |= UInt64(1 << lane) }
+            } else { throw opcodeFault(opcode, address: address) }
+            setRegisterValue(modRM.reg, size: 4, maskValue)
+        case 0x2A: // CVTSI2SS / CVTSI2SD
+            let modRM = try decodeModRM()
+            let raw = try readOperand(modRM, size: operandSize == 8 ? 8 : 4)
+            var result = [UInt8](repeating: 0, count: 16)
+            if variant == .ss {
+                let value = operandSize == 8 ? Float(Int64(bitPattern: raw)) : Float(Int32(bitPattern: UInt32(raw)))
+                putLE32(&result, 0, value.bitPattern)
+            } else if variant == .sd {
+                let value = operandSize == 8 ? Double(Int64(bitPattern: raw)) : Double(Int32(bitPattern: UInt32(raw)))
+                putLE64(&result, 0, value.bitPattern)
+            } else { throw opcodeFault(opcode, address: address) }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0x2C, 0x2D: // CVTTSS2SI / CVTSS2SI / CVTTSD2SI / CVTSD2SI
+            let modRM = try decodeModRM()
+            let destSize = operandSize == 8 ? 8 : 4
+            let converted: UInt64
+            if variant == .ss {
+                let value: Float
+                if modRM.isRegister { value = Float(bitPattern: le32(xmmRegisters[modRM.registerIndex & 15], 0)) }
+                else { value = Float(bitPattern: UInt32(try readOperand(modRM, size: 4))) }
+                converted = convertToInteger(Double(value), truncate: opcode == 0x2C, size: destSize)
+            } else if variant == .sd {
+                let value: Double
+                if modRM.isRegister { value = Double(bitPattern: le64(xmmRegisters[modRM.registerIndex & 15], 0)) }
+                else { value = Double(bitPattern: try readOperand(modRM, size: 8)) }
+                converted = convertToInteger(value, truncate: opcode == 0x2C, size: destSize)
+            } else { throw opcodeFault(opcode, address: address) }
+            setRegisterValue(modRM.reg, size: destSize, converted)
+        case 0x5A: // CVTPS2PD / CVTPD2PS / CVTSS2SD / CVTSD2SS
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            var result = [UInt8](repeating: 0, count: 16)
+            switch variant {
+            case .ps:
+                for lane in 0..<2 { putLE64(&result, lane * 8, Double(Float(bitPattern: le32(src, lane * 4))).bitPattern) }
+            case .pd:
+                for lane in 0..<2 { putLE32(&result, lane * 4, Float(Double(bitPattern: le64(src, lane * 8))).bitPattern) }
+            case .ss:
+                putLE64(&result, 0, Double(Float(bitPattern: le32(src, 0))).bitPattern)
+            case .sd:
+                putLE32(&result, 0, Float(Double(bitPattern: le64(src, 0))).bitPattern)
+            }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0xE6: // CVTPD2DQ / CVTTPD2DQ / CVTDQ2PD
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            var result = [UInt8](repeating: 0, count: 16)
+            switch variant {
+            case .pd:
+                for lane in 0..<2 { putLE32(&result, lane * 4, convertToDword(Double(bitPattern: le64(src, lane * 8)), truncate: false)) }
+            case .sd:
+                for lane in 0..<2 { putLE32(&result, lane * 4, convertToDword(Double(bitPattern: le64(src, lane * 8)), truncate: true)) }
+            case .ss:
+                for lane in 0..<2 { putLE64(&result, lane * 8, Double(Int32(bitPattern: le32(src, lane * 4))).bitPattern) }
+            default: throw opcodeFault(opcode, address: address)
+            }
+            xmmRegisters[modRM.reg & 15] = result
+        case 0x60...0x6D, 0x74, 0x75, 0x76, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
+             0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF,
+             0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE: // 整数演算（SSE2）
+            guard p66 else { throw opcodeFault(opcode, address: address) }
+            let modRM = try decodeModRM()
+            let src = try readXMMOperand(modRM)
+            try sseInteger(opcode: opcode, dest: modRM.reg & 15, src: src, address: address)
+        default:
+            throw opcodeFault(opcode, address: address)
+        }
+    }
+
+    private func convertToInteger(_ value: Double, truncate: Bool, size: Int) -> UInt64 {
+        let rounded = truncate ? value.rounded(.towardZero) : value.rounded(.toNearestOrEven)
+        if size == 8 {
+            if rounded.isNaN || rounded >= 9.223372036854776e18 || rounded < -9.223372036854776e18 { return 0x8000000000000000 }
+            return UInt64(bitPattern: Int64(rounded))
+        }
+        if rounded.isNaN || rounded >= 2147483648.0 || rounded < -2147483648.0 { return 0x80000000 }
+        return UInt64(UInt32(bitPattern: Int32(rounded)))
+    }
+
+    private func convertToDword(_ value: Double, truncate: Bool) -> UInt32 {
+        let rounded = truncate ? value.rounded(.towardZero) : value.rounded(.toNearestOrEven)
+        if rounded.isNaN || rounded >= 2147483648.0 || rounded < -2147483648.0 { return 0x80000000 }
+        return UInt32(bitPattern: Int32(rounded))
+    }
+
+    private func ssePredicate(_ predicate: Int, _ a: Double, _ b: Double) -> Bool {
+        switch predicate {
+        case 0: return a == b
+        case 1: return a < b
+        case 2: return a <= b
+        case 3: return a.isNaN || b.isNaN
+        case 4: return a.isNaN || b.isNaN || a != b
+        case 5: return a.isNaN || b.isNaN || a >= b
+        case 6: return a.isNaN || b.isNaN || a > b
+        case 7: return !a.isNaN && !b.isNaN
+        default: return false
+        }
+    }
+
+    private func sseCompare(variant: SSEVariant, dest: Int, src: [UInt8], predicate: Int) {
+        let destBytes = xmmRegisters[dest]
+        var result = destBytes
+        switch variant {
+        case .ps:
+            for lane in 0..<4 {
+                let a = Double(Float(bitPattern: le32(destBytes, lane * 4)))
+                let b = Double(Float(bitPattern: le32(src, lane * 4)))
+                putLE32(&result, lane * 4, ssePredicate(predicate, a, b) ? 0xFFFFFFFF : 0)
+            }
+        case .pd:
+            for lane in 0..<2 {
+                let a = Double(bitPattern: le64(destBytes, lane * 8))
+                let b = Double(bitPattern: le64(src, lane * 8))
+                putLE64(&result, lane * 8, ssePredicate(predicate, a, b) ? UInt64.max : 0)
+            }
+        case .ss:
+            let a = Double(Float(bitPattern: le32(destBytes, 0)))
+            let b = Double(Float(bitPattern: le32(src, 0)))
+            putLE32(&result, 0, ssePredicate(predicate, a, b) ? 0xFFFFFFFF : 0)
+        case .sd:
+            let a = Double(bitPattern: le64(destBytes, 0))
+            let b = Double(bitPattern: le64(src, 0))
+            putLE64(&result, 0, ssePredicate(predicate, a, b) ? UInt64.max : 0)
+        }
+        xmmRegisters[dest] = result
+    }
+
+    private func sseFloatArithmetic(opcode: UInt8, variant: SSEVariant, dest: Int, src: [UInt8]) {
+        let destBytes = xmmRegisters[dest]
+        var result = destBytes
+        if opcode >= 0x54 && opcode <= 0x57 { // AND / ANDN / OR / XOR（ビット演算）
+            for i in 0..<16 {
+                switch opcode {
+                case 0x54: result[i] = destBytes[i] & src[i]
+                case 0x55: result[i] = ~destBytes[i] & src[i]
+                case 0x56: result[i] = destBytes[i] | src[i]
+                default: result[i] = destBytes[i] ^ src[i]
+                }
+            }
+            xmmRegisters[dest] = result
+            return
+        }
+        func floatOp(_ a: Float, _ b: Float) -> Float {
+            switch opcode {
+            case 0x51: return sqrt(b)
+            case 0x52: return 1 / sqrt(b)
+            case 0x58: return a + b
+            case 0x59: return a * b
+            case 0x5C: return a - b
+            case 0x5D: return (a < b || b.isNaN) ? (b.isNaN ? b : a) : b // MIN（第2オペランド優先の仕様に寄せる）
+            case 0x5E: return a / b
+            case 0x5F: return (a > b || b.isNaN) ? (b.isNaN ? b : a) : b // MAX
+            default: return b
+            }
+        }
+        func doubleOp(_ a: Double, _ b: Double) -> Double {
+            switch opcode {
+            case 0x51: return sqrt(b)
+            case 0x58: return a + b
+            case 0x59: return a * b
+            case 0x5C: return a - b
+            case 0x5D: return (a < b || b.isNaN) ? (b.isNaN ? b : a) : b
+            case 0x5E: return a / b
+            case 0x5F: return (a > b || b.isNaN) ? (b.isNaN ? b : a) : b
+            default: return b
+            }
+        }
+        switch variant {
+        case .ps:
+            for lane in 0..<4 {
+                let a = Float(bitPattern: le32(destBytes, lane * 4))
+                let b = Float(bitPattern: le32(src, lane * 4))
+                putLE32(&result, lane * 4, floatOp(a, b).bitPattern)
+            }
+        case .ss:
+            let a = Float(bitPattern: le32(destBytes, 0))
+            let b = Float(bitPattern: le32(src, 0))
+            putLE32(&result, 0, floatOp(a, b).bitPattern)
+        case .pd:
+            for lane in 0..<2 {
+                let a = Double(bitPattern: le64(destBytes, lane * 8))
+                let b = Double(bitPattern: le64(src, lane * 8))
+                putLE64(&result, lane * 8, doubleOp(a, b).bitPattern)
+            }
+        case .sd:
+            let a = Double(bitPattern: le64(destBytes, 0))
+            let b = Double(bitPattern: le64(src, 0))
+            putLE64(&result, 0, doubleOp(a, b).bitPattern)
+        }
+        xmmRegisters[dest] = result
+    }
+
+    /// レーン単位のシフト（論理 / 算術、左右）。
+    private func sseShiftLanes(_ bytes: [UInt8], laneSize: Int, count: Int, arithmetic: Bool, left: Bool) -> [UInt8] {
+        var result = bytes
+        let bits = laneSize * 8
+        for i in 0..<(16 / laneSize) {
+            var value: UInt64 = 0
+            for k in 0..<laneSize { value |= UInt64(bytes[i * laneSize + k]) << (8 * k) }
+            var shifted: UInt64
+            if left {
+                shifted = count >= bits ? 0 : value << count
+            } else if arithmetic {
+                let signed: Int64
+                switch laneSize {
+                case 2: signed = Int64(Int16(bitPattern: UInt16(value)))
+                case 4: signed = Int64(Int32(bitPattern: UInt32(value)))
+                default: signed = Int64(bitPattern: value)
+                }
+                shifted = count >= bits ? (signed < 0 ? UInt64.max : 0) : UInt64(bitPattern: signed >> count)
+            } else {
+                shifted = count >= bits ? 0 : value >> count
+            }
+            let laneMask: UInt64 = laneSize == 8 ? UInt64.max : (UInt64(1) << bits) - 1
+            shifted &= laneMask
+            for k in 0..<laneSize { result[i * laneSize + k] = UInt8((shifted >> (8 * k)) & 0xFF) }
+        }
+        return result
+    }
+
+    private func sseShiftImmediate(opcode: UInt8, subOperation: Int, bytes: [UInt8], count: Int) -> [UInt8] {
+        switch opcode {
+        case 0x71: // ワード
+            switch subOperation {
+            case 2: return sseShiftLanes(bytes, laneSize: 2, count: count, arithmetic: false, left: false)
+            case 4: return sseShiftLanes(bytes, laneSize: 2, count: count, arithmetic: true, left: false)
+            case 6: return sseShiftLanes(bytes, laneSize: 2, count: count, arithmetic: false, left: true)
+            default: return bytes
+            }
+        case 0x72: // ダブルワード
+            switch subOperation {
+            case 2: return sseShiftLanes(bytes, laneSize: 4, count: count, arithmetic: false, left: false)
+            case 4: return sseShiftLanes(bytes, laneSize: 4, count: count, arithmetic: true, left: false)
+            case 6: return sseShiftLanes(bytes, laneSize: 4, count: count, arithmetic: false, left: true)
+            default: return bytes
+            }
+        default: // 0x73: クワッドワード / レジスタ全体のバイトシフト
+            switch subOperation {
+            case 2: return sseShiftLanes(bytes, laneSize: 8, count: count, arithmetic: false, left: false)
+            case 6: return sseShiftLanes(bytes, laneSize: 8, count: count, arithmetic: false, left: true)
+            case 3: // PSRLDQ
+                if count >= 16 { return [UInt8](repeating: 0, count: 16) }
+                var result = [UInt8](repeating: 0, count: 16)
+                for i in 0..<(16 - count) { result[i] = bytes[i + count] }
+                return result
+            case 7: // PSLLDQ
+                if count >= 16 { return [UInt8](repeating: 0, count: 16) }
+                var result = [UInt8](repeating: 0, count: 16)
+                for i in count..<16 { result[i] = bytes[i - count] }
+                return result
+            default: return bytes
+            }
+        }
+    }
+
+    private func sseInteger(opcode: UInt8, dest: Int, src: [UInt8], address: UInt64) throws {
+        var result = xmmRegisters[dest]
+        let destBytes = xmmRegisters[dest]
+        func lane(_ bytes: [UInt8], _ size: Int, _ index: Int) -> UInt64 {
+            var value: UInt64 = 0
+            for k in 0..<size { value |= UInt64(bytes[index * size + k]) << (8 * k) }
+            return value
+        }
+        func setLane(_ size: Int, _ index: Int, _ value: UInt64) {
+            for k in 0..<size { result[index * size + k] = UInt8((value >> (8 * k)) & 0xFF) }
+        }
+        func signedLane(_ bytes: [UInt8], _ size: Int, _ index: Int) -> Int64 {
+            let raw = lane(bytes, size, index)
+            switch size {
+            case 1: return Int64(Int8(bitPattern: UInt8(raw)))
+            case 2: return Int64(Int16(bitPattern: UInt16(raw)))
+            case 4: return Int64(Int32(bitPattern: UInt32(raw)))
+            default: return Int64(bitPattern: raw)
+            }
+        }
+        func addSub(size: Int, subtract: Bool, saturate: Int) {
+            // saturate: 0 なし / 1 符号付き / 2 符号なし
+            let bits = size * 8
+            let signedMin = -(Int64(1) << (bits - 1))
+            let signedMax = (Int64(1) << (bits - 1)) - 1
+            let unsignedMax = size == 8 ? UInt64.max : (UInt64(1) << bits) - 1
+            for i in 0..<(16 / size) {
+                if saturate == 1 {
+                    var value = signedLane(destBytes, size, i)
+                    let other = signedLane(src, size, i)
+                    value = subtract ? value - other : value + other
+                    value = max(signedMin, min(signedMax, value))
+                    setLane(size, i, UInt64(bitPattern: value))
+                } else if saturate == 2 {
+                    var value = Int64(lane(destBytes, size, i))
+                    let other = Int64(lane(src, size, i))
+                    value = subtract ? value - other : value + other
+                    value = max(0, min(Int64(unsignedMax), value))
+                    setLane(size, i, UInt64(value))
+                } else if subtract {
+                    setLane(size, i, lane(destBytes, size, i) &- lane(src, size, i))
+                } else {
+                    setLane(size, i, lane(destBytes, size, i) &+ lane(src, size, i))
+                }
+            }
+        }
+        switch opcode {
+        case 0xFC: addSub(size: 1, subtract: false, saturate: 0)
+        case 0xFD: addSub(size: 2, subtract: false, saturate: 0)
+        case 0xFE: addSub(size: 4, subtract: false, saturate: 0)
+        case 0xD4: addSub(size: 8, subtract: false, saturate: 0)
+        case 0xF8: addSub(size: 1, subtract: true, saturate: 0)
+        case 0xF9: addSub(size: 2, subtract: true, saturate: 0)
+        case 0xFA: addSub(size: 4, subtract: true, saturate: 0)
+        case 0xFB: addSub(size: 8, subtract: true, saturate: 0)
+        case 0xEC: addSub(size: 1, subtract: false, saturate: 1)
+        case 0xED: addSub(size: 2, subtract: false, saturate: 1)
+        case 0xDC: addSub(size: 1, subtract: false, saturate: 2)
+        case 0xDD: addSub(size: 2, subtract: false, saturate: 2)
+        case 0xE8: addSub(size: 1, subtract: true, saturate: 1)
+        case 0xE9: addSub(size: 2, subtract: true, saturate: 1)
+        case 0xD8: addSub(size: 1, subtract: true, saturate: 2)
+        case 0xD9: addSub(size: 2, subtract: true, saturate: 2)
+        case 0x74, 0x75, 0x76: // PCMPEQ B / W / D
+            let size = opcode == 0x74 ? 1 : (opcode == 0x75 ? 2 : 4)
+            for i in 0..<(16 / size) {
+                setLane(size, i, lane(destBytes, size, i) == lane(src, size, i) ? UInt64.max : 0)
+            }
+        case 0x64, 0x65, 0x66: // PCMPGT B / W / D
+            let size = opcode == 0x64 ? 1 : (opcode == 0x65 ? 2 : 4)
+            for i in 0..<(16 / size) {
+                setLane(size, i, signedLane(destBytes, size, i) > signedLane(src, size, i) ? UInt64.max : 0)
+            }
+        case 0xDA: // PMINUB
+            for i in 0..<16 { result[i] = min(destBytes[i], src[i]) }
+        case 0xDE: // PMAXUB
+            for i in 0..<16 { result[i] = max(destBytes[i], src[i]) }
+        case 0xEA: // PMINSW
+            for i in 0..<8 { setLane(2, i, UInt64(bitPattern: min(signedLane(destBytes, 2, i), signedLane(src, 2, i)))) }
+        case 0xEE: // PMAXSW
+            for i in 0..<8 { setLane(2, i, UInt64(bitPattern: max(signedLane(destBytes, 2, i), signedLane(src, 2, i)))) }
+        case 0xE0: // PAVGB
+            for i in 0..<16 { result[i] = UInt8((Int(destBytes[i]) + Int(src[i]) + 1) >> 1) }
+        case 0xE3: // PAVGW
+            for i in 0..<8 { setLane(2, i, UInt64((lane(destBytes, 2, i) + lane(src, 2, i) + 1) >> 1)) }
+        case 0xD5: // PMULLW
+            for i in 0..<8 { setLane(2, i, lane(destBytes, 2, i) &* lane(src, 2, i)) }
+        case 0xE5: // PMULHW
+            for i in 0..<8 { setLane(2, i, UInt64(bitPattern: (signedLane(destBytes, 2, i) * signedLane(src, 2, i)) >> 16)) }
+        case 0xE4: // PMULHUW
+            for i in 0..<8 { setLane(2, i, (lane(destBytes, 2, i) * lane(src, 2, i)) >> 16) }
+        case 0xF4: // PMULUDQ
+            for i in 0..<2 {
+                let a = lane(destBytes, 4, i * 2), b = lane(src, 4, i * 2)
+                setLane(8, i, a &* b)
+            }
+        case 0xF5: // PMADDWD
+            for i in 0..<4 {
+                let value = signedLane(destBytes, 2, i * 2) * signedLane(src, 2, i * 2)
+                    + signedLane(destBytes, 2, i * 2 + 1) * signedLane(src, 2, i * 2 + 1)
+                setLane(4, i, UInt64(bitPattern: value))
+            }
+        case 0xF6: // PSADBW
+            for half in 0..<2 {
+                var sum: UInt64 = 0
+                for i in 0..<8 {
+                    let a = Int(destBytes[half * 8 + i]), b = Int(src[half * 8 + i])
+                    sum += UInt64(abs(a - b))
+                }
+                setLane(8, half, sum)
+            }
+        case 0xDB: for i in 0..<16 { result[i] = destBytes[i] & src[i] } // PAND
+        case 0xDF: for i in 0..<16 { result[i] = ~destBytes[i] & src[i] } // PANDN
+        case 0xEB: for i in 0..<16 { result[i] = destBytes[i] | src[i] } // POR
+        case 0xEF: for i in 0..<16 { result[i] = destBytes[i] ^ src[i] } // PXOR
+        case 0x63: // PACKSSWB
+            for i in 0..<8 {
+                let a = max(Int64(-128), min(Int64(127), signedLane(destBytes, 2, i)))
+                let b = max(Int64(-128), min(Int64(127), signedLane(src, 2, i)))
+                result[i] = UInt8(bitPattern: Int8(a))
+                result[8 + i] = UInt8(bitPattern: Int8(b))
+            }
+        case 0x6B: // PACKSSDW
+            for i in 0..<4 {
+                let a = max(Int64(-32768), min(Int64(32767), signedLane(destBytes, 4, i)))
+                let b = max(Int64(-32768), min(Int64(32767), signedLane(src, 4, i)))
+                setLane(2, i, UInt64(bitPattern: a))
+                setLane(2, 4 + i, UInt64(bitPattern: b))
+            }
+        case 0x67: // PACKUSWB
+            for i in 0..<8 {
+                let a = max(Int64(0), min(Int64(255), signedLane(destBytes, 2, i)))
+                let b = max(Int64(0), min(Int64(255), signedLane(src, 2, i)))
+                result[i] = UInt8(a)
+                result[8 + i] = UInt8(b)
+            }
+        case 0x60, 0x61, 0x62, 0x68, 0x69, 0x6A: // PUNPCKL / H BW・WD・DQ
+            let size = opcode == 0x60 || opcode == 0x68 ? 1 : (opcode == 0x61 || opcode == 0x69 ? 2 : 4)
+            let high = opcode >= 0x68
+            let count = 16 / size
+            let start = high ? count / 2 : 0
+            for i in 0..<(count / 2) {
+                setLane(size, i * 2, lane(destBytes, size, start + i))
+                setLane(size, i * 2 + 1, lane(src, size, start + i))
+            }
+        case 0x6C: // PUNPCKLQDQ
+            setLane(8, 0, lane(destBytes, 8, 0)); setLane(8, 1, lane(src, 8, 0))
+        case 0x6D: // PUNPCKHQDQ
+            setLane(8, 0, lane(destBytes, 8, 1)); setLane(8, 1, lane(src, 8, 1))
+        case 0xD1, 0xD2, 0xD3, 0xE1, 0xE2, 0xF1, 0xF2, 0xF3: // シフト（レジスタ指定）
+            let count = Int(lane(src, 8, 0))
+            switch opcode {
+            case 0xD1: result = sseShiftLanes(destBytes, laneSize: 2, count: count, arithmetic: false, left: false)
+            case 0xD2: result = sseShiftLanes(destBytes, laneSize: 4, count: count, arithmetic: false, left: false)
+            case 0xD3: result = sseShiftLanes(destBytes, laneSize: 8, count: count, arithmetic: false, left: false)
+            case 0xE1: result = sseShiftLanes(destBytes, laneSize: 2, count: count, arithmetic: true, left: false)
+            case 0xE2: result = sseShiftLanes(destBytes, laneSize: 4, count: count, arithmetic: true, left: false)
+            case 0xF1: result = sseShiftLanes(destBytes, laneSize: 2, count: count, arithmetic: false, left: true)
+            case 0xF2: result = sseShiftLanes(destBytes, laneSize: 4, count: count, arithmetic: false, left: true)
+            default: result = sseShiftLanes(destBytes, laneSize: 8, count: count, arithmetic: false, left: true)
+            }
+        default:
+            throw opcodeFault(opcode, address: address)
+        }
+        xmmRegisters[dest] = result
+    }
+
+    private func executeSSEGroupAE(address: UInt64) throws {
+        let modRM = try decodeModRM()
+        switch modRM.reg {
+        case 0:
+            guard !modRM.isRegister else { throw opcodeFault(0xAE, address: address) }
+            try fxsave(modRM)
+        case 1:
+            guard !modRM.isRegister else { throw opcodeFault(0xAE, address: address) }
+            try fxrstor(modRM)
+        case 2: mxcsr = UInt32(try readOperand(modRM, size: 4)) // LDMXCSR
+        case 3: try writeOperand(modRM, size: 4, UInt64(mxcsr)) // STMXCSR
+        case 7 where !modRM.isRegister: break // CLFLUSH（NOP 扱い）
+        case 5, 6, 7: break // LFENCE / MFENCE / SFENCE（NOP 扱い）
+        default: throw opcodeFault(0xAE, address: address)
+        }
+    }
+
+    private func fxsave(_ operand: ModRM) throws {
+        var area = [UInt8](repeating: 0, count: 512)
+        area[0] = UInt8(fpuControlWord & 0xFF)
+        area[1] = UInt8(fpuControlWord >> 8)
+        area[2] = UInt8(fpuStatusWord & 0xFF)
+        area[3] = UInt8(fpuStatusWord >> 8)
+        var tag: UInt8 = 0
+        for i in 0..<8 where fpuValid[i] { tag |= UInt8(1 << i) }
+        area[4] = tag
+        putLE32(&area, 24, mxcsr)
+        putLE32(&area, 28, 0x0000FFFF)
+        for i in 0..<8 {
+            let extended = storeExtended(fpuRegisters[i])
+            for k in 0..<10 { area[32 + i * 16 + k] = extended[k] }
+        }
+        for i in 0..<16 {
+            for k in 0..<16 { area[160 + i * 16 + k] = xmmRegisters[i][k] }
+        }
+        try writeOperandBytes(operand, area)
+    }
+
+    private func fxrstor(_ operand: ModRM) throws {
+        let area = try readOperandBytes(operand, count: 512)
+        fpuControlWord = UInt16(area[0]) | UInt16(area[1]) << 8
+        let status = UInt16(area[2]) | UInt16(area[3]) << 8
+        fpuTop = Int((status >> 11) & 7)
+        fpuConditionCodes = (status & 0x0100 != 0, status & 0x0200 != 0, status & 0x0400 != 0, status & 0x4000 != 0)
+        let tag = area[4]
+        for i in 0..<8 {
+            fpuValid[i] = tag & UInt8(1 << i) != 0
+            fpuRegisters[i] = loadExtended(Array(area[(32 + i * 16)..<(32 + i * 16 + 10)]))
+        }
+        mxcsr = le32(area, 24)
+        for i in 0..<16 {
+            xmmRegisters[i] = Array(area[(160 + i * 16)..<(160 + i * 16 + 16)])
         }
     }
 

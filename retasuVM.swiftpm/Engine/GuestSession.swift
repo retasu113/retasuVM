@@ -19,4 +19,19 @@ protocol GuestSession: AnyObject {
     func setPaused(_ paused: Bool)
     func terminate()
     func sendInput(_ text: String)
+
+    /// ゲストの画面スナップショット（画面を持つセッションのみ）。
+    func screenSnapshot() -> GuestScreenSnapshot?
+}
+
+/// ゲストの画面のスナップショット。
+enum GuestScreenSnapshot {
+    /// ピクセル画面（GOP フレームバッファ、BGRA 形式）。
+    case framebuffer(width: Int, height: Int, bgra: [UInt8])
+    /// テキスト画面（VGA テキストモード、25 行）。
+    case text(lines: [String])
+}
+
+extension GuestSession {
+    func screenSnapshot() -> GuestScreenSnapshot? { nil }
 }

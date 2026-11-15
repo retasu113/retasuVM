@@ -94,7 +94,7 @@ final class X86Session: GuestSession {
                 continue
             }
             do {
-                try cpu.run(maxInstructions: 50_000)
+                try cpu.run(maxInstructions: 200_000)
             } catch {
                 flushOutput()
                 if !isTerminated { onFault?((error as? X86Fault)?.description ?? error.localizedDescription) }
@@ -105,6 +105,7 @@ final class X86Session: GuestSession {
                 if !isTerminated { onHalt?(cpu.exitCode) }
                 return
             }
+            X86UEFI.deliverPendingNotifications(cpu: cpu)
             if cpu.waitingForInterrupt {
                 // OS のアイドル状態: 割り込み（タイマ・キーボード等）を待つ
                 try? await Task.sleep(nanoseconds: 5_000_000)
@@ -167,5 +168,37 @@ final class X86Session: GuestSession {
 
     func sendInput(_ text: String) {
         cpu.provideInput([UInt8](text.utf8))
+        X86UEFI.pushConInText(cpu: cpu, text: text)
+    }
+
+    /// 画面スナップショット: UEFI 起動時は GOP フレームバッファ、
+    /// それ以外は VGA テキストメモリ（0xB8000、80×25）を読む。
+    func screenSnapshot() -> GuestScreenSnapshot? {
+        if let gop = X86UEFI.gopFramebufferInfo(cpu: cpu) {
+            let count = gop.width * gop.height * 4
+            var pixels = [UInt8]()
+            pixels.reserveCapacity(count)
+            var offset = 0
+            while offset < count {
+                let value = (try? cpu.readMemoryValue(at: gop.base + offset, size: 8)) ?? 0
+                for i in 0..<8 { pixels.append(UInt8((value >> (8 * i)) & 0xFF)) }
+                offset += 8
+            }
+            return .framebuffer(width: gop.width, height: gop.height, bgra: pixels)
+        }
+        var lines: [String] = []
+        for row in 0..<25 {
+            var line = ""
+            for column in 0..<80 {
+                let byte = (try? cpu.readMemoryValue(at: 0xB8000 + row * 160 + column * 2, size: 1)) ?? 0
+                if byte >= 0x20, byte < 0x7F {
+                    line.append(Character(UnicodeScalar(UInt8(byte))))
+                } else {
+                    line.append(" ")
+                }
+            }
+            lines.append(line)
+        }
+        return .text(lines: lines)
     }
 }
