@@ -23,6 +23,10 @@ struct VMEditorView: View {
     /// キャンセルや差し替えで未使用になった場合に片付けるために保持する。
     @State private var importedFileName: String?
     @State private var isoDisplayName: String?
+    /// 内蔵サンプルから起動するか（ファイルより優先）
+    @State private var useSample: Bool
+    /// 選択中の内蔵サンプル
+    @State private var sampleSelection: BuiltInSample
     @State private var cpuCount: Int
     @State private var memoryMB: Int
     @State private var diskGB: Int
@@ -42,6 +46,8 @@ struct VMEditorView: View {
         _useISO = State(initialValue: config.useISO)
         _isoFileName = State(initialValue: config.isoFileName)
         _isoDisplayName = State(initialValue: config.isoDisplayName)
+        _useSample = State(initialValue: config.builtInSample != nil)
+        _sampleSelection = State(initialValue: config.builtInSample ?? .kernel)
         _cpuCount = State(initialValue: config.cpuCount)
         _memoryMB = State(initialValue: config.memoryMB)
         _diskGB = State(initialValue: config.diskGB)
@@ -49,9 +55,10 @@ struct VMEditorView: View {
         _sharedFolderEnabled = State(initialValue: config.sharedFolderEnabled)
     }
 
-    /// ISO / イメージファイルが必須かどうか（RISC-V の ISO 起動と x86）
+    /// ISO / イメージファイルが必須かどうか（RISC-V の ISO 起動と x86。
+    /// 内蔵サンプル使用時はファイル不要）
     private var needsImageFile: Bool {
-        architecture == .x86 || (architecture == .riscv && useISO)
+        !useSample && (architecture == .x86 || (architecture == .riscv && useISO))
     }
 
     private var isValid: Bool {
@@ -79,7 +86,7 @@ struct VMEditorView: View {
                             Text("ISO ファイル").tag(true)
                         }
                         if useISO {
-                            isoPickerRows(buttonTitle: "ISO ファイルを選ぶ")
+                            imageSourceRows(sampleButtonTitle: "ISO ファイルを選ぶ")
                         } else {
                             Picker("ゲストイメージ", selection: $guestImage) {
                                 ForEach(GuestImage.allCases) { image in
@@ -89,9 +96,11 @@ struct VMEditorView: View {
                             }
                         }
                     case .x86:
-                        isoPickerRows(buttonTitle: "ISO / イメージファイルを選ぶ")
+                        imageSourceRows(sampleButtonTitle: "ISO / イメージファイルを選ぶ")
                     case .arm:
                         LabeledContent("ゲスト", value: "ArmDemoOS")
+                    case .arm64:
+                        LabeledContent("ゲスト", value: "Arm64DemoOS")
                     }
                 } header: {
                     Text("基本情報")
@@ -122,6 +131,12 @@ struct VMEditorView: View {
                             .foregroundStyle(.secondary)
                             .font(.footnote)
                     }
+                }
+            }
+            .onChange(of: architecture) { _, newArchitecture in
+                // アーキテクチャを変えたら、サンプル選択をそのアーキテクチャのものへ合わせる
+                if sampleSelection.architecture != newArchitecture {
+                    sampleSelection = BuiltInSample.samples(for: newArchitecture).first ?? .kernel
                 }
             }
             .fileImporter(
@@ -165,17 +180,41 @@ struct VMEditorView: View {
         }
     }
 
+    /// イメージの入手方法（ファイル / 内蔵サンプル）の選択行。
+    @ViewBuilder
+    private func imageSourceRows(sampleButtonTitle: String) -> some View {
+        Picker("イメージの場所", selection: $useSample) {
+            Text("ファイル").tag(false)
+            Text("内蔵サンプル").tag(true)
+        }
+        if useSample {
+            Picker("サンプル", selection: $sampleSelection) {
+                ForEach(BuiltInSample.samples(for: architecture)) { sample in
+                    Label(sample.displayName, systemImage: sample.systemImage)
+                        .tag(sample)
+                }
+            }
+            Text(sampleSelection.detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } else {
+            isoPickerRows(buttonTitle: sampleButtonTitle)
+        }
+    }
+
     private var footerText: String {
         switch architecture {
         case .riscv:
             if useISO {
-                return "ISO 9660 イメージのルート直下にある BOOT.BIN（RISC-V フラットバイナリ）を起動します。試作用のサンプル ISO は GitHub Releases から入手できます。"
+                return "ISO 9660 イメージのルート直下にある BOOT.BIN（RISC-V フラットバイナリ）を起動します。内蔵サンプル ISO も選べます。"
             }
             return "ゲストイメージは、起動時にエミュレータへ読み込む OS です。\(guestImage.displayName): \(guestImage.detail)"
         case .x86:
-            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。Multiboot 対応カーネル（ELF32 ファイル、または ISO 内の KERNEL.ELF）は 32 ビット プロテクトモードで直接起動でき、64 ビット ロングモードへの移行も可能です。UEFI アプリケーション（.efi、PE32+ / x86-64）は最小 UEFI ファームウェアで起動します。割り込みコントローラ（PIC / APIC）、タイマ（PIT）、PCI、IDE ディスク、キーボード、RTC、ACPI テーブルなどの周辺デバイスも再現しています。試作用のサンプルは GitHub Releases から入手できます。"
+            return "内蔵 BIOS が El Torito 対応 ISO（またはブートセクタ付き raw イメージ）からブートセクタを読み込んで実行します。Multiboot 対応カーネル（ELF32 ファイル、または ISO 内の KERNEL.ELF）は 32 ビット プロテクトモードで直接起動でき、64 ビット ロングモードへの移行も可能です。UEFI アプリケーション（.efi、PE32+ / x86-64）は最小 UEFI ファームウェアで起動します。割り込みコントローラ（PIC / APIC）、タイマ（PIT）、PCI、IDE ディスク、キーボード、RTC、ACPI テーブルなどの周辺デバイスも再現しています。試作用のサンプルはアプリに内蔵されています。"
         case .arm:
             return "ARMv7-A エミュレータ上で、内蔵のデモゲスト「ArmDemoOS」が動きます（fact で 12! の計算、echo、help が使えます）。"
+        case .arm64:
+            return "AArch64 エミュレータ（EL0 / EL1 + MMU）上で、内蔵のデモゲスト「Arm64DemoOS」が動きます。Apple Silicon Mac のエミュレーション（Henge 方式）の基盤です。"
         }
     }
 
@@ -220,18 +259,27 @@ struct VMEditorView: View {
     private func save() {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveUseISO = architecture == .x86 ? true : useISO
+        // 内蔵サンプル使用時はファイル参照を外す（旧ファイルは後段で片付ける）
+        let sampleApplies = useSample && sampleSelection.architecture == architecture
+            && (architecture == .x86 || (architecture == .riscv && useISO))
+        let effectiveBuiltInSample: BuiltInSample? = sampleApplies ? sampleSelection : nil
         let effectiveISOFileName: String?
         let effectiveISODisplayName: String?
-        switch architecture {
-        case .riscv:
-            effectiveISOFileName = useISO ? isoFileName : editing?.configuration.isoFileName
-            effectiveISODisplayName = useISO ? isoDisplayName : editing?.configuration.isoDisplayName
-        case .x86:
-            effectiveISOFileName = isoFileName
-            effectiveISODisplayName = isoDisplayName
-        case .arm:
-            effectiveISOFileName = editing?.configuration.isoFileName
-            effectiveISODisplayName = editing?.configuration.isoDisplayName
+        if sampleApplies {
+            effectiveISOFileName = nil
+            effectiveISODisplayName = nil
+        } else {
+            switch architecture {
+            case .riscv:
+                effectiveISOFileName = useISO ? isoFileName : editing?.configuration.isoFileName
+                effectiveISODisplayName = useISO ? isoDisplayName : editing?.configuration.isoDisplayName
+            case .x86:
+                effectiveISOFileName = isoFileName
+                effectiveISODisplayName = isoDisplayName
+            case .arm, .arm64:
+                effectiveISOFileName = editing?.configuration.isoFileName
+                effectiveISODisplayName = editing?.configuration.isoDisplayName
+            }
         }
         let configuration = VMConfiguration(
             cpuCount: cpuCount,
@@ -243,6 +291,7 @@ struct VMEditorView: View {
             useISO: effectiveUseISO,
             isoFileName: effectiveISOFileName,
             isoDisplayName: effectiveISODisplayName,
+            builtInSample: effectiveBuiltInSample,
             networkEnabled: networkEnabled,
             sharedFolderEnabled: sharedFolderEnabled
         )

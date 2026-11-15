@@ -178,17 +178,29 @@ struct VMDetailView: View {
             LabeledContent("CPU アーキテクチャ", value: "\(vm.configuration.architecture.label)（\(vm.configuration.architecture.detail)）")
             switch vm.configuration.architecture {
             case .riscv:
-                LabeledContent("起動方法", value: vm.configuration.useISO ? "ISO ファイル" : "ゲストイメージ")
-                if vm.configuration.useISO {
-                    LabeledContent("ISO", value: vm.configuration.isoDisplayName ?? "未選択")
+                if let sample = vm.configuration.builtInSample {
+                    LabeledContent("起動方法", value: "内蔵サンプル")
+                    LabeledContent("サンプル", value: sample.displayName)
                 } else {
-                    LabeledContent("ゲストイメージ", value: vm.configuration.guestImage.displayName)
+                    LabeledContent("起動方法", value: vm.configuration.useISO ? "ISO ファイル" : "ゲストイメージ")
+                    if vm.configuration.useISO {
+                        LabeledContent("ISO", value: vm.configuration.isoDisplayName ?? "未選択")
+                    } else {
+                        LabeledContent("ゲストイメージ", value: vm.configuration.guestImage.displayName)
+                    }
                 }
             case .x86:
-                LabeledContent("起動方法", value: "BIOS / Multiboot（ISO・イメージ・ELF）")
-                LabeledContent("イメージ", value: vm.configuration.isoDisplayName ?? "未選択")
+                if let sample = vm.configuration.builtInSample {
+                    LabeledContent("起動方法", value: "内蔵サンプル")
+                    LabeledContent("サンプル", value: sample.displayName)
+                } else {
+                    LabeledContent("起動方法", value: "BIOS / Multiboot（ISO・イメージ・ELF）")
+                    LabeledContent("イメージ", value: vm.configuration.isoDisplayName ?? "未選択")
+                }
             case .arm:
                 LabeledContent("ゲスト", value: "ArmDemoOS")
+            case .arm64:
+                LabeledContent("ゲスト", value: "Arm64DemoOS")
             }
             LabeledContent("CPU", value: "\(vm.configuration.cpuCount) コア")
             LabeledContent("メモリ", value: vm.configuration.memoryText)
