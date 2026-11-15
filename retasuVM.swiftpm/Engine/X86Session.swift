@@ -35,9 +35,21 @@ final class X86Session: GuestSession {
         }
     }
 
-    /// イメージ（ISO / raw）から BIOS ブートして実行を開始する。
+    /// イメージから起動して実行を開始する。
+    ///
+    /// Multiboot カーネル（ELF32 ファイルそのもの、または ISO のルートに
+    /// 置かれた KERNEL.ELF）は Multiboot ローダで、それ以外は BIOS
+    /// ブート（El Torito / raw イメージ）で起動する。
     func boot(imageData: [UInt8]) throws {
-        try bios.boot(imageData: imageData)
+        if Multiboot.isMultibootKernel(imageData) {
+            try Multiboot.boot(cpu: cpu, imageData: imageData)
+        } else if let iso = try? ISO9660Image(data: imageData),
+                  let kernel = iso.file(named: "KERNEL.ELF"),
+                  Multiboot.isMultibootKernel(kernel) {
+            try Multiboot.boot(cpu: cpu, imageData: kernel)
+        } else {
+            try bios.boot(imageData: imageData)
+        }
         runTask = Task { [weak self] in
             await self?.runLoop()
         }

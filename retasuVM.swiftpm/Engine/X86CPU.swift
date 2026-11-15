@@ -6,6 +6,7 @@ enum X86Fault: Error, CustomStringConvertible, LocalizedError {
     case memoryOutOfBounds(address: UInt32)
     case divideError(address: UInt32)
     case noInterruptHandler(UInt8)
+    case exceptionUndeliverable(UInt8)
 
     var errorDescription: String? { description }
 
@@ -21,19 +22,24 @@ enum X86Fault: Error, CustomStringConvertible, LocalizedError {
             return String(format: "x86: ゼロ除算または商オーバーフロー（アドレス 0x%05X）", address)
         case .noInterruptHandler(let vector):
             return String(format: "x86: BIOS が接続されていない割り込み INT %02Xh", vector)
+        case .exceptionUndeliverable(let vector):
+            return String(format: "x86: 例外 %02Xh を配送できませんでした（IDT 未設定）", vector)
         }
     }
 }
 
-/// 自作の x86 CPU エミュレータ（16 ビット リアルモード）。
+/// 自作の x86 CPU エミュレータ（リアルモード + 32 ビット プロテクトモード）。
 ///
 /// BIOS ブートしたゲスト（ブートセクタ、El Torito 対応 ISO の起動コード、
-/// リアルモードで動作する小さな OS）を実行するための命令サブセットを実装する。
-/// 割り込み（INT 命令）はホスト側の BIOS サービス（`X86BIOS`）へ委譲する。
-/// シリアルポート（COM1: 0x3F8）はコンソールへ接続されている。
+/// リアルモードで動作する小さな OS）に加え、GDT / IDT を使う 32 ビット
+/// プロテクトモードのコード（ページング、例外配送、Multiboot カーネル）を
+/// 実行できる。リアルモードの割り込み（INT 命令）はホスト側の BIOS
+/// サービス（`X86BIOS`）へ委譲し、プロテクトモードでは IDT のゲートを
+/// 使う。シリアルポート（COM1: 0x3F8）はコンソールへ接続されている。
 ///
-/// 対象外: プロテクトモード / ロングモード、0x67 アドレスサイズ prefix、
-/// 浮動小数点。これらに当たると `X86Fault` で停止する。
+/// 対象外: ロングモード、タスクスイッチ（TSS 切り替え）、ユーザーモード
+/// （特権レベルはリング 0 のみ）、浮動小数点。これらに当たると
+/// `X86Fault` で停止する。
 final class X86CPU {
     /// レジスタ番号（x86 エンコーディング順）: 0=EAX 1=ECX 2=EDX 3=EBX 4=ESP 5=EBP 6=ESI 7=EDI
     private(set) var registers: [UInt32] = [UInt32](repeating: 0, count: 8)
@@ -61,6 +67,40 @@ final class X86CPU {
     var interruptHandler: ((UInt8) -> InterruptOutcome)?
 
     private var inputQueue: [UInt8] = []
+
+    // MARK: プロテクトモード状態
+
+    /// セグメントディスクリプタの隠しキャッシュ（base / limit / 属性）。
+    struct SegmentCache {
+        var base: UInt32 = 0
+        var limit: UInt32 = 0xFFFF
+        /// コードセグメントなら既定オペランドサイズ、データならスタック幅（B ビット）。
+        var defaultSize32 = false
+        var present = true
+        var isCode = false
+        var isExpandDown = false
+        var permitsRead = true
+        var permitsWrite = true
+    }
+
+    /// コントロールレジスタ（CR0 / CR2 / CR3 / CR4 を使用）。
+    private(set) var controlRegisters: [UInt32] = [UInt32](repeating: 0, count: 8)
+    private var gdtrBase: UInt32 = 0
+    private var gdtrLimit: UInt16 = 0
+    private var idtrBase: UInt32 = 0
+    private var idtrLimit: UInt16 = 0xFFFF
+    private var ldtrSelector: UInt16 = 0
+    private var ldtrCache = SegmentCache()
+    private var taskRegister: UInt16 = 0
+    private(set) var segmentCaches: [SegmentCache] = [SegmentCache](repeating: SegmentCache(), count: 6)
+
+    var protectedMode: Bool { controlRegisters[0] & 0x00000001 != 0 }
+    var pagingEnabled: Bool { protectedMode && controlRegisters[0] & 0x80000000 != 0 }
+
+    /// CPU 内部で発生した例外（IDT へ配送するため step 内で捕捉する）。
+    private enum CPUTrap: Error {
+        case exception(vector: UInt8, errorCode: UInt32?)
+    }
 
     // フラグビット
     static let flagCarry: UInt32 = 0x0001
@@ -94,8 +134,46 @@ final class X86CPU {
         halted = false
         exitCode = 0
         waitingForInput = false
+        controlRegisters = [UInt32](repeating: 0, count: 8)
+        gdtrBase = 0
+        gdtrLimit = 0
+        idtrBase = 0
+        idtrLimit = 0xFFFF
+        ldtrSelector = 0
+        ldtrCache = SegmentCache()
+        taskRegister = 0
+        segmentCaches = [SegmentCache](repeating: SegmentCache(), count: 6)
         setRegister16(4, 0x7C00) // SP
         setRegister8(2, bootDrive) // DL = ブートドライブ
+    }
+
+    /// Multiboot 仕様の初期状態にする（フラット GDT を用意し、プロテクト
+    /// モードでカーネルのエントリへ入る）。`Multiboot` ローダから使う。
+    func prepareMultibootEntry(entry: UInt32, infoAddress: UInt32, stackTop: UInt32) {
+        resetForBoot(bootDrive: 0)
+        // GDT を 0x0800 に置く: null / コード (0x08) / データ (0x10)、いずれも base 0・limit 4 GiB
+        var gdt = [UInt8](repeating: 0, count: 24)
+        let code: [UInt8] = [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00]
+        let data: [UInt8] = [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]
+        gdt.replaceSubrange(8..<16, with: code)
+        gdt.replaceSubrange(16..<24, with: data)
+        loadData(gdt, at: 0x0800)
+        gdtrBase = 0x0800
+        gdtrLimit = 23
+        controlRegisters[0] = 0x00000011 // PE + ET（ページング無効）
+        let flatCode = SegmentCache(base: 0, limit: 0xFFFFFFFF, defaultSize32: true, present: true, isCode: true, isExpandDown: false, permitsRead: true, permitsWrite: false)
+        let flatData = SegmentCache(base: 0, limit: 0xFFFFFFFF, defaultSize32: true, present: true, isCode: false, isExpandDown: false, permitsRead: true, permitsWrite: true)
+        segments[1] = 0x08
+        segmentCaches[1] = flatCode
+        for index in [0, 2, 3, 4, 5] {
+            segments[index] = 0x10
+            segmentCaches[index] = flatData
+        }
+        instructionPointer = entry
+        registers[4] = stackTop // ESP
+        registers[0] = 0x2BADB002 // EAX: Multiboot マジック
+        registers[3] = infoAddress // EBX: Multiboot 情報構造体
+        flags = 0x0002 // 割り込み無効
     }
 
     /// ゲストを停止させる（BIOS のブート失敗・電源断に相当）。
@@ -154,9 +232,109 @@ final class X86CPU {
     }
 
     func segment(_ index: Int) -> UInt16 { segments[index] }
-    func setSegment(_ index: Int, _ value: UInt16) { segments[index] = value }
-    func setInstructionPointer(_ value: UInt32) { instructionPointer = value & 0xFFFF }
+
+    /// ホスト（BIOS）からのセグメント設定。リアルモード前提で、隠し
+    /// キャッシュも実モードの値（base = 値 × 16、limit = 64 KiB）に保つ。
+    func setSegment(_ index: Int, _ value: UInt16) {
+        segments[index] = value
+        if !protectedMode {
+            segmentCaches[index] = SegmentCache(base: UInt32(value) << 4, limit: 0xFFFF, defaultSize32: false, present: true, isCode: index == 1, isExpandDown: false, permitsRead: true, permitsWrite: true)
+        }
+    }
+
+    func setInstructionPointer(_ value: UInt32) { instructionPointer = value }
     func setFlags(_ value: UInt32) { flags = value | 0x0002 }
+
+    /// 現在の CS に適用される IP のマスク（32 ビット CS なら全幅）。
+    var ipMask: UInt32 { segmentCaches[1].defaultSize32 ? 0xFFFFFFFF : 0xFFFF }
+
+    // MARK: - ディスクリプタ
+
+    /// GDT / LDT からディスクリプタを読み、検証済みキャッシュへ変換する。
+    private func descriptorCache(selector: UInt16) throws -> SegmentCache {
+        let tableBase: UInt32
+        let tableLimit: UInt32
+        if selector & 0x0004 != 0 {
+            tableBase = ldtrCache.base
+            tableLimit = ldtrCache.limit
+        } else {
+            tableBase = gdtrBase
+            tableLimit = UInt32(gdtrLimit)
+        }
+        let offset = UInt32(selector & 0xFFF8)
+        guard offset + 7 <= tableLimit else {
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        let address = Int(tableBase + offset)
+        let low = try readMemory(at: address, size: 4)
+        let high = try readMemory(at: address + 4, size: 4)
+        let limitLow = low & 0xFFFF
+        let baseLow = (low >> 16) & 0xFFFF
+        let baseMiddle = high & 0xFF
+        let access = (high >> 8) & 0xFF
+        let limitHigh = (high >> 16) & 0x0F
+        let granularity = (high >> 20) & 0x0F
+        let baseHigh = (high >> 24) & 0xFF
+        var limit = (limitHigh << 16) | limitLow
+        if granularity & 0x8 != 0 { limit = (limit << 12) | 0xFFF } // G ビット: 4 KiB 単位
+        let base = baseLow | (baseMiddle << 16) | (baseHigh << 24)
+        let isSystem = access & 0x10 == 0
+        let type = access & 0x0F
+        return SegmentCache(
+            base: base,
+            limit: limit,
+            defaultSize32: granularity & 0x4 != 0,
+            present: access & 0x80 != 0,
+            isCode: !isSystem && type & 0x8 != 0,
+            isExpandDown: !isSystem && type & 0x8 == 0 && type & 0x4 != 0,
+            permitsRead: isSystem ? false : (type & 0x8 == 0 || type & 0x2 != 0),
+            permitsWrite: isSystem ? false : (type & 0x8 == 0 && type & 0x2 != 0)
+        )
+    }
+
+    /// ゲスト命令によるセグメントレジスタのロード。プロテクトモードでは
+    /// ディスクリプタを検証する（CS は far 転送専用のためここでは扱わない）。
+    func loadSegmentRegister(_ index: Int, _ selector: UInt16) throws {
+        guard protectedMode else {
+            setSegment(index, selector)
+            return
+        }
+        if selector & 0xFFF8 == 0 {
+            // NULL セレクタ: DS / ES / FS / GS は使用不可としてマークする
+            if index == 1 || index == 2 {
+                throw CPUTrap.exception(vector: 13, errorCode: 0)
+            }
+            segments[index] = selector
+            segmentCaches[index] = SegmentCache(base: 0, limit: 0, defaultSize32: false, present: false, isCode: false, isExpandDown: false, permitsRead: false, permitsWrite: false)
+            return
+        }
+        let cache = try descriptorCache(selector: selector)
+        guard cache.present, !cache.isCode || cache.permitsRead else {
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        if index == 2 && (cache.isCode || !cache.permitsWrite) {
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        segments[index] = selector
+        segmentCaches[index] = cache
+    }
+
+    /// far ジャンプ / コール / リターンで CS をロードする。
+    func loadCodeSegment(_ selector: UInt16) throws {
+        guard protectedMode else {
+            setSegment(1, selector)
+            return
+        }
+        guard selector & 0xFFF8 != 0 else {
+            throw CPUTrap.exception(vector: 13, errorCode: 0)
+        }
+        let cache = try descriptorCache(selector: selector)
+        guard cache.present, cache.isCode else {
+            throw CPUTrap.exception(vector: 13, errorCode: UInt32(selector & 0xFFFC))
+        }
+        segments[1] = selector
+        segmentCaches[1] = cache
+    }
 
     func flag(_ bit: UInt32) -> Bool { flags & bit != 0 }
     func setFlag(_ bit: UInt32, _ on: Bool) {
@@ -197,13 +375,112 @@ final class X86CPU {
         }
     }
 
+    // MARK: - ゲストメモリアクセス（セグメント変換 + ページング）
+
+    /// セグメントキャッシュ経由のリニアアドレスを求める。
+    func linearAddress(segmentIndex: Int, offset: UInt32) -> UInt32 {
+        segmentCaches[segmentIndex].base &+ offset
+    }
+
+    /// プロテクトモード時のセグメント範囲・権限チェック。
+    private func checkSegmentAccess(_ segmentIndex: Int, offset: UInt32, size: Int, isWrite: Bool) throws {
+        guard protectedMode else { return }
+        let cache = segmentCaches[segmentIndex]
+        let errorCode = UInt32(segments[segmentIndex] & 0xFFFC)
+        guard cache.present else { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
+        if isWrite && !cache.permitsWrite { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
+        if !isWrite && !cache.permitsRead && !cache.isCode { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
+        let last = offset &+ UInt32(size - 1)
+        if cache.isExpandDown {
+            let floor = cache.limit &+ 1
+            let ceiling: UInt32 = cache.defaultSize32 ? 0xFFFFFFFF : 0xFFFF
+            if offset < floor || last > ceiling { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
+        } else if last > cache.limit {
+            throw CPUTrap.exception(vector: 13, errorCode: errorCode)
+        }
+    }
+
+    /// ページング変換（線形 → 物理）。ページ不在などは #PF を送出する。
+    private func translate(linear: UInt32, isWrite: Bool, isFetch: Bool) throws -> Int {
+        guard pagingEnabled else {
+            guard linear < memory.count else { throw X86Fault.memoryOutOfBounds(address: linear) }
+            return Int(linear)
+        }
+        let directoryBase = controlRegisters[3] & 0xFFFFF000
+        let directoryIndex = (linear >> 22) & 0x3FF
+        let pdeAddress = Int(directoryBase + directoryIndex * 4)
+        var pde = try readMemory(at: pdeAddress, size: 4)
+        func pageFault(present: Bool) -> CPUTrap {
+            controlRegisters[2] = linear
+            var code: UInt32 = 0
+            if present { code |= 0x01 }
+            if isWrite { code |= 0x02 }
+            if isFetch { code |= 0x10 }
+            return .exception(vector: 14, errorCode: code)
+        }
+        guard pde & 1 != 0 else { throw pageFault(present: false) }
+        if pde & 0x80 != 0 {
+            // 4 MiB ページ（PSE）
+            if pde & 0x20 == 0 || (isWrite && pde & 0x40 == 0) {
+                pde |= 0x20
+                if isWrite { pde |= 0x40 }
+                try writeMemory(at: pdeAddress, size: 4, pde)
+            }
+            let physical = Int((pde & 0xFFC00000) | (linear & 0x3FFFFF))
+            guard physical < memory.count else { throw X86Fault.memoryOutOfBounds(address: linear) }
+            return physical
+        }
+        let tableIndex = (linear >> 12) & 0x3FF
+        let pteAddress = Int((pde & 0xFFFFF000) + tableIndex * 4)
+        var pte = try readMemory(at: pteAddress, size: 4)
+        guard pte & 1 != 0 else { throw pageFault(present: false) }
+        if pde & 0x20 == 0 {
+            try writeMemory(at: pdeAddress, size: 4, pde | 0x20)
+        }
+        if pte & 0x20 == 0 || (isWrite && pte & 0x40 == 0) {
+            pte |= 0x20
+            if isWrite { pte |= 0x40 }
+            try writeMemory(at: pteAddress, size: 4, pte)
+        }
+        let physical = Int((pte & 0xFFFFF000) | (linear & 0xFFF))
+        guard physical < memory.count else { throw X86Fault.memoryOutOfBounds(address: linear) }
+        return physical
+    }
+
+    /// ゲストのデータ読み取り（セグメント + ページング適用）。
+    func readGuest(segmentIndex: Int, offset: UInt32, size: Int) throws -> UInt32 {
+        try checkSegmentAccess(segmentIndex, offset: offset, size: size, isWrite: false)
+        var value: UInt32 = 0
+        for i in 0..<size {
+            let physical = try translate(linear: linearAddress(segmentIndex: segmentIndex, offset: offset &+ UInt32(i)), isWrite: false, isFetch: false)
+            value |= UInt32(memory[physical]) << (8 * i)
+        }
+        return value
+    }
+
+    /// ゲストのデータ書き込み（セグメント + ページング適用）。
+    func writeGuest(segmentIndex: Int, offset: UInt32, size: Int, _ value: UInt32) throws {
+        try checkSegmentAccess(segmentIndex, offset: offset, size: size, isWrite: true)
+        for i in 0..<size {
+            let physical = try translate(linear: linearAddress(segmentIndex: segmentIndex, offset: offset &+ UInt32(i)), isWrite: true, isFetch: false)
+            memory[physical] = UInt8((value >> (8 * i)) & 0xFF)
+        }
+    }
+
+    /// 物理メモリの直接読み取り（ページテーブル走査・ホスト処理用）。
+    func readPhysical(at address: Int, size: Int) throws -> UInt32 {
+        try readMemory(at: address, size: size)
+    }
+
     // MARK: - フェッチ
 
-    private var fetchSegment: UInt16 { segments[1] } // CS
-
     private func fetch8() throws -> UInt8 {
-        let value = try readMemory8(at: physicalAddress(segment: fetchSegment, offset: instructionPointer))
-        instructionPointer = (instructionPointer + 1) & 0xFFFF
+        if protectedMode && instructionPointer > segmentCaches[1].limit {
+            throw CPUTrap.exception(vector: 13, errorCode: 0)
+        }
+        let physical = try translate(linear: linearAddress(segmentIndex: 1, offset: instructionPointer), isWrite: false, isFetch: true)
+        let value = memory[physical]
+        instructionPointer = (instructionPointer + 1) & ipMask
         return value
     }
 
@@ -224,26 +501,29 @@ final class X86CPU {
     // MARK: - デコード補助
 
     private var decodeOperandSize = 2
+    private var decodeAddressSize = 2
     private var decodeSegmentOverride: Int?
 
     private struct ModRM {
         var reg: Int
         var isRegister: Bool
         var registerIndex: Int
-        var physicalAddress: Int
         var segmentIndex: Int
         /// セグメント内のオフセット（LEA 用）
         var effectiveOffset: UInt32
     }
 
-    /// ModR/M バイトを読み、実効アドレス（物理アドレス）を解決する。
+    /// ModR/M バイトを読み、実効アドレス（セグメント内オフセット）を解決する。
     private func decodeModRM() throws -> ModRM {
         let byte = try fetch8()
         let mod = Int(byte >> 6)
         let reg = Int((byte >> 3) & 7)
         let rm = Int(byte & 7)
         if mod == 3 {
-            return ModRM(reg: reg, isRegister: true, registerIndex: rm, physicalAddress: 0, segmentIndex: 3, effectiveOffset: 0)
+            return ModRM(reg: reg, isRegister: true, registerIndex: rm, segmentIndex: 3, effectiveOffset: 0)
+        }
+        if decodeAddressSize == 4 {
+            return try decodeModRM32(mod: mod, reg: reg, rm: rm)
         }
         var offset: UInt32 = 0
         var defaultSegment = 3 // DS
@@ -271,15 +551,49 @@ final class X86CPU {
             offset = (offset &+ UInt32(bitPattern: Int32(displacement))) & 0xFFFF
         }
         let segmentIndex = decodeSegmentOverride ?? defaultSegment
-        let address = physicalAddress(segment: segments[segmentIndex], offset: offset)
-        return ModRM(reg: reg, isRegister: false, registerIndex: rm, physicalAddress: address, segmentIndex: segmentIndex, effectiveOffset: offset)
+        return ModRM(reg: reg, isRegister: false, registerIndex: rm, segmentIndex: segmentIndex, effectiveOffset: offset)
+    }
+
+    /// 32 ビットアドレッシングの ModR/M（SIB バイト対応）。
+    private func decodeModRM32(mod: Int, reg: Int, rm: Int) throws -> ModRM {
+        var offset: UInt32 = 0
+        var defaultSegment = 3 // DS
+        if rm == 4 {
+            // SIB バイト
+            let sib = try fetch8()
+            let scale = Int(sib >> 6)
+            let index = Int((sib >> 3) & 7)
+            let base = Int(sib & 7)
+            if index != 4 {
+                offset = offset &+ (registers[index] &<< scale)
+            }
+            if base == 5 && mod == 0 {
+                offset = offset &+ (try fetch32())
+            } else {
+                offset = offset &+ registers[base]
+                if base == 5 { defaultSegment = 2 } // EBP ベースは SS
+            }
+        } else if rm == 5 && mod == 0 {
+            offset = try fetch32()
+        } else {
+            offset = registers[rm]
+            if rm == 5 { defaultSegment = 2 } // EBP は SS
+        }
+        if mod == 1 {
+            let displacement = Int8(bitPattern: try fetch8())
+            offset = offset &+ UInt32(bitPattern: Int32(displacement))
+        } else if mod == 2 {
+            offset = offset &+ (try fetch32())
+        }
+        let segmentIndex = decodeSegmentOverride ?? defaultSegment
+        return ModRM(reg: reg, isRegister: false, registerIndex: rm, segmentIndex: segmentIndex, effectiveOffset: offset)
     }
 
     private func readOperand(_ operand: ModRM, size: Int) throws -> UInt32 {
         if operand.isRegister {
             return size == 1 ? UInt32(register8(operand.registerIndex)) : (size == 2 ? UInt32(register16(operand.registerIndex)) : register32(operand.registerIndex))
         }
-        return try readMemory(at: operand.physicalAddress, size: size)
+        return try readGuest(segmentIndex: operand.segmentIndex, offset: operand.effectiveOffset, size: size)
     }
 
     private func writeOperand(_ operand: ModRM, size: Int, _ value: UInt32) throws {
@@ -288,7 +602,7 @@ final class X86CPU {
             else if size == 2 { setRegister16(operand.registerIndex, UInt16(value & 0xFFFF)) }
             else { setRegister32(operand.registerIndex, value) }
         } else {
-            try writeMemory(at: operand.physicalAddress, size: size, value)
+            try writeGuest(segmentIndex: operand.segmentIndex, offset: operand.effectiveOffset, size: size, value)
         }
     }
 
@@ -380,16 +694,29 @@ final class X86CPU {
 
     // MARK: - スタック
 
+    /// 現在のスタックポインタ（SS の B ビットが立っていれば ESP、全幅）。
+    private var stackPointer: UInt32 {
+        segmentCaches[2].defaultSize32 ? registers[4] : UInt32(register16(4))
+    }
+
+    private func setStackPointer(_ value: UInt32) {
+        if segmentCaches[2].defaultSize32 {
+            registers[4] = value
+        } else {
+            setRegister16(4, UInt16(value & 0xFFFF))
+        }
+    }
+
     private func push(_ value: UInt32, size: Int) throws {
-        let newSP = register16(4) &- UInt16(size)
-        setRegister16(4, newSP)
-        try writeMemory(at: physicalAddress(segment: segments[2], offset: UInt32(newSP)), size: size, value)
+        let newPointer = stackPointer &- UInt32(size)
+        setStackPointer(newPointer)
+        try writeGuest(segmentIndex: 2, offset: newPointer, size: size, value)
     }
 
     private func pop(size: Int) throws -> UInt32 {
-        let sp = register16(4)
-        let value = try readMemory(at: physicalAddress(segment: segments[2], offset: UInt32(sp)), size: size)
-        setRegister16(4, sp &+ UInt16(size))
+        let pointer = stackPointer
+        let value = try readGuest(segmentIndex: 2, offset: pointer, size: size)
+        setStackPointer(pointer &+ UInt32(size))
         return value
     }
 
@@ -491,17 +818,34 @@ final class X86CPU {
         return result
     }
 
-    /// 1 命令を実行する。
+    /// 1 命令を実行する。プロテクトモードで例外が発生したら IDT へ配送する。
     private func step() throws {
         let startIP = instructionPointer
-        var operandSize = 2
+        do {
+            try stepDecode(startIP: startIP)
+        } catch let trap as CPUTrap {
+            switch trap {
+            case .exception(let vector, let errorCode):
+                do {
+                    try dispatchGate(vector: vector, errorCode: errorCode, returnIP: startIP)
+                } catch is CPUTrap {
+                    throw X86Fault.exceptionUndeliverable(vector)
+                }
+            }
+        }
+    }
+
+    private func stepDecode(startIP: UInt32) throws {
+        let defaultSize = segmentCaches[1].defaultSize32 ? 4 : 2
+        var operandSize = defaultSize
+        var addressSize = defaultSize
         var segmentOverride: Int?
         var repeatPrefix: UInt8 = 0
         while true {
             let byte = try fetch8()
             switch byte {
-            case 0x66: operandSize = 4
-            case 0x67: throw X86Fault.unsupportedPrefix(address: UInt32(physicalAddress(segment: segments[1], offset: startIP)))
+            case 0x66: operandSize = operandSize == 2 ? 4 : 2
+            case 0x67: addressSize = addressSize == 2 ? 4 : 2
             case 0x26: segmentOverride = 0
             case 0x2E: segmentOverride = 1
             case 0x36: segmentOverride = 2
@@ -513,6 +857,7 @@ final class X86CPU {
             case 0xF0: continue
             default:
                 decodeOperandSize = operandSize
+                decodeAddressSize = addressSize
                 decodeSegmentOverride = segmentOverride
                 try execute(opcode: byte, operandSize: operandSize, repeatPrefix: repeatPrefix, startIP: startIP)
                 return
@@ -520,19 +865,52 @@ final class X86CPU {
         }
     }
 
+    /// IDT ゲート経由で割り込み / 例外を配送する（プロテクトモード用）。
+    private func dispatchGate(vector: UInt8, errorCode: UInt32?, returnIP: UInt32) throws {
+        let entryOffset = UInt32(vector) * 8
+        guard entryOffset + 7 <= UInt32(idtrLimit) else {
+            throw X86Fault.exceptionUndeliverable(vector)
+        }
+        let address = Int(idtrBase + entryOffset)
+        let low = try readMemory(at: address, size: 4)
+        let high = try readMemory(at: address + 4, size: 4)
+        let access = (high >> 8) & 0xFF
+        let gateType = access & 0x1F
+        guard access & 0x80 != 0, gateType == 0xE || gateType == 0xF || gateType == 0x6 || gateType == 0x7 else {
+            throw X86Fault.exceptionUndeliverable(vector)
+        }
+        let selector = UInt16((low >> 16) & 0xFFFF)
+        let is32BitGate = gateType == 0xE || gateType == 0xF
+        let offset: UInt32 = is32BitGate ? ((high & 0xFFFF0000) | (low & 0xFFFF)) : (low & 0xFFFF)
+        let size = is32BitGate ? 4 : 2
+        let savedFlags = flags
+        let savedCS = segments[1]
+        try loadCodeSegment(selector)
+        try push(savedFlags, size: size)
+        try push(UInt32(savedCS), size: size)
+        try push(returnIP, size: size)
+        if let errorCode {
+            try push(errorCode, size: size)
+        }
+        if gateType == 0xE || gateType == 0x6 {
+            setFlag(Self.flagInterrupt, false)
+        }
+        instructionPointer = offset & ipMask
+    }
+
     private func execute(opcode: UInt8, operandSize: Int, repeatPrefix: UInt8, startIP: UInt32) throws {
-        let address = UInt32(physicalAddress(segment: segments[1], offset: startIP))
+        let address = linearAddress(segmentIndex: 1, offset: startIP)
 
         // ALU グリッド（0x00〜0x3D）とセグメント push/pop、BCD 補正
         if opcode <= 0x3D {
             switch opcode {
             case 0x06: try push(UInt32(segments[0]), size: operandSize); return
-            case 0x07: setSegment(0, UInt16(try pop(size: operandSize) & 0xFFFF)); return
+            case 0x07: try loadSegmentRegister(0, UInt16(try pop(size: operandSize) & 0xFFFF)); return
             case 0x0E: try push(UInt32(segments[1]), size: operandSize); return
             case 0x16: try push(UInt32(segments[2]), size: operandSize); return
-            case 0x17: setSegment(2, UInt16(try pop(size: operandSize) & 0xFFFF)); return
+            case 0x17: try loadSegmentRegister(2, UInt16(try pop(size: operandSize) & 0xFFFF)); return
             case 0x1E: try push(UInt32(segments[3]), size: operandSize); return
-            case 0x1F: setSegment(3, UInt16(try pop(size: operandSize) & 0xFFFF)); return
+            case 0x1F: try loadSegmentRegister(3, UInt16(try pop(size: operandSize) & 0xFFFF)); return
             case 0x27, 0x2F, 0x37, 0x3F: executeBCDAdjust(opcode); return
             default: break
             }
@@ -562,15 +940,28 @@ final class X86CPU {
             let index = Int(opcode - 0x58)
             let value = try pop(size: operandSize)
             if operandSize == 2 { setRegister16(index, UInt16(value & 0xFFFF)) } else { setRegister32(index, value) }
-        case 0x60: // PUSHA
-            let savedSP = register16(4)
-            for index in [0, 1, 2, 3] { try push(UInt32(register16(index)), size: 2) }
-            try push(UInt32(savedSP), size: 2)
-            for index in [5, 6, 7] { try push(UInt32(register16(index)), size: 2) }
-        case 0x61: // POPA
-            for index in [7, 6, 5] { setRegister16(index, UInt16(try pop(size: 2) & 0xFFFF)) }
-            _ = try pop(size: 2)
-            for index in [3, 2, 1, 0] { setRegister16(index, UInt16(try pop(size: 2) & 0xFFFF)) }
+        case 0x60: // PUSHA / PUSHAD
+            if operandSize == 4 {
+                let savedSP = registers[4]
+                for index in [0, 1, 2, 3] { try push(registers[index], size: 4) }
+                try push(savedSP, size: 4)
+                for index in [5, 6, 7] { try push(registers[index], size: 4) }
+            } else {
+                let savedSP = register16(4)
+                for index in [0, 1, 2, 3] { try push(UInt32(register16(index)), size: 2) }
+                try push(UInt32(savedSP), size: 2)
+                for index in [5, 6, 7] { try push(UInt32(register16(index)), size: 2) }
+            }
+        case 0x61: // POPA / POPAD
+            if operandSize == 4 {
+                for index in [7, 6, 5] { registers[index] = try pop(size: 4) }
+                _ = try pop(size: 4)
+                for index in [3, 2, 1, 0] { registers[index] = try pop(size: 4) }
+            } else {
+                for index in [7, 6, 5] { setRegister16(index, UInt16(try pop(size: 2) & 0xFFFF)) }
+                _ = try pop(size: 2)
+                for index in [3, 2, 1, 0] { setRegister16(index, UInt16(try pop(size: 2) & 0xFFFF)) }
+            }
         case 0x68: // PUSH imm
             try push(try fetchImmediate(operandSize), size: operandSize)
         case 0x6A: // PUSH imm8（符号拡張）
@@ -585,7 +976,7 @@ final class X86CPU {
         case 0x70...0x7F: // Jcc rel8
             let displacement = Int8(bitPattern: try fetch8())
             if condition(Int(opcode & 0x0F)) {
-                instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & 0xFFFF
+                instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & ipMask
             }
         case 0x80, 0x81, 0x82, 0x83: // グループ1（ALU + 即値）
             let size = opcode == 0x80 || opcode == 0x82 ? 1 : operandSize
@@ -638,7 +1029,7 @@ final class X86CPU {
             let modRM = try decodeModRM()
             guard modRM.reg != 1 else { throw X86Fault.unimplementedOpcode(opcode, address: address) }
             let value = try readOperand(modRM, size: 2)
-            setSegment(modRM.reg, UInt16(value & 0xFFFF))
+            try loadSegmentRegister(modRM.reg, UInt16(value & 0xFFFF))
         case 0x8F: // POP r/m
             let modRM = try decodeModRM()
             let value = try pop(size: operandSize)
@@ -668,30 +1059,33 @@ final class X86CPU {
             let newSegment = try fetch16()
             try push(UInt32(segments[1]), size: operandSize)
             try push(instructionPointer, size: operandSize)
-            setSegment(1, newSegment)
-            instructionPointer = offset & 0xFFFF
+            try loadCodeSegment(newSegment)
+            instructionPointer = offset & ipMask
         case 0x9C: // PUSHF
-            try push(flags & 0xFFFF, size: operandSize)
+            try push(operandSize == 2 ? flags & 0xFFFF : flags, size: operandSize)
         case 0x9D: // POPF
             let value = try pop(size: operandSize)
-            flags = (value & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
+            if operandSize == 2 {
+                flags = (value & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
+            } else {
+                flags = value | 0x0002
+            }
         case 0x9E: // SAHF
             flags = (flags & ~0xD5) | (UInt32(register8(4)) & 0xD5)
         case 0x9F: // LAHF
             setRegister8(4, UInt8((flags & 0xD5) | 0x02))
         case 0xA0, 0xA1, 0xA2, 0xA3: // MOV moffs
             let size = (opcode == 0xA0 || opcode == 0xA2) ? 1 : operandSize
-            let offset = UInt32(try fetch16())
+            let offset = decodeAddressSize == 4 ? try fetch32() : UInt32(try fetch16())
             let segmentIndex = decodeSegmentOverride ?? 3
-            let address = physicalAddress(segment: segments[segmentIndex], offset: offset)
             if opcode == 0xA0 || opcode == 0xA1 {
-                let value = try readMemory(at: address, size: size)
+                let value = try readGuest(segmentIndex: segmentIndex, offset: offset, size: size)
                 if size == 1 { setRegister8(0, UInt8(value & 0xFF)) }
                 else if size == 2 { setRegister16(0, UInt16(value & 0xFFFF)) }
                 else { setRegister32(0, value) }
             } else {
                 let value = size == 1 ? UInt32(register8(0)) : (size == 2 ? UInt32(register16(0)) : register32(0))
-                try writeMemory(at: address, size: size, value)
+                try writeGuest(segmentIndex: segmentIndex, offset: offset, size: size, value)
             }
         case 0xA4...0xA7, 0xAA...0xAF: // 文字列操作
             try executeStringOperation(opcode: opcode, operandSize: operandSize, repeatPrefix: repeatPrefix)
@@ -713,27 +1107,35 @@ final class X86CPU {
             try writeOperand(modRM, size: size, shift(modRM.reg, value, count, size: size))
         case 0xC2: // RET imm16
             let extra = try fetch16()
-            instructionPointer = try pop(size: operandSize) & 0xFFFF
-            setRegister16(4, register16(4) &+ extra)
+            instructionPointer = try pop(size: operandSize) & ipMask
+            setStackPointer(stackPointer &+ UInt32(extra))
         case 0xC3: // RET
-            instructionPointer = try pop(size: operandSize) & 0xFFFF
+            instructionPointer = try pop(size: operandSize) & ipMask
         case 0xC6, 0xC7: // MOV r/m, imm
             let size = opcode == 0xC6 ? 1 : operandSize
             let modRM = try decodeModRM()
             let value = try fetchImmediate(size)
             try writeOperand(modRM, size: size, value)
         case 0xC9: // LEAVE
-            setRegister16(4, register16(5))
+            if operandSize == 2 {
+                setRegister16(4, register16(5))
+            } else {
+                setRegister32(4, register32(5))
+            }
             let value = try pop(size: operandSize)
             if operandSize == 2 { setRegister16(5, UInt16(value & 0xFFFF)) } else { setRegister32(5, value) }
         case 0xCA: // RETF imm16
             let extra = try fetch16()
-            instructionPointer = try pop(size: operandSize) & 0xFFFF
-            setSegment(1, UInt16(try pop(size: operandSize) & 0xFFFF))
-            setRegister16(4, register16(4) &+ extra)
+            let returnIP = try pop(size: operandSize)
+            let newSegment = UInt16(try pop(size: operandSize) & 0xFFFF)
+            try loadCodeSegment(newSegment)
+            instructionPointer = returnIP & ipMask
+            setStackPointer(stackPointer &+ UInt32(extra))
         case 0xCB: // RETF
-            instructionPointer = try pop(size: operandSize) & 0xFFFF
-            setSegment(1, UInt16(try pop(size: operandSize) & 0xFFFF))
+            let returnIP = try pop(size: operandSize)
+            let newSegment = UInt16(try pop(size: operandSize) & 0xFFFF)
+            try loadCodeSegment(newSegment)
+            instructionPointer = returnIP & ipMask
         case 0xCC: // INT 3
             try executeInterrupt(vector: 3, startIP: startIP)
         case 0xCD: // INT imm8
@@ -742,10 +1144,16 @@ final class X86CPU {
         case 0xCE: // INTO
             if flag(Self.flagOverflow) { try executeInterrupt(vector: 4, startIP: startIP) }
         case 0xCF: // IRET
-            instructionPointer = try pop(size: operandSize) & 0xFFFF
-            setSegment(1, UInt16(try pop(size: operandSize) & 0xFFFF))
+            let returnIP = try pop(size: operandSize)
+            let newSegment = UInt16(try pop(size: operandSize) & 0xFFFF)
             let value = try pop(size: operandSize)
-            flags = (value & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
+            try loadCodeSegment(newSegment)
+            instructionPointer = returnIP & ipMask
+            if operandSize == 2 {
+                flags = (value & 0x0FD5) | 0x0002 | (flags & 0xFFFF0000)
+            } else {
+                flags = value | 0x0002
+            }
         case 0xD0, 0xD1, 0xD2, 0xD3: // シフト（1 / CL）
             let size = (opcode == 0xD0 || opcode == 0xD2) ? 1 : operandSize
             let modRM = try decodeModRM()
@@ -754,7 +1162,7 @@ final class X86CPU {
             try writeOperand(modRM, size: size, shift(modRM.reg, value, count, size: size))
         case 0xD4: // AAM
             let base = UInt32(try fetch8())
-            guard base != 0 else { throw X86Fault.divideError(address: address) }
+            guard base != 0 else { throw divideFault(address: address) }
             let al = UInt32(register8(0))
             setRegister8(4, UInt8(al / base))
             setRegister8(0, UInt8(al % base))
@@ -766,18 +1174,28 @@ final class X86CPU {
             setRegister8(4, 0)
             setSignZeroParity(result, size: 1)
         case 0xD7: // XLAT
-            let address = physicalAddress(segment: segments[decodeSegmentOverride ?? 3], offset: (UInt32(register16(3)) &+ UInt32(register8(0))) & 0xFFFF)
-            setRegister8(0, try readMemory8(at: address))
+            let base = decodeAddressSize == 4 ? register32(3) : UInt32(register16(3))
+            let value = try readGuest(segmentIndex: decodeSegmentOverride ?? 3, offset: base &+ UInt32(register8(0)), size: 1)
+            setRegister8(0, UInt8(value & 0xFF))
         case 0xE0, 0xE1, 0xE2, 0xE3: // LOOP 系
             let displacement = Int8(bitPattern: try fetch8())
             var take = false
-            switch opcode {
-            case 0xE0: setRegister16(1, register16(1) &- 1); take = register16(1) != 0 && !flag(Self.flagZero)
-            case 0xE1: setRegister16(1, register16(1) &- 1); take = register16(1) != 0 && flag(Self.flagZero)
-            case 0xE2: setRegister16(1, register16(1) &- 1); take = register16(1) != 0
-            default: take = register16(1) == 0
+            if decodeAddressSize == 4 {
+                switch opcode {
+                case 0xE0: registers[1] &-= 1; take = registers[1] != 0 && !flag(Self.flagZero)
+                case 0xE1: registers[1] &-= 1; take = registers[1] != 0 && flag(Self.flagZero)
+                case 0xE2: registers[1] &-= 1; take = registers[1] != 0
+                default: take = registers[1] == 0
+                }
+            } else {
+                switch opcode {
+                case 0xE0: setRegister16(1, register16(1) &- 1); take = register16(1) != 0 && !flag(Self.flagZero)
+                case 0xE1: setRegister16(1, register16(1) &- 1); take = register16(1) != 0 && flag(Self.flagZero)
+                case 0xE2: setRegister16(1, register16(1) &- 1); take = register16(1) != 0
+                default: take = register16(1) == 0
+                }
             }
-            if take { instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & 0xFFFF }
+            if take { instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & ipMask }
         case 0xE4, 0xE5: // IN AL / eAX, imm8
             let port = UInt16(try fetch8())
             let size = opcode == 0xE4 ? 1 : operandSize
@@ -799,11 +1217,11 @@ final class X86CPU {
         case 0xEA: // JMP far
             let offset = try fetchImmediate(operandSize)
             let newSegment = try fetch16()
-            setSegment(1, newSegment)
-            instructionPointer = offset & 0xFFFF
+            try loadCodeSegment(newSegment)
+            instructionPointer = offset & ipMask
         case 0xEB: // JMP rel8
             let displacement = Int8(bitPattern: try fetch8())
-            instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & 0xFFFF
+            instructionPointer = (instructionPointer &+ UInt32(bitPattern: Int32(displacement))) & ipMask
         case 0xEC, 0xED: // IN AL / eAX, DX
             let size = opcode == 0xEC ? 1 : operandSize
             let value = portIn(register16(2), size: size)
@@ -897,14 +1315,132 @@ final class X86CPU {
         }
     }
 
+    /// 未実装命令に対するエラー（プロテクトモードでは #UD 例外にする）。
+    private func opcodeFault(_ opcode: UInt8, address: UInt32) -> Error {
+        if protectedMode {
+            return CPUTrap.exception(vector: 6, errorCode: nil)
+        }
+        return X86Fault.unimplementedOpcode(opcode, address: address)
+    }
+
     private func executeTwoByte(operandSize: Int, address: UInt32) throws {
         let opcode = try fetch8()
         switch opcode {
+        case 0x00: // グループ6（SLDT / STR / LLDT / LTR）
+            let modRM = try decodeModRM()
+            switch modRM.reg {
+            case 0: try writeOperand(modRM, size: 2, UInt32(ldtrSelector))
+            case 1: try writeOperand(modRM, size: 2, UInt32(taskRegister))
+            case 2:
+                let selector = UInt16(try readOperand(modRM, size: 2) & 0xFFFF)
+                ldtrSelector = selector
+                if selector & 0xFFF8 != 0 {
+                    ldtrCache = try descriptorCache(selector: selector)
+                } else {
+                    ldtrCache = SegmentCache()
+                }
+            case 3:
+                taskRegister = UInt16(try readOperand(modRM, size: 2) & 0xFFFF)
+            default:
+                throw opcodeFault(opcode, address: address)
+            }
+        case 0x01: // グループ7（SGDT / SIDT / LGDT / LIDT / SMSW / LMSW / INVLPG）
+            let modRM = try decodeModRM()
+            switch modRM.reg {
+            case 0, 1: // SGDT / SIDT
+                guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+                let base = modRM.reg == 0 ? gdtrBase : idtrBase
+                let limit = modRM.reg == 0 ? gdtrLimit : idtrLimit
+                try writeGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset, size: 2, UInt32(limit))
+                try writeGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset &+ 2, size: 4, base)
+            case 2, 3: // LGDT / LIDT
+                guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }
+                let limit = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset, size: 2)
+                let base = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset &+ 2, size: 4)
+                if modRM.reg == 2 {
+                    gdtrBase = base
+                    gdtrLimit = UInt16(limit & 0xFFFF)
+                } else {
+                    idtrBase = base
+                    idtrLimit = UInt16(limit & 0xFFFF)
+                }
+            case 4: // SMSW
+                try writeOperand(modRM, size: 2, controlRegisters[0] & 0xFFFF)
+            case 6: // LMSW
+                let value = try readOperand(modRM, size: 2) & 0xFFFF
+                var newValue = (controlRegisters[0] & 0xFFFF0000) | value
+                if controlRegisters[0] & 1 != 0 { newValue |= 1 } // PE は落とせない
+                controlRegisters[0] = newValue
+            case 7: // INVLPG（TLB は持たないため何もしない）
+                break
+            default:
+                throw opcodeFault(opcode, address: address)
+            }
+        case 0x06: // CLTS
+            break
+        case 0x08, 0x09: // INVD / WBINVD（キャッシュを持たないため何もしない）
+            break
+        case 0x0B: // UD2
+            throw opcodeFault(opcode, address: address)
+        case 0x1F: // マルチバイト NOP
+            _ = try decodeModRM()
+        case 0x20, 0x21, 0x22, 0x23: // MOV CRn / DRn
+            let modRM = try decodeModRM()
+            let controlIndex = modRM.reg
+            if opcode == 0x20 {
+                try writeOperand(modRM, size: 4, controlRegisters[controlIndex])
+            } else if opcode == 0x22 {
+                controlRegisters[controlIndex] = try readOperand(modRM, size: 4)
+            } else if opcode == 0x21 {
+                try writeOperand(modRM, size: 4, 0) // DR は未実装（読み出しは 0）
+            }
+            // 0x23: DR への書き込みは無視
+        case 0x30: // WRMSR（無視）
+            break
+        case 0x32: // RDMSR（0 を返す）
+            registers[0] = 0
+            registers[2] = 0
+        case 0x40...0x4F: // CMOVcc
+            let modRM = try decodeModRM()
+            if condition(Int(opcode & 0x0F)) {
+                let value = try readOperand(modRM, size: operandSize)
+                setRegisterValue(modRM.reg, size: operandSize, value)
+            }
         case 0x80...0x8F: // Jcc near
             let displacement = operandSize == 2 ? Int32(Int16(bitPattern: try fetch16())) : Int32(bitPattern: try fetch32())
             if condition(Int(opcode & 0x0F)) {
                 instructionPointer = (instructionPointer &+ UInt32(bitPattern: displacement)) & (operandSize == 2 ? 0xFFFF : 0xFFFFFFFF)
             }
+        case 0x90...0x9F: // SETcc
+            let modRM = try decodeModRM()
+            try writeOperand(modRM, size: 1, condition(Int(opcode & 0x0F)) ? 1 : 0)
+        case 0xA0: try push(UInt32(segments[4]), size: operandSize) // PUSH FS
+        case 0xA1: try loadSegmentRegister(4, UInt16(try pop(size: operandSize) & 0xFFFF)) // POP FS
+        case 0xA2: // CPUID
+            switch registers[0] {
+            case 0:
+                registers[0] = 1
+                registers[3] = 0x61746552 // EBX: "Reta"
+                registers[2] = 0x4D567573 // EDX: "suVM"
+                registers[1] = 0x20363878 // ECX: "x86 "
+            case 1:
+                registers[0] = 0x00000611
+                registers[3] = 0
+                registers[1] = 0
+                registers[2] = 0x00000139 // FPU / PSE / TSC / MSR / CX8
+            case 0x80000000:
+                registers[0] = 0x80000001
+                registers[3] = 0
+                registers[1] = 0
+                registers[2] = 0
+            default:
+                registers[0] = 0
+                registers[3] = 0
+                registers[1] = 0
+                registers[2] = 0
+            }
+        case 0xA8: try push(UInt32(segments[5]), size: operandSize) // PUSH GS
+        case 0xA9: try loadSegmentRegister(5, UInt16(try pop(size: operandSize) & 0xFFFF)) // POP GS
         case 0xB6, 0xB7: // MOVZX
             let modRM = try decodeModRM()
             let value = try readOperand(modRM, size: opcode == 0xB6 ? 1 : 2)
@@ -914,8 +1450,11 @@ final class X86CPU {
             let modRM = try decodeModRM()
             let raw = try readOperand(modRM, size: sourceSize)
             setRegisterValue(modRM.reg, size: operandSize, UInt32(bitPattern: Int32(signExtend(raw, size: sourceSize))))
+        case 0xC8...0xCF: // BSWAP
+            let index = Int(opcode - 0xC8)
+            registers[index] = registers[index].byteSwapped
         default:
-            throw X86Fault.unimplementedOpcode(opcode, address: address)
+            throw opcodeFault(opcode, address: address)
         }
     }
 
@@ -980,10 +1519,16 @@ final class X86CPU {
     private func executeStringOperation(opcode: UInt8, operandSize: Int, repeatPrefix: UInt8) throws {
         let size = opcode & 1 == 0 ? 1 : operandSize
         let isRepeated = repeatPrefix == 0xF3 || repeatPrefix == 0xF2
+        let use32 = decodeAddressSize == 4
         while true {
             if isRepeated {
-                if register16(1) == 0 { return }
-                setRegister16(1, register16(1) &- 1)
+                if use32 {
+                    if registers[1] == 0 { return }
+                    registers[1] &-= 1
+                } else {
+                    if register16(1) == 0 { return }
+                    setRegister16(1, register16(1) &- 1)
+                }
             }
             try singleStringStep(opcode: opcode, size: size)
             if !isRepeated { return }
@@ -995,30 +1540,38 @@ final class X86CPU {
     }
 
     private func singleStringStep(opcode: UInt8, size: Int) throws {
+        let use32 = decodeAddressSize == 4
         let stepDelta = Int32(size) * (flag(Self.flagDirection) ? -1 : 1)
-        func advanceSI() { setRegister16(6, UInt16((Int32(register16(6)) + stepDelta) & 0xFFFF)) }
-        func advanceDI() { setRegister16(7, UInt16((Int32(register16(7)) + stepDelta) & 0xFFFF)) }
-        let source = physicalAddress(segment: segments[decodeSegmentOverride ?? 3], offset: UInt32(register16(6)))
-        let destination = physicalAddress(segment: segments[0], offset: UInt32(register16(7)))
+        func pointer(_ index: Int) -> UInt32 { use32 ? registers[index] : UInt32(register16(index)) }
+        func advance(_ index: Int) {
+            if use32 {
+                registers[index] = registers[index] &+ UInt32(bitPattern: stepDelta)
+            } else {
+                setRegister16(index, UInt16((Int32(register16(index)) + stepDelta) & 0xFFFF))
+            }
+        }
+        let sourceSegment = decodeSegmentOverride ?? 3
+        let sourceOffset = pointer(6)
+        let destinationOffset = pointer(7)
         switch opcode {
         case 0xA4, 0xA5: // MOVS
-            try writeMemory(at: destination, size: size, try readMemory(at: source, size: size))
-            advanceSI(); advanceDI()
+            try writeGuest(segmentIndex: 0, offset: destinationOffset, size: size, try readGuest(segmentIndex: sourceSegment, offset: sourceOffset, size: size))
+            advance(6); advance(7)
         case 0xA6, 0xA7: // CMPS
-            let a = try readMemory(at: source, size: size)
-            let b = try readMemory(at: destination, size: size)
+            let a = try readGuest(segmentIndex: sourceSegment, offset: sourceOffset, size: size)
+            let b = try readGuest(segmentIndex: 0, offset: destinationOffset, size: size)
             _ = subtractWithFlags(a, b, size: size, borrowIn: false)
-            advanceSI(); advanceDI()
+            advance(6); advance(7)
         case 0xAA, 0xAB: // STOS
-            try writeMemory(at: destination, size: size, registerValue(0, size: size))
-            advanceDI()
+            try writeGuest(segmentIndex: 0, offset: destinationOffset, size: size, registerValue(0, size: size))
+            advance(7)
         case 0xAC, 0xAD: // LODS
-            setRegisterValue(0, size: size, try readMemory(at: source, size: size))
-            advanceSI()
+            setRegisterValue(0, size: size, try readGuest(segmentIndex: sourceSegment, offset: sourceOffset, size: size))
+            advance(6)
         case 0xAE, 0xAF: // SCAS
-            let b = try readMemory(at: destination, size: size)
+            let b = try readGuest(segmentIndex: 0, offset: destinationOffset, size: size)
             _ = subtractWithFlags(registerValue(0, size: size), b, size: size, borrowIn: false)
-            advanceDI()
+            advance(7)
         default:
             break
         }
@@ -1076,7 +1629,7 @@ final class X86CPU {
             }
         case 6, 7: // DIV / IDIV
             let divisor = try readOperand(modRM, size: size)
-            guard divisor != 0 else { throw X86Fault.divideError(address: address) }
+            guard divisor != 0 else { throw divideFault(address: address) }
             let signed = modRM.reg == 7
             switch size {
             case 1:
@@ -1084,13 +1637,13 @@ final class X86CPU {
                     let dividend = Int32(Int16(bitPattern: register16(0)))
                     let d = Int32(Int8(bitPattern: UInt8(divisor & 0xFF)))
                     let quotient = dividend / d
-                    guard quotient >= -128 && quotient <= 127 else { throw X86Fault.divideError(address: address) }
+                    guard quotient >= -128 && quotient <= 127 else { throw divideFault(address: address) }
                     setRegister8(0, UInt8(bitPattern: Int8(quotient)))
                     setRegister8(4, UInt8(bitPattern: Int8(dividend % d)))
                 } else {
                     let dividend = UInt32(register16(0))
                     let quotient = dividend / divisor
-                    guard quotient <= 0xFF else { throw X86Fault.divideError(address: address) }
+                    guard quotient <= 0xFF else { throw divideFault(address: address) }
                     setRegister8(0, UInt8(quotient))
                     setRegister8(4, UInt8(dividend % divisor))
                 }
@@ -1100,12 +1653,12 @@ final class X86CPU {
                     let dividend = Int32(bitPattern: dividendBits)
                     let d = Int32(Int16(bitPattern: UInt16(divisor & 0xFFFF)))
                     let quotient = dividend / d
-                    guard quotient >= -32768 && quotient <= 32767 else { throw X86Fault.divideError(address: address) }
+                    guard quotient >= -32768 && quotient <= 32767 else { throw divideFault(address: address) }
                     setRegister16(0, UInt16(bitPattern: Int16(quotient)))
                     setRegister16(2, UInt16(bitPattern: Int16(dividend % d)))
                 } else {
                     let quotient = dividendBits / divisor
-                    guard quotient <= 0xFFFF else { throw X86Fault.divideError(address: address) }
+                    guard quotient <= 0xFFFF else { throw divideFault(address: address) }
                     setRegister16(0, UInt16(quotient))
                     setRegister16(2, UInt16(dividendBits % divisor))
                 }
@@ -1115,12 +1668,12 @@ final class X86CPU {
                     let dividend = Int64(bitPattern: dividendBits)
                     let d = Int64(Int32(bitPattern: divisor))
                     let quotient = dividend / d
-                    guard quotient >= Int64(Int32.min) && quotient <= Int64(Int32.max) else { throw X86Fault.divideError(address: address) }
+                    guard quotient >= Int64(Int32.min) && quotient <= Int64(Int32.max) else { throw divideFault(address: address) }
                     setRegister32(0, UInt32(bitPattern: Int32(quotient)))
                     setRegister32(2, UInt32(bitPattern: Int32(dividend % d)))
                 } else {
                     let quotient = dividendBits / UInt64(divisor)
-                    guard quotient <= 0xFFFFFFFF else { throw X86Fault.divideError(address: address) }
+                    guard quotient <= 0xFFFFFFFF else { throw divideFault(address: address) }
                     setRegister32(0, UInt32(quotient))
                     setRegister32(2, UInt32(dividendBits % UInt64(divisor)))
                 }
@@ -1128,6 +1681,14 @@ final class X86CPU {
         default:
             throw X86Fault.unimplementedOpcode(opcode, address: address)
         }
+    }
+
+    /// 除算エラー（プロテクトモードでは #DE 例外にする）。
+    private func divideFault(address: UInt32) -> Error {
+        if protectedMode {
+            return CPUTrap.exception(vector: 0, errorCode: nil)
+        }
+        return X86Fault.divideError(address: address)
     }
 
     private func executeGroup5(operandSize: Int, address: UInt32) throws {
@@ -1142,24 +1703,24 @@ final class X86CPU {
         case 2: // CALL near indirect
             let target = try readOperand(modRM, size: operandSize)
             try push(instructionPointer, size: operandSize)
-            instructionPointer = target & (operandSize == 2 ? 0xFFFF : 0xFFFFFFFF)
+            instructionPointer = target & ipMask
         case 3: // CALL far indirect
             guard !modRM.isRegister else { throw X86Fault.unimplementedOpcode(0xFF, address: address) }
-            let offset = try readMemory(at: modRM.physicalAddress, size: operandSize)
-            let newSegment = try readMemory(at: modRM.physicalAddress + operandSize, size: 2)
+            let offset = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset, size: operandSize)
+            let newSegment = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset &+ UInt32(operandSize), size: 2)
             try push(UInt32(segments[1]), size: operandSize)
             try push(instructionPointer, size: operandSize)
-            setSegment(1, UInt16(newSegment & 0xFFFF))
-            instructionPointer = offset & 0xFFFF
+            try loadCodeSegment(UInt16(newSegment & 0xFFFF))
+            instructionPointer = offset & ipMask
         case 4: // JMP near indirect
             let target = try readOperand(modRM, size: operandSize)
-            instructionPointer = target & (operandSize == 2 ? 0xFFFF : 0xFFFFFFFF)
+            instructionPointer = target & ipMask
         case 5: // JMP far indirect
             guard !modRM.isRegister else { throw X86Fault.unimplementedOpcode(0xFF, address: address) }
-            let offset = try readMemory(at: modRM.physicalAddress, size: operandSize)
-            let newSegment = try readMemory(at: modRM.physicalAddress + operandSize, size: 2)
-            setSegment(1, UInt16(newSegment & 0xFFFF))
-            instructionPointer = offset & 0xFFFF
+            let offset = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset, size: operandSize)
+            let newSegment = try readGuest(segmentIndex: modRM.segmentIndex, offset: modRM.effectiveOffset &+ UInt32(operandSize), size: 2)
+            try loadCodeSegment(UInt16(newSegment & 0xFFFF))
+            instructionPointer = offset & ipMask
         case 6: // PUSH r/m
             try push(try readOperand(modRM, size: operandSize), size: operandSize)
         default:
@@ -1168,6 +1729,11 @@ final class X86CPU {
     }
 
     private func executeInterrupt(vector: UInt8, startIP: UInt32) throws {
+        if protectedMode {
+            // プロテクトモードでは BIOS ではなく IDT ゲートを使う
+            try dispatchGate(vector: vector, errorCode: nil, returnIP: instructionPointer)
+            return
+        }
         guard let handler = interruptHandler else { throw X86Fault.noInterruptHandler(vector) }
         if handler(vector) == .needsInput {
             instructionPointer = startIP
