@@ -146,7 +146,14 @@ final class VMStore: ObservableObject {
             wireCallbacks(session: emulatorSession, vmID: vm.id, generation: generation)
             if vm.configuration.useISO {
                 // ISO ブート: ISO 9660 を解析し、ルート直下の BOOT.BIN を起動する
-                guard let isoData = loadISOData(for: vm) else {
+                // 内蔵サンプルが選ばれている場合はそのデータを使う
+                let isoData: [UInt8]?
+                if let sample = vm.configuration.builtInSample, sample.architecture == .riscv {
+                    isoData = sample.data
+                } else {
+                    isoData = loadISOData(for: vm)
+                }
+                guard let isoData else {
                     failStart(index: index, vm: vm, message: "ISO ファイルが見つかりません")
                     return
                 }
@@ -179,10 +186,21 @@ final class VMStore: ObservableObject {
             session = emulatorSession
         case .x86:
             // x86 は BIOS ブート: El Torito ISO または raw イメージから起動する
-            guard let imageData = loadISOData(for: vm) else {
+            // 内蔵サンプルが選ばれている場合はそのデータを起動する
+            let imageData: [UInt8]?
+            let sampleName: String?
+            if let sample = vm.configuration.builtInSample, sample.architecture == .x86 {
+                imageData = sample.data
+                sampleName = sample.displayName
+            } else {
+                imageData = loadISOData(for: vm)
+                sampleName = nil
+            }
+            guard let imageData else {
                 failStart(index: index, vm: vm, message: "ISO / イメージファイルが見つかりません")
                 return
             }
+            let imageDisplayName = sampleName ?? vm.configuration.isoDisplayName
             let x86Session = X86Session()
             x86Session.initialUEFIVariables = vm.configuration.uefiVariables.map {
                 X86UEFI.Variable(guid: $0.guid, name: $0.name,
@@ -196,11 +214,11 @@ final class VMStore: ObservableObject {
                 return
             }
             if Multiboot.isMultibootKernel(imageData) {
-                bootDescription = "Multiboot（\(vm.configuration.isoDisplayName ?? "カーネル")）"
+                bootDescription = "Multiboot（\(imageDisplayName ?? "カーネル")）"
             } else if X86UEFI.isUEFIApplication(imageData) {
-                bootDescription = "UEFI（\(vm.configuration.isoDisplayName ?? "アプリケーション")）"
+                bootDescription = "UEFI（\(imageDisplayName ?? "アプリケーション")）"
             } else {
-                bootDescription = "BIOS（\(vm.configuration.isoDisplayName ?? "イメージ")）"
+                bootDescription = "BIOS（\(imageDisplayName ?? "イメージ")）"
             }
             session = x86Session
         case .arm:
@@ -214,6 +232,17 @@ final class VMStore: ObservableObject {
             }
             bootDescription = "ArmDemoOS"
             session = armSession
+        case .arm64:
+            let arm64Session = ARM64Session()
+            wireCallbacks(session: arm64Session, vmID: vm.id, generation: generation)
+            do {
+                try arm64Session.boot(source: ARM64DemoOS.source)
+            } catch {
+                failStart(index: index, vm: vm, message: error.localizedDescription)
+                return
+            }
+            bootDescription = "Arm64DemoOS"
+            session = arm64Session
         }
 
         sessions[vm.id] = session
@@ -278,7 +307,7 @@ final class VMStore: ObservableObject {
                     throw X86BootError.notBootable("ブート可能なイメージではありません。El Torito 対応の ISO、ブートセクタ付きの raw イメージ（.img）、Multiboot 対応カーネル（ELF32）、または UEFI アプリケーション（.efi）を選んでください")
                 }
             }
-        case .arm:
+        case .arm, .arm64:
             throw X86BootError.notBootable("ARM ではイメージファイルは使いません")
         }
         guard let directory = isoDirectory else {

@@ -64,6 +64,7 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
     case riscv
     case x86
     case arm
+    case arm64
 
     var id: String { rawValue }
 
@@ -72,6 +73,7 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
         case .riscv: return "RISC-V"
         case .x86: return "x86"
         case .arm: return "ARM"
+        case .arm64: return "ARM64"
         }
     }
 
@@ -81,6 +83,7 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
         case .riscv: return "RV32IM ソフトウェア CPU"
         case .x86: return "リアルモード + 32 ビット プロテクトモード"
         case .arm: return "ARMv7-A (A32) サブセット"
+        case .arm64: return "AArch64（EL0 / EL1 + MMU）"
         }
     }
 
@@ -89,6 +92,7 @@ enum CPUArchitecture: String, Codable, CaseIterable, Identifiable {
         case .riscv: return "terminal"
         case .x86: return "desktopcomputer"
         case .arm: return "cpu"
+        case .arm64: return "cpu.fill"
         }
     }
 }
@@ -117,6 +121,8 @@ struct VMConfiguration: Equatable {
     var isoFileName: String? = nil
     /// 選択した ISO の元のファイル名（表示用）
     var isoDisplayName: String? = nil
+    /// アプリ内蔵サンプルから起動する場合のサンプル（ファイルより優先）
+    var builtInSample: BuiltInSample? = nil
     var networkEnabled: Bool = true
     var sharedFolderEnabled: Bool = false
     /// 永続化された UEFI 変数（x86 の UEFI 起動時に引き継ぐ）
@@ -138,11 +144,15 @@ struct VMConfiguration: Equatable {
     var bootTargetName: String {
         switch architecture {
         case .riscv:
+            if let builtInSample { return builtInSample.displayName }
             return useISO ? (isoDisplayName ?? "ISO ファイル") : guestImage.displayName
         case .x86:
+            if let builtInSample { return builtInSample.displayName }
             return isoDisplayName ?? "イメージファイル"
         case .arm:
             return "ArmDemoOS"
+        case .arm64:
+            return "Arm64DemoOS"
         }
     }
 
@@ -150,11 +160,15 @@ struct VMConfiguration: Equatable {
     var bootSystemImage: String {
         switch architecture {
         case .riscv:
+            if let builtInSample { return builtInSample.systemImage }
             return useISO ? "opticaldisc" : guestImage.systemImage
         case .x86:
+            if let builtInSample { return builtInSample.systemImage }
             return "opticaldisc"
         case .arm:
             return "cpu"
+        case .arm64:
+            return "cpu.fill"
         }
     }
 
@@ -167,6 +181,8 @@ struct VMConfiguration: Equatable {
             return []
         case .arm:
             return ["fact", "help", "quit"]
+        case .arm64:
+            return ["fact", "help", "quit"]
         }
     }
 }
@@ -174,7 +190,7 @@ struct VMConfiguration: Equatable {
 extension VMConfiguration: Codable {
     private enum CodingKeys: String, CodingKey {
         case cpuCount, memoryMB, diskGB, architecture, guestOS, guestImage
-        case useISO, isoFileName, isoDisplayName
+        case useISO, isoFileName, isoDisplayName, builtInSample
         case networkEnabled, sharedFolderEnabled
         case uefiVariables
     }
@@ -193,6 +209,7 @@ extension VMConfiguration: Codable {
         useISO = Self.tolerantBool(container, .useISO) ?? false
         isoFileName = Self.tolerantString(container, .isoFileName)
         isoDisplayName = Self.tolerantString(container, .isoDisplayName)
+        builtInSample = Self.tolerantEnum(BuiltInSample.self, container, .builtInSample)
         networkEnabled = Self.tolerantBool(container, .networkEnabled) ?? true
         sharedFolderEnabled = Self.tolerantBool(container, .sharedFolderEnabled) ?? false
         uefiVariables = (try? container.decodeIfPresent([UEFIVariableRecord].self, forKey: .uefiVariables)) ?? nil ?? []
@@ -237,6 +254,7 @@ extension VMConfiguration: Codable {
         try container.encode(useISO, forKey: .useISO)
         try container.encodeIfPresent(isoFileName, forKey: .isoFileName)
         try container.encodeIfPresent(isoDisplayName, forKey: .isoDisplayName)
+        try container.encodeIfPresent(builtInSample, forKey: .builtInSample)
         try container.encode(networkEnabled, forKey: .networkEnabled)
         try container.encode(sharedFolderEnabled, forKey: .sharedFolderEnabled)
     }
