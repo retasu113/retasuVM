@@ -49,6 +49,13 @@ final class VMStore: ObservableObject {
         sessions[id]?.screenSnapshot()
     }
 
+    /// 画面の変化カウンタ（変化通知のたびに増える）。
+    @Published private(set) var screenRevisions: [UUID: Int] = [:]
+
+    func screenRevision(for id: UUID) -> Int {
+        screenRevisions[id] ?? 0
+    }
+
     func terminalText(for id: UUID) -> String {
         consoleText[id] ?? ""
     }
@@ -95,6 +102,12 @@ final class VMStore: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.consoleText[vmID, default: ""] += text
+            }
+        }
+        session.onScreenChange = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.screenRevisions[vmID, default: 0] += 1
             }
         }
         session.onClear = { [weak self] in
