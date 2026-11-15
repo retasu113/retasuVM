@@ -47,9 +47,23 @@ final class EmulatorSession {
     /// 指定したゲスト OS イメージをアセンブルして読み込み、実行を開始する。
     func boot(guestImage: GuestImage) throws {
         let program = try RISCVAssembler().assemble(guestImage.assemblySource)
+        start(program: program.bytes, entry: program.entry, diskImage: nil)
+    }
+
+    /// フラットバイナリを直接読み込んで実行を開始する（ISO ブート用）。
+    /// diskImage には ISO 全体を渡し、ゲストがディスク読み取り
+    /// システムコールで参照できるようにする。
+    func boot(program: [UInt8], entry: UInt32 = 0, diskImage: [UInt8]? = nil) {
+        start(program: program, entry: entry, diskImage: diskImage)
+    }
+
+    private func start(program: [UInt8], entry: UInt32, diskImage: [UInt8]?) {
+        if let diskImage {
+            cpu.attachDisk(diskImage)
+        }
         // 起動ごとに乱数の種を変える（ゲーム用）。テストでは CPU 側の固定種を使う。
         cpu.setRandomSeed(UInt32(truncatingIfNeeded: Int64(Date().timeIntervalSince1970 * 1000)))
-        cpu.loadProgram(program.bytes, at: program.entry)
+        cpu.loadProgram(program, at: entry)
         cpu.onChar = { [weak self] byte in
             guard let self else { return }
             self.bufferLock.lock()

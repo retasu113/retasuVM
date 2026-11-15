@@ -1,10 +1,12 @@
 import Foundation
 
 /// CPU 実行中の異常。
-enum CPUFault: Error, CustomStringConvertible {
+enum CPUFault: Error, CustomStringConvertible, LocalizedError {
     case invalidInstruction(UInt32, pc: UInt32)
     case memoryOutOfBounds(address: UInt32, size: Int)
     case unknownSyscall(UInt32)
+
+    var errorDescription: String? { description }
 
     var description: String {
         switch self {
@@ -31,6 +33,10 @@ enum CPUFault: Error, CustomStringConvertible {
 /// - a7=5: コンソール消去
 /// - a7=6: 乱数を a0 に返す（xorshift32）
 /// - a7=10: 終了（a0 が終了コード）
+/// - a7=20: 装着中のディスク（ISO）のセクタ数（2048 バイト/セクタ）を a0 に返す
+/// - a7=21: ディスクのセクタ読み取り（a0 = セクタ番号、a1 = 転送先アドレス）。
+///          成功で a0 = 0、失敗で a0 = -1
+/// - a7=22: ディスクのバイト数を a0 に返す
 ///
 /// 命令セットは RV32I + M 拡張（乗除算）。
 final class RISCVCPU {
@@ -48,6 +54,15 @@ final class RISCVCPU {
     private(set) var waitingForInput = false
 
     private var inputQueue: [UInt8] = []
+
+    /// 装着中のディスクイメージ（ISO ファイルの中身）。セクタサイズは 2048。
+    private(set) var diskData: [UInt8]?
+    static let diskSectorSize = 2048
+
+    /// ディスクイメージを装着する（ISO ブート用）。
+    func attachDisk(_ data: [UInt8]) {
+        diskData = data
+    }
 
     /// 乱数生成器（xorshift32）の状態。決定的に動作する（テスト可能）。
     private var randomState: UInt32 = 0x2545F491
@@ -316,6 +331,16 @@ final class RISCVCPU {
         case 6: // random (xorshift32)
             setReg(10, nextRandom())
             return true
+        case 20: // disk sector count
+            let count = diskData?.count ?? 0
+            setReg(10, UInt32((count + Self.diskSectorSize - 1) / Self.diskSectorSize))
+            return true
+        case 21: // disk read sector: a0 = sector, a1 = destination address
+            setReg(10, readDiskSector(sector: regs[10], destination: regs[11]) ? 0 : 0xFFFFFFFF)
+            return true
+        case 22: // disk byte size
+            setReg(10, UInt32(diskData?.count ?? 0))
+            return true
         case 10: // exit
             halted = true
             exitCode = Int32(bitPattern: regs[10])
@@ -323,6 +348,21 @@ final class RISCVCPU {
         default:
             throw CPUFault.unknownSyscall(number)
         }
+    }
+
+    /// ディスクの 1 セクタをゲストメモリへ読み込む。最終セクタの余りは 0 で埋める。
+    private func readDiskSector(sector: UInt32, destination: UInt32) -> Bool {
+        guard let diskData else { return false }
+        let sectorSize = Self.diskSectorSize
+        let sourceStart = Int(sector) * sectorSize
+        guard sourceStart < diskData.count else { return false }
+        let destStart = Int(destination)
+        guard destStart + sectorSize <= memory.count else { return false }
+        for i in 0..<sectorSize {
+            let sourceIndex = sourceStart + i
+            memory[destStart + i] = sourceIndex < diskData.count ? diskData[sourceIndex] : 0
+        }
+        return true
     }
 
     // MARK: - レジスタ・メモリアクセス
