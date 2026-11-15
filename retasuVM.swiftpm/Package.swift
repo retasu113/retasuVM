@@ -14,7 +14,7 @@ let package = Package(
             targets: ["AppModule"],
             bundleIdentifier: "jp.retasu.retasuVM",
             teamIdentifier: "",
-            displayVersion: "0.3.0",
+            displayVersion: "0.4.0",
             bundleVersion: "1",
             appIcon: .placeholder(icon: .shapes),
             accentColor: .presetColor(.green),
