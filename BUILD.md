@@ -46,7 +46,8 @@ retasuVM.swiftpm/
 │   ├── Multiboot.swift        … Multiboot ブートローダ（ELF32 カーネル起動）
 │   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / RTC / キーボード / PCI / IDE）
 │   ├── X86ACPI.swift          … ACPI テーブル生成（RSDP / XSDT / FADT / DSDT / MADT）
-│   ├── X86UEFI.swift          … 最小 UEFI ファームウェア（PE32+ ローダ + ブートサービス）
+│   ├── X86FAT.swift           … FAT12 / 16 / 32 ファイルシステム（読み書き）
+│   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Block I/O + SFS + 変数）
 │   ├── X86Session.swift       … x86 実行セッション
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ

@@ -2,6 +2,85 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.9.0] - 2026-11-15
+
+### 追加
+
+- x86 CPU に特権リング（ユーザーモード）を追加した。
+  - CPL 管理（セグメントキャッシュの DPL）、TSS の読み込み（LTR）と
+    割り込み時の RSP0 スタック切替（32 / 64 ビット両対応）、
+    ページウォーク全階層での U/S 検査、CPL に応じた特権命令の
+    #GP 検査（CLI / STI / HLT / IN / OUT / LGDT など、IOPL 判定含む）。
+- SYSCALL / SYSRET 命令を実装した。STAR / LSTAR / CSTAR /
+  SFMASK MSR（0xC0000081〜84）に対応し、リング 3 から
+  SYSCALL でリング 0 へ入り、SYSRET で戻れる。
+- IDE（ATA）コントローラにバスマスタ DMA を追加した。
+  PCI コマンドレジスタの書き込み、BAR4（バスマスタ I/O ベース）、
+  PRDT ウォークによる READ DMA / WRITE DMA コマンド（0xC8 / 0xCA 系）、
+  完了時の IRQ14 通知、IDENTIFY の DMA 対応ビット。
+- UEFI にプロトコルデータベースを追加した。
+  InstallProtocolInterface / UninstallProtocolInterface /
+  HandleProtocol / OpenProtocol / CloseProtocol /
+  ProtocolsPerHandle / LocateHandleBuffer / LocateProtocol /
+  InstallConfigurationTable を実動作するようにした。
+- UEFI に Block I/O プロトコルを追加した。対象は接続中の
+  ディスクイメージ（書き戻しあり）、未接続時は RAM 上の
+  FAT12 フロッピーボリューム。Device Path プロトコル
+  （PCI ノード + ファイルパス）も公開する。
+- FAT ファイルシステムを自作した（`Engine/X86FAT.swift`）。
+  FAT12 / 16 / 32 の読み書き、FAT チェーン管理（全 FAT コピーへ
+  反映）、ディレクトリ列挙（ロングファイル名の読み取り対応）、
+  ファイルの作成・上書き・削除。
+- UEFI に Simple File System プロトコルとファイルプロトコルを
+  追加した。OpenVolume / Open（読み取り・書き込み・作成）/
+  Read / Write / Close / Delete / GetInfo（FileInfo /
+  FileSystemInfo / VolumeLabel）/ SetPosition など。
+- UEFI ランタイムサービスに変数サービスを追加した。
+  GetVariable（容量不足時は必要サイズを返して
+  BUFFER_TOO_SMALL）、SetVariable（サイズ 0 で削除）、
+  GetNextVariableName、QueryVariableInfo。変数はメモリ上に
+  保持する（永続化はしない）。
+
+### 修正
+
+- 64 ビットモードのアキュムレータ即値 ALU 命令（CMP RAX, imm
+  など）と TEST RAX, imm が即値を 64 ビットで読んでいた不具合を
+  修正した。仕様どおり符号拡張 32 ビット即値として読む
+  （v0.8.0 以前に潜在していた問題）。
+
+### 検証
+
+- リング検証カーネル（Multiboot）: プロテクトモード → ロング
+  モード移行、リング 3 での SYSCALL / SYSRET 往復、リング 3 の
+  CLI による #GP、スーパーバイザページへのリング 3 アクセス
+  による #PF、TSS スタック切替を伴うタイマ割り込み、すべて成功。
+- DMA 検証カーネル: PCI 設定（BAR4 / コマンドレジスタ）、
+  DMA 読み取り（パターン一致 + IRQ14）、DMA 書き込み後の
+  PIO 読み戻し一致、すべて成功。
+- UEFI 統合テストアプリ（新規サンプル）: 変数サービス
+  （Set / Get / 小バッファ / GetNextVariableName）、プロトコル
+  検索（LocateHandleBuffer / HandleProtocol）、Block I/O
+  （ブートセクタ読み取り）、Simple File System
+  （ファイル作成・書き込み・読み戻し・ディレクトリ列挙）、
+  ExitBootServices まで、すべて成功。
+- 回帰テスト: ロングモード検証カーネル、v0.8.0 UEFI サンプル、
+  BIOS ブート（El Torito ISO）、Multiboot カーネル、デバイス
+  検証カーネル（TIMER / KBD / PCI / IDE / RTC）、RISC-V
+  （retasuOS）、ARM（ArmDemoOS）すべて従来どおり動作。
+- 全 36 Swift ファイルの文法チェックと、エンジン + モデルの
+  型チェックを実施（エラーなし）。
+
+### 既知の制限
+
+- UEFI に Loaded Image プロトコル、グラフィックス出力（GOP）
+  などがないため、Windows Boot Manager や GRUB はまだ起動
+  できない。一般の OS（Windows / 現在の Linux）は引き続き
+  実行できない。
+- TSS タスクスイッチ（ハードウェアタスク切替）と SWAPGS は
+  未実装。UEFI 変数は永続化しない。FAT の書き込みは 8.3 形式の
+  短いファイル名のみ。
+- 実機の Swift Playgrounds での動作検証は未実施。
+
 ## [0.8.0] - 2026-11-15
 
 ### 追加
