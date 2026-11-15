@@ -3,7 +3,7 @@
 retasuVM は、iPhone と iPad で仮想マシンを管理するための SwiftUI アプリです。
 Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgrounds でそのまま開けるプロジェクト形式（`.swiftpm`）で配布します。
 
-> **現在の実行エンジンについて**: v0.3.0 の実行エンジンは RISC-V RV32IM ソフトウェア CPU エミュレータです。起動するゲスト OS イメージを VM ごとに選べます（retasuOS / PlayOS / CalcOS）。iOS / iPadOS ではハードウェア仮想化がアプリに提供されないため、Linux や Windows のような一般の OS は実行できません。
+> **現在の実行エンジンについて**: v0.4.0 の実行エンジンは RISC-V RV32IM ソフトウェア CPU エミュレータです。起動するゲスト OS イメージを VM ごとに選べるほか、ISO ファイル（ISO 9660、ルート直下に BOOT.BIN を置く retasuVM 形式）からも起動できます。iOS / iPadOS ではハードウェア仮想化がアプリに提供されないため、Linux や Windows のような一般の OS やそのインストール ISO は実行できません。
 
 ## 主な機能
 
@@ -16,6 +16,7 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
   - retasuOS: 対話型モニタ（help / echo / fib / about / ver / clear / halt）
   - PlayOS: 数当てゲームとサイコロ（guess / dice / help / quit）
   - CalcOS: スタック式（RPN）計算機（+ - * / % / dup / drop / swap / p など）
+- ISO ファイルからの起動（ISO 9660 を解析し BOOT.BIN を実行。ISO 全体はディスクとしてゲストから読み取り可能）
 - 対話型コンソール画面（コマンド入力・イメージ連動のクイックコマンド・リアルタイム出力）
 - 設定は端末内に自動保存され、再起動後も保持
 - iPad ではサイドバー付きスプリットビュー、iPhone ではタブバー＋スタック遷移
@@ -45,9 +46,18 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
 
 詳しいビルド・検証手順は [BUILD.md](BUILD.md) を参照してください。
 
+## ISO ファイルから起動する
+
+1. Release から `retasuVM-sample.iso`（試作用サンプル）をダウンロードします。
+2. アプリで VM を作成（または編集）し、起動方法を「ISO ファイル」にして、ダウンロードした .iso を選びます。
+3. VM を起動すると、ISO 内のゲスト OS「IsoDemoOS」がブートします。コンソールで `info` と入力すると、ディスクの容量やボリュームラベルが表示されます。
+
+自作 ISO の規約: ISO 9660 のルート直下に `BOOT.BIN`（RISC-V RV32IM フラットバイナリ、最大 1 MiB）を置きます。ISO 全体はディスクとして装着され、ゲストはシステムコール（a7=20/21/22）でセクタ読み取りできます。詳細はサンプル ISO 内の README.TXT と `Engine/RISCVCPU.swift` を参照してください。
+
 ## 現在の開発状況
 
-- v0.3.0: ゲストイメージを 3 種類に拡充（retasuOS / PlayOS / CalcOS）、CPU に M 拡張（乗除算）と乱数を追加。全 Swift ファイルの文法チェックと、エミュレータ core の実行テストを実施済み。
+- v0.4.0: ISO 9660 イメージからの起動に対応（BOOT.BIN 形式）。サンプル ISO と IsoDemoOS を同梱。全 Swift ファイルの文法チェックと、ISO ブートを含む実行テストを実施済み。
+- v0.3.0: ゲストイメージを 3 種類に拡充（retasuOS / PlayOS / CalcOS）、CPU に M 拡張（乗除算）と乱数を追加。
 - v0.2.0: RISC-V RV32I エミュレータとゲスト OS「retasuOS」を実装。
 - v0.1.0: 初期リリース。HIG 準拠の管理 UI とシミュレーションエンジンを実装。
 - 変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
@@ -55,7 +65,7 @@ Apple Human Interface Guidelines（HIG）に沿って設計し、Swift Playgroun
 
 ## 既知の制約
 
-- 実行できるゲストは同梱の 3 イメージのみです。一般の OS（Linux / Windows など）は実行できません。
+- 実行できるゲストは同梱の 3 イメージと、retasuVM 形式の ISO（BOOT.BIN 入り）のみです。一般の OS（Linux / Windows など）や、そのインストール ISO は実行できません。
 - エミュレータは固定スペック（RV32IM、メモリ 1 MiB）で、VM の構成値（CPU / メモリ）はまだエミュレータへ反映されません（管理用メタデータ）。
 - ゲスト画面はテキストコンソールのみです（グラフィカル表示はありません）。
 - VM の設定データは端末内にのみ保存されます（同期機能はありません）。

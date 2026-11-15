@@ -35,6 +35,8 @@ retasuVM.swiftpm/
 │   ├── PlayOS.swift           … ゲスト OS「PlayOS」（数当てゲーム・サイコロ）
 │   ├── CalcOS.swift           … ゲスト OS「CalcOS」（RPN 計算機）
 │   ├── GuestImage.swift       … 起動イメージの定義と選択
+│   ├── ISO9660.swift          … ISO 9660 パーサ（BOOT.BIN の取り出し）
+│   ├── IsoDemoOS.swift        … ISO ブート確認用ゲスト（サンプル ISO に収録）
 │   ├── GuestOS.swift          … 旧ファイル名の名残（空。RetasuOS.swift に改名済み）
 │   └── VMEngine.swift         … EmulatorSession（実行セッション管理）
 ├── Views/
