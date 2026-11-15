@@ -70,14 +70,11 @@ jobs:
             echo "Release v${VERSION} は既に存在するため、作成とアップロードをスキップします。"
             exit 0
           fi
-          # 0.x は開発版として Pre-release にする
-          PRERELEASE_FLAG=""
-          if [[ "$VERSION" == 0.* ]]; then PRERELEASE_FLAG="--prerelease"; fi
+          # リリースは正式リリースとして公開する（2026-11-15 の方針変更。以後は Pre-release にしない）
           gh release create "v${VERSION}" \
             "dist/retasuVM-v${VERSION}-SwiftPlaygrounds.zip" \
             "dist/SHA256SUMS.txt" \
             --title "retasuVM v${VERSION}" \
             --notes "retasuVM v${VERSION} のリリースです。詳細は CHANGELOG.md を参照してください。
 
-          動作確認環境: GitHub Actions（macos-latest）でプロジェクト構成と ZIP の整合性を検証。実機 Swift Playgrounds での検証は未実施です。" \
-            $PRERELEASE_FLAG
+          動作確認環境: GitHub Actions（macos-latest）でプロジェクト構成と ZIP の整合性を検証。実機 Swift Playgrounds での検証は未実施です。"
