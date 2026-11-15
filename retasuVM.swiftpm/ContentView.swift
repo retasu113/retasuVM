@@ -21,7 +21,7 @@ struct ContentView: View {
 
     private var splitView: some View {
         NavigationSplitView {
-            VMListView(selection: $selectedID)
+            VMListView(selection: $selectedID, usesSplitSelection: true)
         } detail: {
             if let selectedID, let vm = store.machine(id: selectedID) {
                 VMDetailView(vm: vm)
