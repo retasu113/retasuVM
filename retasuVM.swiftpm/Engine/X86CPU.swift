@@ -54,6 +54,18 @@ final class X86CPU {
     private(set) var waitingForInput = false
     private(set) var instructionsExecuted: UInt64 = 0
 
+    /// 周辺デバイスバス（PIC / PIT / RTC / キーボード / PCI / IDE など）。
+    let devices = X86DeviceBus()
+    /// BIOS と IDE で共有するディスクイメージ。
+    private(set) var attachedDisk: X86DiskImage?
+    /// HLT で割り込み待ちになっている状態（OS のアイドル）。
+    private(set) var waitingForInterrupt = false
+    /// STI / SS ロード直後の割り込み禁止期間（命令数）。
+    private var interruptInhibit = 0
+    /// デバイス時刻の供給元（テストで差し替え可能）。
+    var timeSource: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+    var nowNanos: UInt64 { timeSource() }
+
     var onChar: ((UInt8) -> Void)?
     var onClearScreen: (() -> Void)?
 
@@ -115,6 +127,12 @@ final class X86CPU {
 
     init(memorySize: Int = 16 << 20) {
         memory = [UInt8](repeating: 0, count: memorySize)
+        devices.cpu = self
+    }
+
+    /// ディスクイメージを接続する（BIOS ブート時に呼ばれる）。
+    func attachDisk(_ disk: X86DiskImage) {
+        attachedDisk = disk
     }
 
     // MARK: - 公開操作
@@ -134,6 +152,9 @@ final class X86CPU {
         halted = false
         exitCode = 0
         waitingForInput = false
+        waitingForInterrupt = false
+        interruptInhibit = 0
+        devices.reset()
         controlRegisters = [UInt32](repeating: 0, count: 8)
         gdtrBase = 0
         gdtrLimit = 0
@@ -182,10 +203,12 @@ final class X86CPU {
         self.exitCode = exitCode
     }
 
-    /// コンソール入力をキューへ追加する。
+    /// コンソール入力をキューへ追加する（シリアル / BIOS 用に加え、
+    /// キーボードコントローラへはスキャンコード化して渡す）。
     func provideInput(_ bytes: [UInt8]) {
         inputQueue.append(contentsOf: bytes)
         if !bytes.isEmpty { waitingForInput = false }
+        devices.keyboard.receiveText(bytes)
     }
 
     /// 入力を 1 バイト取り出す（無ければ nil）。BIOS のキーボード処理から使う。
@@ -200,14 +223,55 @@ final class X86CPU {
 
     var hasInput: Bool { !inputQueue.isEmpty }
 
-    /// 最大で指定した命令数だけ実行する。停止・入力待ちで早期に返る。
+    /// 最大で指定した命令数だけ実行する。停止・入力待ち・割り込み待ちで早期に返る。
     func run(maxInstructions: Int) throws {
         var count = 0
-        while !halted && !waitingForInput && count < maxInstructions {
+        while !halted && !waitingForInput && !waitingForInterrupt && count < maxInstructions {
+            try serviceInterrupts()
             try step()
+            if interruptInhibit > 0 { interruptInhibit -= 1 }
             count += 1
             instructionsExecuted += 1
         }
+    }
+
+    /// 配送可能なハードウェア割り込みがあれば命令境界で配送する。
+    private func serviceInterrupts() throws {
+        devices.updateDevices(now: nowNanos)
+        guard interruptInhibit == 0, flag(Self.flagInterrupt),
+              let pending = devices.pic.pendingInterrupt() else { return }
+        devices.pic.acknowledge(irq: pending.irq)
+        try deliverHardwareInterrupt(vector: pending.vector)
+    }
+
+    /// HLT で割り込み待ちの間に割り込みが届いたら配送して実行を再開する。
+    @discardableResult
+    func pollInterrupts() throws -> Bool {
+        guard waitingForInterrupt else { return false }
+        devices.updateDevices(now: nowNanos)
+        guard flag(Self.flagInterrupt), let pending = devices.pic.pendingInterrupt() else { return false }
+        devices.pic.acknowledge(irq: pending.irq)
+        waitingForInterrupt = false
+        try deliverHardwareInterrupt(vector: pending.vector)
+        return true
+    }
+
+    /// ハードウェア割り込みの配送（リアルモードは IVT、プロテクトモードは IDT）。
+    private func deliverHardwareInterrupt(vector: UInt8) throws {
+        if protectedMode {
+            try dispatchGate(vector: vector, errorCode: nil, returnIP: instructionPointer)
+            return
+        }
+        let entry = Int(vector) * 4
+        let newIP = try readMemory(at: entry, size: 2)
+        let newCS = try readMemory(at: entry + 2, size: 2)
+        try push(flags & 0xFFFF, size: 2)
+        try push(UInt32(segments[1]), size: 2)
+        try push(instructionPointer, size: 2)
+        setFlag(Self.flagInterrupt, false)
+        setFlag(Self.flagTrap, false)
+        setSegment(1, UInt16(newCS & 0xFFFF))
+        instructionPointer = newIP & 0xFFFF
     }
 
     // MARK: - レジスタアクセス
@@ -908,7 +972,10 @@ final class X86CPU {
             case 0x07: try loadSegmentRegister(0, UInt16(try pop(size: operandSize) & 0xFFFF)); return
             case 0x0E: try push(UInt32(segments[1]), size: operandSize); return
             case 0x16: try push(UInt32(segments[2]), size: operandSize); return
-            case 0x17: try loadSegmentRegister(2, UInt16(try pop(size: operandSize) & 0xFFFF)); return
+            case 0x17: // POP SS（次の命令までは割り込みを受け付けない）
+                try loadSegmentRegister(2, UInt16(try pop(size: operandSize) & 0xFFFF))
+                interruptInhibit = 2
+                return
             case 0x1E: try push(UInt32(segments[3]), size: operandSize); return
             case 0x1F: try loadSegmentRegister(3, UInt16(try pop(size: operandSize) & 0xFFFF)); return
             case 0x27, 0x2F, 0x37, 0x3F: executeBCDAdjust(opcode); return
@@ -1030,6 +1097,7 @@ final class X86CPU {
             guard modRM.reg != 1 else { throw X86Fault.unimplementedOpcode(opcode, address: address) }
             let value = try readOperand(modRM, size: 2)
             try loadSegmentRegister(modRM.reg, UInt16(value & 0xFFFF))
+            if modRM.reg == 2 { interruptInhibit = 2 } // MOV SS の割り込みシャドウ
         case 0x8F: // POP r/m
             let modRM = try decodeModRM()
             let value = try pop(size: operandSize)
@@ -1087,7 +1155,7 @@ final class X86CPU {
                 let value = size == 1 ? UInt32(register8(0)) : (size == 2 ? UInt32(register16(0)) : register32(0))
                 try writeGuest(segmentIndex: segmentIndex, offset: offset, size: size, value)
             }
-        case 0xA4...0xA7, 0xAA...0xAF: // 文字列操作
+        case 0xA4...0xA7, 0xAA...0xAF, 0x6C...0x6F: // 文字列操作（INS / OUTS を含む）
             try executeStringOperation(opcode: opcode, operandSize: operandSize, repeatPrefix: repeatPrefix)
         case 0xA8, 0xA9: // TEST AL / eAX, imm
             let size = opcode == 0xA8 ? 1 : operandSize
@@ -1160,6 +1228,15 @@ final class X86CPU {
             let count = (opcode == 0xD0 || opcode == 0xD1) ? 1 : Int(register8(1))
             let value = try readOperand(modRM, size: size)
             try writeOperand(modRM, size: size, shift(modRM.reg, value, count, size: size))
+        case 0xD8...0xDF: // FPU エスケープ（最小限のスタブ: FNSTCW / FNSTSW のみ実データ）
+            let modRM = try decodeModRM()
+            if !modRM.isRegister {
+                if opcode == 0xD9 && modRM.reg == 7 { // FNSTCW
+                    try writeOperand(modRM, size: 2, 0x037F)
+                } else if opcode == 0xDD && modRM.reg == 7 { // FNSTSW
+                    try writeOperand(modRM, size: 2, 0)
+                }
+            }
         case 0xD4: // AAM
             let base = UInt32(try fetch8())
             guard base != 0 else { throw divideFault(address: address) }
@@ -1231,9 +1308,13 @@ final class X86CPU {
         case 0xEE, 0xEF: // OUT DX, AL / eAX
             let size = opcode == 0xEE ? 1 : operandSize
             portOut(register16(2), value: size == 1 ? UInt32(register8(0)) : (size == 2 ? UInt32(register16(0)) : register32(0)), size: size)
-        case 0xF4: // HLT
-            halted = true
-            exitCode = 0
+        case 0xF4: // HLT（割り込み可能なら OS のアイドルとして待機する）
+            if flag(Self.flagInterrupt) {
+                waitingForInterrupt = true
+            } else {
+                halted = true
+                exitCode = 0
+            }
         case 0xF5: // CMC
             setFlag(Self.flagCarry, !flag(Self.flagCarry))
         case 0xF6, 0xF7: // グループ3
@@ -1241,7 +1322,9 @@ final class X86CPU {
         case 0xF8: setFlag(Self.flagCarry, false)
         case 0xF9: setFlag(Self.flagCarry, true)
         case 0xFA: setFlag(Self.flagInterrupt, false)
-        case 0xFB: setFlag(Self.flagInterrupt, true)
+        case 0xFB: // STI（次の命令までは割り込みを受け付けない）
+            setFlag(Self.flagInterrupt, true)
+            interruptInhibit = 2
         case 0xFC: setFlag(Self.flagDirection, false)
         case 0xFD: setFlag(Self.flagDirection, true)
         case 0xFE: // グループ4（INC / DEC byte）
@@ -1572,6 +1655,14 @@ final class X86CPU {
             let b = try readGuest(segmentIndex: 0, offset: destinationOffset, size: size)
             _ = subtractWithFlags(registerValue(0, size: size), b, size: size, borrowIn: false)
             advance(7)
+        case 0x6C, 0x6D: // INS（ポート DX → ES:DI）
+            let value = portIn(UInt16(registers[2] & 0xFFFF), size: size)
+            try writeGuest(segmentIndex: 0, offset: destinationOffset, size: size, value)
+            advance(7)
+        case 0x6E, 0x6F: // OUTS（DS:SI → ポート DX）
+            let value = try readGuest(segmentIndex: sourceSegment, offset: sourceOffset, size: size)
+            portOut(UInt16(registers[2] & 0xFFFF), value: value, size: size)
+            advance(6)
         default:
             break
         }
@@ -1741,22 +1832,13 @@ final class X86CPU {
         }
     }
 
-    // MARK: - ポート I/O（シリアル COM1 / COM2 をコンソールへ接続）
+    // MARK: - ポート I/O（デバイスバスへ委譲）
 
     private func portIn(_ port: UInt16, size: Int) -> UInt32 {
-        switch port {
-        case 0x3F8, 0x2F8:
-            return UInt32(nextInputByte() ?? 0)
-        case 0x3FD, 0x2FD:
-            return 0x20 | (hasInput ? 0x01 : 0)
-        default:
-            return mask(forSize: size)
-        }
+        devices.readPort(port, size: size)
     }
 
     private func portOut(_ port: UInt16, value: UInt32, size: Int) {
-        if port == 0x3F8 || port == 0x2F8 {
-            onChar?(UInt8(value & 0xFF))
-        }
+        devices.writePort(port, value: value, size: size)
     }
 }

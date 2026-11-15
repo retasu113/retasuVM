@@ -43,15 +43,25 @@ final class X86Session: GuestSession {
     func boot(imageData: [UInt8]) throws {
         if Multiboot.isMultibootKernel(imageData) {
             try Multiboot.boot(cpu: cpu, imageData: imageData)
+            attachRAMDiskIfNeeded()
         } else if let iso = try? ISO9660Image(data: imageData),
                   let kernel = iso.file(named: "KERNEL.ELF"),
                   Multiboot.isMultibootKernel(kernel) {
             try Multiboot.boot(cpu: cpu, imageData: kernel)
+            attachRAMDiskIfNeeded()
         } else {
             try bios.boot(imageData: imageData)
         }
         runTask = Task { [weak self] in
             await self?.runLoop()
+        }
+    }
+
+    /// Multiboot 起動時はブートイメージがディスクにならないため、
+    /// IDE 用に RAM ディスク（16 MiB、内容は VM の停止で消える）を接続する。
+    private func attachRAMDiskIfNeeded() {
+        if cpu.attachedDisk == nil {
+            cpu.attachDisk(X86DiskImage(data: [UInt8](repeating: 0, count: 16 << 20)))
         }
     }
 
@@ -73,7 +83,17 @@ final class X86Session: GuestSession {
                 onHalt?(cpu.exitCode)
                 return
             }
-            if cpu.waitingForInput {
+            if cpu.waitingForInterrupt {
+                // OS のアイドル状態: 割り込み（タイマ・キーボード等）を待つ
+                try? await Task.sleep(nanoseconds: 5_000_000)
+                do {
+                    _ = try cpu.pollInterrupts()
+                } catch {
+                    flushOutput()
+                    onFault?((error as? X86Fault)?.description ?? error.localizedDescription)
+                    return
+                }
+            } else if cpu.waitingForInput {
                 try? await Task.sleep(nanoseconds: 20_000_000)
             }
         }

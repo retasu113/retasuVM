@@ -25,7 +25,16 @@ enum X86BootError: Error, CustomStringConvertible, LocalizedError {
 final class X86BIOS {
     private weak var cpu: X86CPU?
 
-    private var diskData: [UInt8] = []
+    /// IDE コントローラと共有するディスクイメージ。
+    private var diskBox: X86DiskImage?
+    private var diskData: [UInt8] { diskBox?.data ?? [] }
+
+    /// ディスクイメージを設定し、CPU（IDE コントローラ）へも接続する。
+    private func setDisk(_ data: [UInt8]) {
+        let box = X86DiskImage(data: data)
+        diskBox = box
+        cpu?.attachDisk(box)
+    }
     private var diskSectorSize = 512
     private var heads = 255
     private var sectorsPerTrack = 63
@@ -48,7 +57,7 @@ final class X86BIOS {
             } catch let error as ElToritoError {
                 throw X86BootError.notBootable(error.description)
             }
-            diskData = image.diskData
+            setDisk(image.diskData)
             diskSectorSize = image.diskSectorSize
             heads = image.heads
             sectorsPerTrack = image.sectorsPerTrack
@@ -62,7 +71,7 @@ final class X86BIOS {
         } else {
             // raw イメージ: 先頭セクタ（MBR / ブートセクタ）を読み込む
             guard imageData.count >= 512 else { throw X86BootError.imageTooSmall }
-            diskData = imageData
+            setDisk(imageData)
             diskSectorSize = 512
             switch imageData.count {
             case 1_228_800: heads = 2; sectorsPerTrack = 15; bootDrive = 0x00
@@ -231,11 +240,17 @@ final class X86BIOS {
             return
         }
         if isWrite {
+            guard let box = diskBox else {
+                setDiskResult(success: false, status: 0x01)
+                return
+            }
+            var data = box.data
             for i in 0..<byteCount {
                 if let byte = try? cpu.readMemory8(at: buffer + i) {
-                    diskData[byteOffset + i] = byte
+                    data[byteOffset + i] = byte
                 }
             }
+            box.data = data
         } else {
             for i in 0..<byteCount {
                 try? cpu.writeMemory8(at: buffer + i, diskData[byteOffset + i])
