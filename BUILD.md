@@ -40,14 +40,15 @@ retasuVM.swiftpm/
 │   ├── IsoDemoOS.swift        … ISO ブート確認用ゲスト（サンプル ISO に収録）
 │   ├── GuestOS.swift          … 旧ファイル名の名残（空。RetasuOS.swift に改名済み）
 │   ├── VMEngine.swift         … EmulatorSession（RISC-V 実行セッション管理）
-│   ├── X86CPU.swift           … x86 CPU エミュレータ（リアル / プロテクト / ロングモード）
+│   ├── X86CPU.swift           … x86 CPU エミュレータ（リアル / プロテクト / ロングモード、x87 / MMX / SSE〜SSE4.1）
 │   ├── X86BIOS.swift          … x86 BIOS サービス層とブート処理（E820 含む）
 │   ├── ElTorito.swift         … El Torito ブート拡張パーサ（x86 ISO ブート）
 │   ├── Multiboot.swift        … Multiboot ブートローダ（ELF32 カーネル起動）
-│   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / RTC / キーボード / PCI / IDE）
+│   ├── X86Devices.swift       … 周辺デバイスバス（PIC / APIC / PIT / RTC / キーボード / PCI / IDE / VGA モード 13h）
 │   ├── X86ACPI.swift          … ACPI テーブル生成（RSDP / XSDT / FADT / DSDT / MADT）
 │   ├── X86FAT.swift           … FAT12 / 16 / 32 ファイルシステム（読み書き）
-│   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Loaded Image + LoadImage（デバイスパス対応）+ ConIn + イベント通知 + ドライババインディング + GOP + Block I/O + SFS + 変数）
+│   ├── X86UEFI.swift          … UEFI ファームウェア（PE32+ ローダ + プロトコル DB + Loaded Image + LoadImage（デバイスパス対応）+ ConIn + イベント通知・グループ + ドライババインディング + GOP（3 モード）+ Block I/O + SFS + 変数 + メモリアロケータ + Secure Boot + SetVirtualAddressMap）
+│   ├── SHA256.swift           … SHA-256 実装（Secure Boot の Authenticode ハッシュ用）
 │   ├── X86Session.swift       … x86 実行セッション
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ

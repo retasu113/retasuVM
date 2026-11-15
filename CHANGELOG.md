@@ -2,6 +2,100 @@
 
 このプロジェクトの変更履歴です。バージョン形式は Semantic Versioning に従います。
 
+## [0.12.0] - 2026-11-15
+
+### 追加
+
+- x86 CPU に MMX を実装した（64 ビット整数 SIMD 一式と
+  EMMS。レジスタは x87 スタックとは別管理）。
+- SSE3（MOVSLDUP / MOVSHDUP / MOVDDUP / HADD / HSUB /
+  ADDSUB / LDDQU）、SSSE3（PSHUFB / PHADD / PHSUB /
+  PMADDUBSW / PSIGN / PMULHRSW / PABS）、SSE4.1
+  （PMOVSX / PMOVZX / BLEND / PBLEND / DPPS / DPPD /
+  ROUND / PINSR / PEXTR / INSERTPS / MPSADBW / PMULLD /
+  PMULDQ / PCMPEQQ）を実装した。CPUID リーフ 1 / 7 を
+  拡張し、SSE3 / SSSE3 / SSE4.1 / POPCNT / MOVBE /
+  XSAVE などを申告するようになった。
+- POPCNT、MOVBE、RDTSC / RDTSCP（IA32_TSC_AUX MSR）、
+  CMPXCHG8B / CMPXCHG16B を実装した。
+- XSAVE / XRSTOR / XSAVEOPT と XGETBV / XSETBV を実装
+  した（XCR0 は x87 + SSE コンポーネントのみ）。
+- CR0.TS セット時の #NM 配送、FLDENV / FNSTENV の
+  完全な環境転送、FNSAVE / FRSTOR、FISTTP を実装した。
+- UEFI に本物のメモリアロケータを実装した。ページの
+  空き管理とプールのフリーリストで FreePages / FreePool
+  が実際に回収し、AllocatePages の AnyPages /
+  MaxAddress / Address、UnloadImage の領域回収に対応
+  した。GetMemoryMap は実際の確保状況を反映する。
+- UEFI に Secure Boot（イメージハッシュ方式）を実装
+  した。SecureBoot / SetupMode 変数、PK 登録による
+  ユーザーモード移行、db / dbx の署名リスト（SHA-256
+  ハッシュ）による LoadImage の検証に対応した。
+  Authenticode ハッシュ計算のため SHA-256 を新規実装
+  した（Engine/SHA256.swift）。証明書（X.509）の検証は
+  未対応。
+- GOP が 640×400 / 800×600 / 1024×768 の 3 モードに
+  対応した（QueryMode / SetMode）。
+- CreateEventEx のイベントグループ GUID（ExitBootServices /
+  SetVirtualAddressMap グループ）に対応した。
+- SetVirtualAddressMap を実装した。ランタイム領域の
+  対応表を記録し、ConvertPointer と仮想アドレス経由の
+  ランタイムサービス呼び出しに対応した。メモリマップは
+  ランタイム属性と VirtualStart を正しく報告する。
+- VGA モード 13h（320×200、256 色）に対応した。BIOS
+  INT 10h のモード設定、DAC パレット、アプリの画面
+  表示への描画に対応する（モード 12h は未対応）。
+- アプリの画面表示が変更通知に対応した（チェックサムで
+  変化を検出して即時更新し、ポーリングは 500 ミリ秒
+  間隔に緩和）。
+- アプリアイコンを設定した（レタスの葉とモニタを
+  モチーフにしたアイコン）。
+
+### 修正
+
+- CLTS（0F 06）が CR0.TS を実際にはクリアして
+  いなかった。
+- RDTSC（0F 31）が未実装だった（CPUID では TSC を
+  申告していた）。
+- x87 の DD /4・/5 の割り当て違いを直した（正しくは
+  FRSTOR / FUCOM m64）。
+- SSSE3 の水平演算（PHADD / PHSUB 系）を 64 ビット
+  単位で処理し、dest / src のペア順序が混ざっていた。
+- SSSE3 / SSE4.1 / 0F 3A のオペコード割り当てずれを
+  直した（PMADDUBSW / PSIGN / PMULHRSW / PCMPEQQ /
+  PMULDQ / ROUND 系 / PEXTRD・PEXTRQ）。
+- DPPS / DPPD の即値マスク（積和対象マスクと書き込み
+  マスク）が逆だった。
+- 80 ビット拡張精度の読み込みで指数部の上位バイトが
+  落ち、大きな値が 0 になっていた（FRSTOR / FLD m80 /
+  FXRSTOR の x87 復元に影響）。
+- Secure Boot の証明書種別 GUID（EFI_CERT_SHA256）の
+  定数タイポを直した。
+- 変数の列挙（GetNextVariableName）で、ファームウェア
+  合成変数（SecureBoot / SetupMode）をゲスト変数の
+  後ろに並べるよう変更した（列挙順は仕様上不定だが、
+  順序に依存するアプリとの互換性のため）。
+
+### 検証
+
+- 新規統合テスト: CPU 拡張カーネル（MMX / SSE3 /
+  SSSE3 / SSE4.1 / POPCNT / MOVBE / RDTSCP /
+  CMPXCHG8B・16B / XSAVE・XRSTOR / FISTTP /
+  FNSAVE・FRSTOR / FLDENV / #NM ハンドラ / VGA
+  モード 13h の描画とパレット確認）、UEFI5（アロ
+  ケータ、GOP モード切替、CMPXCHG16B、Secure Boot
+  の登録・検証・dbx 優先の拒否・未登録の拒否・
+  ユーザーモードでの db 更新拒否、CreateEventEx
+  グループ通知、SetVirtualAddressMap + CR3 切替後の
+  仮想アドレス経由 GetTime）。すべて合格。
+- 全回帰テスト（リング / DMA / ロングモード /
+  デバイス / Multiboot / タスクスイッチ・SWAPGS /
+  FPU・SSE / BIOS ISO / UEFI サンプル 4 種 / LFN /
+  変数永続化 / RISC-V / ARM / Codable 寛容デコード）
+  合格。全 37 ファイルの文法チェックとエンジン +
+  モデルの型チェック合格。
+- 実機（iPhone / iPad の Swift Playgrounds）での検証は未実施。
+
 ## [0.11.0] - 2026-11-15
 
 ### 追加
