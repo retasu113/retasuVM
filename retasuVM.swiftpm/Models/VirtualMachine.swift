@@ -1,0 +1,111 @@
+import Foundation
+
+/// 仮想マシンの状態。
+///
+/// 状態は色だけに頼らず、必ずラベル（文字列）とシンボルでも表す
+/// （HIG: 色のみで情報を伝えない）。
+enum VMState: String, Codable, CaseIterable {
+    case stopped
+    case running
+    case paused
+    case error
+
+    /// 画面表示・VoiceOver 共通のラベル
+    var label: String {
+        switch self {
+        case .stopped: return "停止中"
+        case .running: return "実行中"
+        case .paused: return "一時停止中"
+        case .error: return "エラー"
+        }
+    }
+
+    /// 状態を表す SF Symbol 名
+    var systemImage: String {
+        switch self {
+        case .stopped: return "stop.circle.fill"
+        case .running: return "play.circle.fill"
+        case .paused: return "pause.circle.fill"
+        case .error: return "exclamationmark.triangle.fill"
+        }
+    }
+}
+
+/// ゲスト OS の種類。
+enum GuestOS: String, Codable, CaseIterable, Identifiable {
+    case linux
+    case macOS
+    case windows
+    case other
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .linux: return "Linux"
+        case .macOS: return "macOS"
+        case .windows: return "Windows"
+        case .other: return "その他"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .linux: return "terminal"
+        case .macOS: return "macwindow"
+        case .windows: return "pc"
+        case .other: return "desktopcomputer"
+        }
+    }
+}
+
+/// 仮想マシンのハードウェア構成。
+struct VMConfiguration: Codable, Equatable {
+    var cpuCount: Int = 2
+    var memoryMB: Int = 4096
+    var diskGB: Int = 32
+    var guestOS: GuestOS = .linux
+    var networkEnabled: Bool = true
+    var sharedFolderEnabled: Bool = false
+
+    var memoryText: String {
+        if memoryMB >= 1024 {
+            let gb = Double(memoryMB) / 1024.0
+            return String(format: "%.0f GB", gb)
+        }
+        return "\(memoryMB) MB"
+    }
+
+    var summary: String {
+        "\(cpuCount) CPU / \(memoryText) / \(diskGB) GB"
+    }
+}
+
+/// 仮想マシン 1 台分のデータ。
+struct VirtualMachine: Identifiable, Codable, Equatable {
+    let id: UUID
+    var name: String
+    var configuration: VMConfiguration
+    var state: VMState
+    var createdAt: Date
+    var lastStartedAt: Date?
+    var errorMessage: String?
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        configuration: VMConfiguration = VMConfiguration(),
+        state: VMState = .stopped,
+        createdAt: Date = Date(),
+        lastStartedAt: Date? = nil,
+        errorMessage: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.configuration = configuration
+        self.state = state
+        self.createdAt = createdAt
+        self.lastStartedAt = lastStartedAt
+        self.errorMessage = errorMessage
+    }
+}
