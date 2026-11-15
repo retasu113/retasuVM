@@ -1,47 +1,127 @@
 import Foundation
 
-/// 仮想マシンの実行バックエンドが満たすべきインターフェース。
+/// 仮想マシンの実行エンジン（セッション）。
 ///
-/// 現在の実装は `SimulatedVMEngine`（画面遷移と状態管理を確認するための
-/// シミュレーション）であり、実際の仮想化は行わない。
-/// 将来、実バックエンドに差し替える場合はこのプロトコルに適合させる。
-protocol VMEngine {
-    func start(_ vm: VirtualMachine) async throws -> [String]
-    func stop(_ vm: VirtualMachine) async throws -> [String]
-    func pause(_ vm: VirtualMachine) async throws -> [String]
-    func resume(_ vm: VirtualMachine) async throws -> [String]
-}
-
-/// シミュレーション用エンジン。
+/// 構成:
+/// - `RISCVCPU`: RISC-V RV32I ソフトウェア CPU エミュレータ
+/// - `RISCVAssembler`: ゲストプログラム用アセンブラ
+/// - `GuestOS`: ゲスト OS「retasuOS」のアセンブリソース
 ///
-/// 起動・停止などの各操作で、コンソールに表示するログ行を返す。
-/// 遅延はごく短くし、操作の応答性を損なわないようにしている。
-struct SimulatedVMEngine: VMEngine {
-    func start(_ vm: VirtualMachine) async throws -> [String] {
-        try await Task.sleep(for: .milliseconds(600))
-        return [
-            "[retasuVM] \(vm.name) を起動しています…",
-            "[retasuVM] CPU \(vm.configuration.cpuCount) コア / メモリ \(vm.configuration.memoryText) を割り当てました",
-            "[retasuVM] ゲスト OS（\(vm.configuration.guestOS.label)）のブートを開始しました",
-            "[retasuVM] 起動が完了しました（シミュレーション）"
-        ]
+/// iOS / iPadOS ではハードウェア仮想化（Hypervisor）がアプリに提供されないため、
+/// retasuVM は CPU をソフトウェアでエミュレーションし、ゲスト OS を実際に
+/// 実行する。起動すると retasuOS がブートし、コンソールから対話できる。
+///
+/// 1 台の VM につき 1 つのセッションを作り、バックグラウンドで CPU を
+/// 回し続ける。出力はコールバック経由でコンソールへ流れる。
+final class EmulatorSession {
+    private let cpu = RISCVCPU()
+    private var runTask: Task<Void, Never>?
+
+    private var outputBuffer: [UInt8] = []
+    private let bufferLock = NSLock()
+    private let flagLock = NSLock()
+    private var pausedFlag = false
+    private var terminatedFlag = false
+
+    /// ゲストの出力（文字列）がまとまって届く
+    var onOutput: ((String) -> Void)?
+    /// ゲストが画面消去を要求した
+    var onClear: (() -> Void)?
+    /// ゲストが終了した（引数は終了コード）
+    var onHalt: ((Int32) -> Void)?
+    /// CPU 異常で停止した（引数はエラーメッセージ）
+    var onFault: ((String) -> Void)?
+
+    var isPaused: Bool {
+        flagLock.lock()
+        defer { flagLock.unlock() }
+        return pausedFlag
     }
 
-    func stop(_ vm: VirtualMachine) async throws -> [String] {
-        try await Task.sleep(for: .milliseconds(400))
-        return [
-            "[retasuVM] \(vm.name) にシャットダウンを要求しました",
-            "[retasuVM] 停止しました"
-        ]
+    private var isTerminated: Bool {
+        flagLock.lock()
+        defer { flagLock.unlock() }
+        return terminatedFlag
     }
 
-    func pause(_ vm: VirtualMachine) async throws -> [String] {
-        try await Task.sleep(for: .milliseconds(300))
-        return ["[retasuVM] \(vm.name) を一時停止しました"]
+    /// ゲスト OS をアセンブルして読み込み、実行を開始する。
+    func boot() throws {
+        let program = try RISCVAssembler().assemble(GuestOS.source)
+        cpu.loadProgram(program.bytes, at: program.entry)
+        cpu.onChar = { [weak self] byte in
+            guard let self else { return }
+            self.bufferLock.lock()
+            self.outputBuffer.append(byte)
+            self.bufferLock.unlock()
+        }
+        cpu.onClear = { [weak self] in
+            self?.onClear?()
+        }
+        runTask = Task { [weak self] in
+            await self?.runLoop()
+        }
     }
 
-    func resume(_ vm: VirtualMachine) async throws -> [String] {
-        try await Task.sleep(for: .milliseconds(300))
-        return ["[retasuVM] \(vm.name) を再開しました"]
+    private func runLoop() async {
+        while !Task.isCancelled {
+            if isPaused {
+                flushOutput()
+                try? await Task.sleep(for: .milliseconds(40))
+                continue
+            }
+            do {
+                _ = try cpu.run(maxInstructions: 20_000)
+            } catch let fault as CPUFault {
+                flushOutput()
+                if !isTerminated { onFault?(fault.description) }
+                return
+            } catch {
+                flushOutput()
+                if !isTerminated { onFault?(error.localizedDescription) }
+                return
+            }
+            flushOutput()
+            if cpu.halted {
+                if !isTerminated { onHalt?(cpu.exitCode) }
+                return
+            }
+            if cpu.waitingForInput {
+                try? await Task.sleep(for: .milliseconds(25))
+            } else {
+                await Task.yield()
+            }
+        }
+    }
+
+    private func flushOutput() {
+        bufferLock.lock()
+        let bytes = outputBuffer
+        outputBuffer = []
+        bufferLock.unlock()
+        if !bytes.isEmpty {
+            onOutput?(String(decoding: bytes, as: UTF8.self))
+        }
+    }
+
+    // MARK: - 操作
+
+    /// キーボード入力をゲストへ送る。
+    func sendInput(_ text: String) {
+        cpu.provideInput([UInt8](text.utf8))
+    }
+
+    func setPaused(_ paused: Bool) {
+        flagLock.lock()
+        pausedFlag = paused
+        flagLock.unlock()
+    }
+
+    /// セッションを破棄する（電源断相当）。onHalt / onFault は呼ばれない。
+    func terminate() {
+        flagLock.lock()
+        terminatedFlag = true
+        flagLock.unlock()
+        runTask?.cancel()
+        runTask = nil
     }
 }
