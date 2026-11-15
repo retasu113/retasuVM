@@ -44,6 +44,11 @@ final class VMStore: ObservableObject {
         consoleLogs[id] ?? []
     }
 
+    /// ゲストの画面スナップショット（画面表示用、対応セッションのみ）。
+    func screenSnapshot(for id: UUID) -> GuestScreenSnapshot? {
+        sessions[id]?.screenSnapshot()
+    }
+
     func terminalText(for id: UUID) -> String {
         consoleText[id] ?? ""
     }
