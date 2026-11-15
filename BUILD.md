@@ -28,9 +28,14 @@ retasuVM.swiftpm/
 │   ├── VirtualMachine.swift … VM・構成・状態のモデル
 │   └── VMStore.swift          … 一覧管理・状態遷移・永続化
 ├── Engine/
-│   ├── RISCVCPU.swift         … RISC-V RV32I CPU エミュレータ
+│   ├── RISCVCPU.swift         … RISC-V RV32IM CPU エミュレータ
 │   ├── RISCVAssembler.swift   … ゲスト用アセンブラ
-│   ├── GuestOS.swift          … ゲスト OS「retasuOS」のアセンブリソース
+│   ├── GuestRuntime.swift     … ゲスト共通ランタイム（_start と基本ルーチン）
+│   ├── RetasuOS.swift         … ゲスト OS「retasuOS」（対話型モニタ）
+│   ├── PlayOS.swift           … ゲスト OS「PlayOS」（数当てゲーム・サイコロ）
+│   ├── CalcOS.swift           … ゲスト OS「CalcOS」（RPN 計算機）
+│   ├── GuestImage.swift       … 起動イメージの定義と選択
+│   ├── GuestOS.swift          … 旧ファイル名の名残（空。RetasuOS.swift に改名済み）
 │   └── VMEngine.swift         … EmulatorSession（実行セッション管理）
 ├── Views/
 │   ├── VMListView.swift       … 一覧
