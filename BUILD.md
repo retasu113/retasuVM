@@ -40,9 +40,10 @@ retasuVM.swiftpm/
 │   ├── IsoDemoOS.swift        … ISO ブート確認用ゲスト（サンプル ISO に収録）
 │   ├── GuestOS.swift          … 旧ファイル名の名残（空。RetasuOS.swift に改名済み）
 │   ├── VMEngine.swift         … EmulatorSession（RISC-V 実行セッション管理）
-│   ├── X86CPU.swift           … x86 リアルモード CPU エミュレータ
+│   ├── X86CPU.swift           … x86 CPU エミュレータ（リアルモード + プロテクトモード）
 │   ├── X86BIOS.swift          … x86 BIOS サービス層とブート処理
 │   ├── ElTorito.swift         … El Torito ブート拡張パーサ（x86 ISO ブート）
+│   ├── Multiboot.swift        … Multiboot ブートローダ（ELF32 カーネル起動）
 │   ├── X86Session.swift       … x86 実行セッション
 │   ├── ARMCPU.swift           … ARM (ARMv7-A / A32 サブセット) CPU エミュレータ
 │   ├── ARMAssembler.swift     … ARM ゲスト用アセンブラ
