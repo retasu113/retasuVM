@@ -1,27 +1,29 @@
 import Foundation
 
-/// コンソールに表示するログ 1 行分。
+/// 管理イベントのログ 1 行分（詳細画面の「最近の記録」用）。
 struct ConsoleLine: Identifiable, Equatable {
     let id = UUID()
     let date: Date
     let text: String
 }
 
-/// 仮想マシン一覧と状態遷移を管理するストア。
+/// 仮想マシン一覧と実行セッションを管理するストア。
 ///
 /// - 一覧は JSON としてアプリのドキュメントフォルダに保存し、再起動後も保持する。
-/// - 状態遷移は `VMEngine` を通して行い、結果をコンソールログへ追記する。
+/// - 起動すると `EmulatorSession` が RISC-V エミュレータ上でゲスト OS
+///   （retasuOS）を実際に走らせる。コンソール入出力はセッション経由。
 @MainActor
 final class VMStore: ObservableObject {
     @Published private(set) var machines: [VirtualMachine] = []
     @Published private(set) var consoleLogs: [UUID: [ConsoleLine]] = [:]
+    /// コンソール（ターミナル）の表示内容。ゲストの出力がそのまま流れる。
+    @Published private(set) var consoleText: [UUID: String] = [:]
     @Published private(set) var transitioning: Set<UUID> = []
 
-    private let engine: VMEngine
+    private var sessions: [UUID: EmulatorSession] = [:]
     private let fileURL: URL?
 
-    init(engine: VMEngine = SimulatedVMEngine()) {
-        self.engine = engine
+    init() {
         if let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
             self.fileURL = documents.appendingPathComponent("virtual-machines.json")
         } else {
@@ -38,6 +40,10 @@ final class VMStore: ObservableObject {
 
     func log(for id: UUID) -> [ConsoleLine] {
         consoleLogs[id] ?? []
+    }
+
+    func terminalText(for id: UUID) -> String {
+        consoleText[id] ?? ""
     }
 
     func isTransitioning(_ vm: VirtualMachine) -> Bool {
@@ -61,89 +67,155 @@ final class VMStore: ObservableObject {
     }
 
     func delete(_ vm: VirtualMachine) {
+        sessions[vm.id]?.terminate()
+        sessions[vm.id] = nil
         machines.removeAll { $0.id == vm.id }
         consoleLogs[vm.id] = nil
+        consoleText[vm.id] = nil
         save()
     }
 
     // MARK: - 状態遷移
 
+    /// 起動: エミュレータセッションを作り、ゲスト OS をブートする。
     func start(_ vm: VirtualMachine) {
         guard vm.state == .stopped || vm.state == .error else { return }
-        perform(vm, busy: true) { engine in
-            let lines = try await engine.start(vm)
-            return (lines, .running)
+        guard sessions[vm.id] == nil else { return }
+        guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
+
+        consoleText[vm.id] = ""
+        let session = EmulatorSession()
+        let vmID = vm.id
+        session.onOutput = { [weak self] text in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.consoleText[vmID, default: ""] += text
+            }
         }
+        session.onClear = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.consoleText[vmID] = ""
+            }
+        }
+        session.onHalt = { [weak self] exitCode in
+            Task { @MainActor [weak self] in
+                self?.handleGuestHalt(vmID: vmID, exitCode: exitCode)
+            }
+        }
+        session.onFault = { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.handleGuestFault(vmID: vmID, message: message)
+            }
+        }
+
+        do {
+            try session.boot()
+        } catch {
+            machines[index].state = .error
+            machines[index].errorMessage = error.localizedDescription
+            appendLog(for: vm.id, lines: ["[retasuVM] 起動に失敗しました: \(error.localizedDescription)"])
+            save()
+            return
+        }
+
+        sessions[vm.id] = session
+        machines[index].state = .running
+        machines[index].errorMessage = nil
+        machines[index].lastStartedAt = Date()
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を起動しました（retasuOS ブート）"])
+        save()
     }
 
+    /// 停止: セッションを終了する（電源断）。
     func stop(_ vm: VirtualMachine) {
         guard vm.state == .running || vm.state == .paused else { return }
-        perform(vm, busy: true) { engine in
-            let lines = try await engine.stop(vm)
-            return (lines, .stopped)
-        }
+        endSession(vmID: vm.id)
+        setState(vmID: vm.id, .stopped)
+        consoleText[vm.id, default: ""] += "\n[retasuVM] 停止しました\n"
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を停止しました"])
+        save()
     }
 
+    /// 一時停止: CPU の実行を止める（メモリ内容は保持される）。
     func pause(_ vm: VirtualMachine) {
-        guard vm.state == .running else { return }
-        perform(vm, busy: true) { engine in
-            let lines = try await engine.pause(vm)
-            return (lines, .paused)
-        }
+        guard vm.state == .running, let session = sessions[vm.id] else { return }
+        session.setPaused(true)
+        setState(vmID: vm.id, .paused)
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を一時停止しました"])
+        save()
     }
 
     func resume(_ vm: VirtualMachine) {
-        guard vm.state == .paused else { return }
-        perform(vm, busy: true) { engine in
-            let lines = try await engine.resume(vm)
-            return (lines, .running)
-        }
+        guard vm.state == .paused, let session = sessions[vm.id] else { return }
+        session.setPaused(false)
+        setState(vmID: vm.id, .running)
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を再開しました"])
+        save()
     }
 
+    /// 再起動: セッションを作り直してブートし直す。
     func restart(_ vm: VirtualMachine) {
         guard vm.state == .running || vm.state == .paused else { return }
-        perform(vm, busy: true) { engine in
-            var lines = try await engine.stop(vm)
-            lines += try await engine.start(vm)
-            return (lines, .running)
+        endSession(vmID: vm.id)
+        setState(vmID: vm.id, .stopped)
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を再起動します"])
+        if let fresh = machine(id: vm.id) {
+            start(fresh)
         }
     }
 
     /// 強制停止。実行中・一時停止中どちらからでも停止状態へ移す。
     func forceStop(_ vm: VirtualMachine) {
         guard vm.state == .running || vm.state == .paused else { return }
-        perform(vm, busy: true) { _ in
-            (["[retasuVM] \(vm.name) を強制停止しました"], .stopped)
-        }
+        endSession(vmID: vm.id)
+        setState(vmID: vm.id, .stopped)
+        consoleText[vm.id, default: ""] += "\n[retasuVM] 強制停止しました\n"
+        appendLog(for: vm.id, lines: ["[retasuVM] \(vm.name) を強制停止しました"])
+        save()
     }
 
-    private func perform(
-        _ vm: VirtualMachine,
-        busy: Bool,
-        action: @escaping (VMEngine) async throws -> (lines: [String], state: VMState)
-    ) {
-        guard !transitioning.contains(vm.id) else { return }
-        transitioning.insert(vm.id)
-        let engine = self.engine
-        Task {
-            defer { transitioning.remove(vm.id) }
-            do {
-                let result = try await action(engine)
-                guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
-                machines[index].state = result.state
-                machines[index].errorMessage = nil
-                if result.state == .running {
-                    machines[index].lastStartedAt = Date()
-                }
-                appendLog(for: vm.id, lines: result.lines)
-                save()
-            } catch {
-                guard let index = machines.firstIndex(where: { $0.id == vm.id }) else { return }
-                machines[index].state = .error
-                machines[index].errorMessage = error.localizedDescription
-                appendLog(for: vm.id, lines: ["[retasuVM] エラー: \(error.localizedDescription)"])
-                save()
-            }
+    // MARK: - コンソール入力
+
+    /// コンソールからの入力をゲストへ送る。
+    func sendInput(_ vm: VirtualMachine, text: String) {
+        sessions[vm.id]?.sendInput(text)
+    }
+
+    // MARK: - セッション終了イベント
+
+    private func handleGuestHalt(vmID: UUID, exitCode: Int32) {
+        guard sessions[vmID] != nil else { return }
+        sessions[vmID] = nil
+        setState(vmID: vmID, .stopped)
+        consoleText[vmID, default: ""] += "\n[retasuVM] ゲスト OS が終了しました（終了コード \(exitCode)）\n"
+        if let vm = machine(id: vmID) {
+            appendLog(for: vmID, lines: ["[retasuVM] \(vm.name) のゲスト OS が終了しました（終了コード \(exitCode)）"])
+        }
+        save()
+    }
+
+    private func handleGuestFault(vmID: UUID, message: String) {
+        guard sessions[vmID] != nil else { return }
+        sessions[vmID] = nil
+        if let index = machines.firstIndex(where: { $0.id == vmID }) {
+            machines[index].state = .error
+            machines[index].errorMessage = message
+        }
+        consoleText[vmID, default: ""] += "\n[retasuVM] エラーで停止しました: \(message)\n"
+        appendLog(for: vmID, lines: ["[retasuVM] エラー: \(message)"])
+        save()
+    }
+
+    private func endSession(vmID: UUID) {
+        sessions[vmID]?.terminate()
+        sessions[vmID] = nil
+    }
+
+    private func setState(vmID: UUID, _ state: VMState) {
+        guard let index = machines.firstIndex(where: { $0.id == vmID }) else { return }
+        machines[index].state = state
+        if state != .error {
+            machines[index].errorMessage = nil
         }
     }
 
@@ -186,24 +258,24 @@ final class VMStore: ObservableObject {
     static var sampleData: [VirtualMachine] {
         [
             VirtualMachine(
-                name: "Ubuntu テスト環境",
+                name: "retasuOS ゲスト",
                 configuration: VMConfiguration(
-                    cpuCount: 2,
-                    memoryMB: 4096,
-                    diskGB: 32,
+                    cpuCount: 1,
+                    memoryMB: 1,
+                    diskGB: 1,
                     guestOS: .linux,
-                    networkEnabled: true,
-                    sharedFolderEnabled: true
+                    networkEnabled: false,
+                    sharedFolderEnabled: false
                 )
             ),
             VirtualMachine(
-                name: "軽量 Linux",
+                name: "テスト用 VM",
                 configuration: VMConfiguration(
                     cpuCount: 1,
-                    memoryMB: 2048,
-                    diskGB: 16,
-                    guestOS: .linux,
-                    networkEnabled: true,
+                    memoryMB: 1,
+                    diskGB: 1,
+                    guestOS: .other,
+                    networkEnabled: false,
                     sharedFolderEnabled: false
                 )
             )
