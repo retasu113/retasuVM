@@ -64,6 +64,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          # すでに同じタグの Release が存在する場合は、資産を上書きしない
+          # （手動で検証済み ZIP を添付した Release を尊重するため）
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} は既に存在するため、作成とアップロードをスキップします。"
+            exit 0
+          fi
           # 0.x は開発版として Pre-release にする
           PRERELEASE_FLAG=""
           if [[ "$VERSION" == 0.* ]]; then PRERELEASE_FLAG="--prerelease"; fi
