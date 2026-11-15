@@ -13,7 +13,7 @@ import Foundation
 ///
 /// 1 台の VM につき 1 つのセッションを作り、バックグラウンドで CPU を
 /// 回し続ける。出力はコールバック経由でコンソールへ流れる。
-final class EmulatorSession {
+final class EmulatorSession: GuestSession {
     private let cpu = RISCVCPU()
     private var runTask: Task<Void, Never>?
 
