@@ -29,6 +29,8 @@ struct VMListView: View {
                 } description: {
                     Text("右上の＋ボタンから、最初の仮想マシンを作成してください。")
                 }
+            } else if filteredMachines.isEmpty {
+                ContentUnavailableView.search(text: searchText)
             } else {
                 list
             }

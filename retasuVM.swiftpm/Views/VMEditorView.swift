@@ -147,6 +147,8 @@ struct VMEditorView: View {
                     sampleSelection = BuiltInSample.samples(for: newArchitecture).first ?? .kernel
                 }
             }
+            .onChange(of: useSample) { _, _ in syncSampleSelection() }
+            .onChange(of: useISO) { _, _ in syncSampleSelection() }
             .fileImporter(
                 isPresented: $showingISOImporter,
                 allowedContentTypes: [
@@ -264,13 +266,26 @@ struct VMEditorView: View {
         }
     }
 
+    /// サンプル選択が現在のアーキテクチャの候補に含まれていなければ先頭へ合わせる。
+    /// アーキテクチャが変わらない経路（新規作成で最初から RISC-V 等）でも
+    /// 候補外の選択（既定値の .kernel）が残らないようにするための同期。
+    private func syncSampleSelection() {
+        let candidates = BuiltInSample.samples(for: architecture)
+        if !candidates.contains(sampleSelection), let first = candidates.first {
+            sampleSelection = first
+        }
+    }
+
     private func save() {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveUseISO = architecture == .x86 ? true : useISO
+        // 候補外のサンプル選択が残っていたら現在のアーキテクチャの候補へ寄せる
+        let candidates = BuiltInSample.samples(for: architecture)
+        let effectiveSample = candidates.contains(sampleSelection) ? sampleSelection : candidates.first
         // 内蔵サンプル使用時はファイル参照を外す（旧ファイルは後段で片付ける）
-        let sampleApplies = useSample && sampleSelection.architecture == architecture
+        let sampleApplies = useSample && effectiveSample != nil
             && (architecture == .x86 || (architecture == .riscv && useISO))
-        let effectiveBuiltInSample: BuiltInSample? = sampleApplies ? sampleSelection : nil
+        let effectiveBuiltInSample: BuiltInSample? = sampleApplies ? effectiveSample : nil
         let effectiveISOFileName: String?
         let effectiveISODisplayName: String?
         if sampleApplies {
@@ -307,9 +322,12 @@ struct VMEditorView: View {
         )
         if let editing {
             store.update(editing, name: trimmedName, configuration: configuration)
-            // ISO を差し替えた場合は、元の保存ファイルを片付ける
+            // ISO を差し替えた場合は、元の保存ファイルを片付ける。
+            // ただし更新が実際に反映された場合のみ（実行中などで update が
+            // 適用されなかった場合、保存済み構成がまだ旧ファイルを参照する）
             if let oldFileName = editing.configuration.isoFileName,
-               oldFileName != configuration.isoFileName {
+               oldFileName != configuration.isoFileName,
+               store.machine(id: editing.id)?.configuration.isoFileName == configuration.isoFileName {
                 store.deleteISOFile(named: oldFileName)
             }
         } else {

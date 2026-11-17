@@ -2,8 +2,9 @@ import SwiftUI
 
 /// 仮想マシンのコンソール画面。
 ///
-/// RISC-V エミュレータ上で動くゲスト OS（retasuOS）の入出力を表示する
-/// 対話型ターミナル。コマンドを入力するとゲストが実際に実行する。
+/// 全アーキテクチャ共通。ゲストのテキスト入出力を表示する対話型ターミナルと、
+/// x86 の画面モード（VGA / GOP フレームバッファ）の表示を担う。
+/// コマンドを入力するとゲストが実際に実行する。
 /// Reduce Motion が有効な場合はスクロールアニメーションを行わない。
 struct VMConsoleView: View {
     @EnvironmentObject private var store: VMStore
