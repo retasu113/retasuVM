@@ -12,7 +12,7 @@
   - PL011 UART、bdif ストレージチャネル（root / aux のファイルバックドディスク、読み書き対応）。
   - bdif USB チャネル + virtio-usb: ROM が DFU デバイスとしてオンライン化し（VID 0x05AC / PID 0x1227）、libirecovery から CPID=FE00 / iBoot-10151.140.19 として認識されることを確認。
   - PCIe ホスト + virtio（Engine/VMApplePCIe.swift）: virtio-blk（Apple バリアント 0x106B:0x1A00、ベンダデータ capability 付き）と virtio-usb を実装。ディスクは bdif と同じファイルを共有。
-  - リストア経路の検証: idevicerestore 相当のスタックで Sequoia 15.6.1 のリストアを実行し、iBSS のアップロード・検証・起動（iBSS がリカバリモード 05ac:1281 として再列挙されるところまで）到達（継続開発中）。
+  - リストア経路の検証: idevicerestore 相当のスタックで Sequoia 15.6.1 のリストアを実行し、iBSS のアップロード・検証・起動、Ap,LocalPolicy の送信、iBEC の起動、リストア本編（RestoreTrustCache / RestoreRamDisk の送信）まで到達（継続開発中）。
 
 ### 修正（プレリリース前の全ファイル監査で検出・修正）
 
