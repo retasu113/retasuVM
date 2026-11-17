@@ -157,7 +157,8 @@ struct VMConfiguration: Equatable {
     var memoryText: String {
         if memoryMB >= 1024 {
             let gb = Double(memoryMB) / 1024.0
-            return String(format: "%.0f GB", gb)
+            if gb == gb.rounded() { return "\(Int(gb)) GB" }
+            return String(format: "%.1f GB", gb)
         }
         return "\(memoryMB) MB"
     }
@@ -285,6 +286,7 @@ extension VMConfiguration: Codable {
         try container.encode(arm64Platform, forKey: .arm64Platform)
         try container.encode(networkEnabled, forKey: .networkEnabled)
         try container.encode(sharedFolderEnabled, forKey: .sharedFolderEnabled)
+        try container.encode(uefiVariables, forKey: .uefiVariables)
     }
 }
 

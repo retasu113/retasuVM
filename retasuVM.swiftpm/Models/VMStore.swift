@@ -10,7 +10,7 @@ struct ConsoleLine: Identifiable, Equatable {
 /// 仮想マシン一覧と実行セッションを管理するストア。
 ///
 /// - 一覧は JSON としてアプリのドキュメントフォルダに保存し、再起動後も保持する。
-/// - 起動するとアーキテクチャに応じたセッション（RISC-V / x86 / ARM）が
+/// - 起動するとアーキテクチャに応じたセッション（RISC-V / x86 / ARM / ARM64）が
 ///   自作エミュレータ上でゲストを実際に走らせる。コンソール入出力はセッション経由。
 @MainActor
 final class VMStore: ObservableObject {
@@ -91,6 +91,9 @@ final class VMStore: ObservableObject {
         machines.removeAll { $0.id == vm.id }
         consoleLogs[vm.id] = nil
         consoleText[vm.id] = nil
+        screenRevisions[vm.id] = nil
+        sessionGenerations[vm.id] = nil
+        transitioning.remove(vm.id)
         save()
     }
 
@@ -98,21 +101,27 @@ final class VMStore: ObservableObject {
 
     /// セッションのコールバックをストアへ接続する（全アーキテクチャ共通）。
     private func wireCallbacks(session: any GuestSession, vmID: UUID, generation: Int) {
+        // 世代チェック: 再起動後の旧セッションからの遅延コールバックを捨てる
+        // （onHalt / onFault と同じ扱い。削除済み VM のエントリ再生成も防ぐ）
         session.onOutput = { [weak self] text in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.sessionGenerations[vmID] == generation,
+                      self.machines.contains(where: { $0.id == vmID }) else { return }
                 self.consoleText[vmID, default: ""] += text
             }
         }
         session.onScreenChange = { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.sessionGenerations[vmID] == generation,
+                      self.machines.contains(where: { $0.id == vmID }) else { return }
                 self.screenRevisions[vmID, default: 0] += 1
             }
         }
         session.onClear = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.consoleText[vmID] = ""
+                guard let self, self.sessionGenerations[vmID] == generation,
+                      self.machines.contains(where: { $0.id == vmID }) else { return }
+                self.consoleText[vmID] = ""
             }
         }
         session.onHalt = { [weak self] exitCode in
