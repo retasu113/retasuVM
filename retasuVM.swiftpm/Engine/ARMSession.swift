@@ -47,7 +47,7 @@ final class ARMSession: GuestSession {
     }
 
     private func runLoop() async {
-        while !isTerminated {
+        while !isTerminated && !Task.isCancelled {
             if isPaused {
                 try? await Task.sleep(nanoseconds: 30_000_000)
                 continue
@@ -59,6 +59,7 @@ final class ARMSession: GuestSession {
                 if !isTerminated { onFault?((error as? ARMFault)?.description ?? error.localizedDescription) }
                 return
             }
+            flushOutput()
             if cpu.halted {
                 flushOutput()
                 if !isTerminated { onHalt?(cpu.exitCode) }

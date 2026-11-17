@@ -73,6 +73,12 @@ struct ADTNode {
         appendU32(&out, UInt32(children.count))
         for property in allProperties {
             var nameBytes = [UInt8](property.name.utf8)
+            if nameBytes.count > 32 {
+                // 32 バイトの名前フィールドに収めるため、UTF-8 の文字境界までで切る
+                var cut = 32
+                while cut > 0 && (nameBytes[cut] & 0xC0) == 0x80 { cut -= 1 }
+                nameBytes = [UInt8](nameBytes.prefix(cut))
+            }
             nameBytes += [UInt8](repeating: 0, count: max(0, 32 - nameBytes.count))
             out += nameBytes.prefix(32)
             appendU32(&out, UInt32(property.value.count))

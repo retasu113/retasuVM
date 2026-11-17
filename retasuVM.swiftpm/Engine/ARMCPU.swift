@@ -416,7 +416,7 @@ final class ARMCPU {
             }
         }
         if writeBack {
-            writeRegister(rn, up ? finalAddress : finalAddress)
+            writeRegister(rn, finalAddress)
         }
     }
 

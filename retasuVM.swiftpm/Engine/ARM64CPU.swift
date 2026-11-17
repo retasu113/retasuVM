@@ -54,18 +54,38 @@ final class ARM64CPU {
     enum Platform {
         case gic
         case appleSilicon
+        case vmApple
     }
     var platform: Platform = .gic
 
     // MARK: - 状態
 
     var registers = [UInt64](repeating: 0, count: 31)   // X0...X30
+    /// FP/SIMD レジスタファイル（V0...V31、各 128 ビットを lo/hi の 2 ワードで保持）
+    var fpRegisters = [UInt64](repeating: 0, count: 64)
+    var fpsr: UInt32 = 0
+    var fpcr: UInt32 = 0
     private(set) var pc: UInt64 = 0
     var spEL0: UInt64 = 0
+    var tpidrEL0: UInt64 = 0      // TPIDR_EL0（S3_3_C13_C0_2）: executeSystem で専用に振り分け
+    var tpidrROEL0: UInt64 = 0    // TPIDRRO_EL0（S3_3_C13_C0_3、読み取り専用）
     var spEL1: UInt64 = 0
     /// PSTATE（SPSR 形式: NZCV[31:28] / DAIF[9:6] / EL[3:2] / SPSel[0]）
     var pstate: UInt32 = 0x3C5                            // EL1h, 全割り込みマスク
     private(set) var halted = false
+    /// 実行した命令数（診断用）
+    private(set) var instructionsExecuted: UInt64 = 0
+    /// システムレジスタアクセスの診断フック（isRead, key, value, pc）
+    var onSysRegAccess: ((Bool, Int, UInt64, UInt64) -> Void)?
+    /// 例外配送フック（vector, esr, elr）
+    var onException: ((UInt64, UInt64, UInt64) -> Void)?
+    /// 命令フェッチフック（pc, insn）
+    var onFetch: ((UInt64, UInt32) -> Void)?
+    /// 例外配送の診断カウンタ（ベクタオフセット → 回数）と最終例外の内容
+    private(set) var exceptionCounts: [UInt64: Int] = [:]
+    private(set) var lastExceptionESR: UInt64 = 0
+    private(set) var lastExceptionELR: UInt64 = 0
+    private(set) var lastExceptionVector: UInt64 = 0
     private(set) var exitCode: Int32 = 0
     private(set) var waitingForInput = false
     /// WFI でアイドル中（割り込み待ち）
@@ -85,12 +105,57 @@ final class ARM64CPU {
     var spsrEL1: UInt32 = 0
     var esrEL1: UInt64 = 0
     var farEL1: UInt64 = 0
+    var parEL1: UInt64 = 0
+
+    // システムレジスタ（EL2、VMAPPLE の VHE カーネル用）
+    var sctlrEL2: UInt64 = 0
+    var tcrEL2: UInt64 = 0
+    var ttbr0EL2: UInt64 = 0
+    var ttbr1EL2: UInt64 = 0
+    var mairEL2: UInt64 = 0
+    var vbarEL2: UInt64 = 0
+    var elrEL2: UInt64 = 0
+    var spsrEL2: UInt32 = 0
+    var esrEL2: UInt64 = 0
+    var farEL2: UInt64 = 0
+    var hcrEL2: UInt64 = 0
+    var spEL2: UInt64 = 0
+
+    /// 実効 RAM ベース（プラットフォームで切替。既定は従来の 0x4000_0000）
+    var ramBaseAddress: UInt64 = ARM64CPU.ramBase
+    /// 未実装システムレジスタの汎用ストレージ（VMAPPLE 用）
+    private var sysRegStorage: [Int: UInt64] = [:]
+
+    // VMAPPLE デバイス配置
+    var gic3: GICv3? = nil
+    private var vmGICDistPA: UInt64 = 0
+    private var vmGICRedistPA: UInt64 = 0
+    private var vmUARTPA: UInt64 = 0
+    /// AVPBooter ROM イメージ（0x0010_0000 に RAM としてマップ。ROM 起動時のみ）
+    var romData: [UInt8] = []
+    /// vmapple cfg ウィンドウ（0x0040_0000 から 1 MiB。先頭 64 KiB が構造体、残りは RAM）
+    var cfgWindow: [UInt8] = []
+    /// cfg `rnd` レジスタ用 xorshift 状態（読むたびに新しい乱数を返す）
+    private var cfgRNGState: UInt64 = 0x9E37_79B9_7F4A_7C15
+    /// bdif（0x3000_0000、2 MiB）に接続された root / aux ディスク
+    var bdifRootDisk: BdifDisk? = nil
+    var bdifAuxDisk: BdifDisk? = nil
+    /// VMAPPLE PCIe バスと virtio デバイス（ディスク接続時に生成）
+    var pcieBus: PcieBus? = nil
+    var vmAuxBlk: VirtioBlk? = nil
+    var vmRootBlk: VirtioBlk? = nil
+    var vmUsbDev: VirtioUsbDevice? = nil
+    /// 未知の arm-io アクセス記録（診断用、先頭のみ保持）
+    private(set) var unknownMMIOAccesses: [UInt64] = []
 
     // ジェネリックタイマ（物理カウンタ）
-    private let timerFrequency: UInt64 = 62_500_000
+    private var timerFrequency: UInt64 = 62_500_000
     private var timerEpoch = Date()
     private var cntpCval: UInt64 = UInt64.max
     private var cntpCtl: UInt64 = 0                       // bit0 ENABLE, bit1 IMASK
+    private var cntvCval: UInt64 = UInt64.max
+    private var cntvCtl: UInt64 = 0
+    private var cntvOff: UInt64 = 0                       // CNTVOFF_EL2
 
     // 割り込みコントローラ（GIC ライト）
     private var gicDistEnabled = false
@@ -158,10 +223,12 @@ final class ARM64CPU {
     var currentSP: UInt64 {
         get {
             if currentEL == 0 { return spEL0 }
+            if currentEL == 2 { return spSel ? spEL2 : spEL0 }
             return spSel ? spEL1 : spEL0
         }
         set {
             if currentEL == 0 { spEL0 = newValue }
+            else if currentEL == 2 { if spSel { spEL2 = newValue } else { spEL0 = newValue } }
             else if spSel { spEL1 = newValue } else { spEL0 = newValue }
         }
     }
@@ -185,11 +252,12 @@ final class ARM64CPU {
 
     /// フラットバイナリを RAM へ読み込み、実行開始アドレスを設定する。
     func loadProgram(_ bytes: [UInt8], at address: UInt64) {
-        let offset = Int(address - Self.ramBase)
-        guard offset >= 0, offset + bytes.count <= memory.count else { return }
+        guard address >= ramBaseAddress else { return }
+        let offset = Int(address - ramBaseAddress)
+        guard offset + bytes.count <= memory.count else { return }
         memory.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
         pc = address
-        spEL1 = Self.ramBase + UInt64(memorySize) - 0x1000
+        spEL1 = ramBaseAddress + UInt64(memorySize) - 0x1000
         spEL0 = spEL1 - 0x10000
     }
 
@@ -216,8 +284,11 @@ final class ARM64CPU {
             let vaddr = u64(base + 16)
             let fileSize = Int(u64(base + 32))
             let memSize = Int(u64(base + 40))
-            let dest = Int(vaddr - Self.ramBase)
-            guard dest >= 0, dest + memSize <= memory.count, fileOff + fileSize <= data.count else {
+            guard vaddr >= ramBaseAddress else {
+                throw ARM64Fault.invalidELF("セグメントが RAM の範囲外です")
+            }
+            let dest = Int(vaddr - ramBaseAddress)
+            guard dest + memSize <= memory.count, fileOff + fileSize <= data.count else {
                 throw ARM64Fault.invalidELF("セグメントが RAM の範囲外です")
             }
             for j in 0..<memSize {
@@ -225,7 +296,7 @@ final class ARM64CPU {
             }
         }
         pc = entry
-        spEL1 = Self.ramBase + UInt64(memorySize) - 0x1000
+        spEL1 = ramBaseAddress + UInt64(memorySize) - 0x1000
         spEL0 = spEL1 - 0x10000
         return entry
     }
@@ -260,7 +331,9 @@ final class ARM64CPU {
         while !halted && !waitingForInput && count < maxInstructions {
             if idle {
                 // WFI 中: 割り込みが来たら復帰し、来ていなければ呼び出しを返す
-                if platform == .appleSilicon {
+                if platform == .vmApple {
+                    if (vmAppleFIQPending && !fiqMasked) || (vmAppleIRQPending && !irqMasked) { idle = false } else { break }
+                } else if platform == .appleSilicon {
                     if fiqPending && !fiqMasked { idle = false } else { break }
                 } else if interruptPending && !irqMasked { idle = false } else { break }
             }
@@ -299,27 +372,33 @@ final class ARM64CPU {
 
     private func step() throws {
         // 割り込みは命令境界で受け付ける（ELR は次に実行する命令を指す）
-        if platform == .appleSilicon {
+        if platform == .vmApple {
+            if vmAppleFIQPending && !fiqMasked {
+                enterException(vectorOffset: fiqVectorOffset(), elr: pc, esr: 0)
+            } else if vmAppleIRQPending && !irqMasked {
+                enterException(vectorOffset: irqVectorOffset(), elr: pc, esr: 0)
+            }
+        } else if platform == .appleSilicon {
             if fiqPending && !fiqMasked {
                 enterException(vectorOffset: fiqVectorOffset(), elr: pc, esr: 0)
             }
         } else if interruptPending && !irqMasked {
             enterException(vectorOffset: irqVectorOffset(), elr: pc, esr: 0)
         }
+        instructionsExecuted &+= 1
         let instructionPC = pc
         do {
             let insn = try fetch32(at: instructionPC)
+            onFetch?(instructionPC, insn)
             pc = instructionPC &+ 4
             try execute(insn, at: instructionPC)
         } catch let abort as AbortSignal {
             // データ / 命令アボートは例外として配送する（セッションは継続）
-            farEL1 = abort.address
-            let fromLower = currentEL == 0
+            let target = exceptionTargetEL
+            if target == 2 { farEL2 = abort.address } else { farEL1 = abort.address }
+            let fromLower = currentEL < target
             let ec: UInt64 = abort.isInstruction ? (fromLower ? 0x20 : 0x21) : (fromLower ? 0x24 : 0x25)
-            esrEL1 = (ec << 26) | abort.fsc
-            elrEL1 = abort.isInstruction ? instructionPC : instructionPC
-            spsrEL1 = pstate
-            enterEL1(vectorOffset: syncVectorOffset())
+            enterException(vectorOffset: syncVectorOffset(), elr: instructionPC, esr: (ec << 26) | (1 << 25) | (abort.isWrite ? (1 << 6) : 0) | abort.fsc)
         }
     }
 
@@ -327,6 +406,7 @@ final class ARM64CPU {
     private struct AbortSignal: Error {
         var address: UInt64
         var isInstruction: Bool
+        var isWrite: Bool = false
         var fsc: UInt64    // フォルトステータスコード（レベル含む下位 6 ビット）
     }
 
@@ -463,30 +543,50 @@ final class ARM64CPU {
         }
     }
 
-    /// 例外を EL1 へ配送する（ELR / ESR を設定し、SPSR へ現在の PSTATE を退避）。
+    /// 例外の配送先 EL（現在の EL が EL2 のときは EL2、それ以外は EL1）。
+    private var exceptionTargetEL: Int {
+        if currentEL == 2 { return 2 }
+        return 1
+    }
+
+    /// 例外をターゲット EL へ配送する（ELR / ESR を設定し、SPSR へ現在の PSTATE を退避）。
     private func enterException(vectorOffset: UInt64, elr: UInt64, esr: UInt64) {
-        esrEL1 = esr
-        elrEL1 = elr
-        spsrEL1 = pstate
-        enterEL1(vectorOffset: vectorOffset)
+        exceptionCounts[vectorOffset, default: 0] += 1
+        onException?(vectorOffset, esr, elr)
+        lastExceptionESR = esr
+        lastExceptionELR = elr
+        lastExceptionVector = vectorOffset
+        let target = exceptionTargetEL
+        if target == 2 {
+            esrEL2 = esr
+            elrEL2 = elr
+            spsrEL2 = pstate
+        } else {
+            esrEL1 = esr
+            elrEL1 = elr
+            spsrEL1 = pstate
+        }
+        // 例外突入: ターゲット EL / SP_ELx を使い、割り込みをマスクする
+        var newState = pstate
+        newState = (newState & 0xFFFF_FF00) | 0x3C0 | (UInt32(target) << 2) | 0x01
+        pstate = newState
+        let vbar = target == 2 ? vbarEL2 : vbarEL1
+        pc = (vbar & ~0x7FF) &+ vectorOffset
     }
 
     /// 同期例外（SVC / 未定義命令など）。ELR は呼び出し側で決める。
     private func raiseSync(ec: UInt64, iss: UInt64, elr: UInt64) {
-        enterException(vectorOffset: syncVectorOffset(), elr: elr, esr: (ec << 26) | (iss & 0x1FF_FFFF))
-    }
-
-    private func enterEL1(vectorOffset: UInt64) {
-        // 例外突入: EL1 / SP_EL1 を使い、割り込みをマスクする
-        var newState = pstate
-        newState = (newState & 0xFFFF_FF00) | 0x3C0 | 0x05   // DAIF=1111, EL=1, SPSel=1
-        pstate = newState
-        pc = (vbarEL1 & ~0x7FF) &+ vectorOffset
+        enterException(vectorOffset: syncVectorOffset(), elr: elr, esr: (ec << 26) | (1 << 25) | (iss & 0x1FF_FFFF))
     }
 
     private func eret() {
-        pc = elrEL1
-        pstate = spsrEL1
+        if currentEL == 2 {
+            pc = elrEL2
+            pstate = spsrEL2
+        } else {
+            pc = elrEL1
+            pstate = spsrEL1
+        }
     }
 
     // MARK: - メモリアクセス（MMU + 物理）
@@ -496,15 +596,36 @@ final class ARM64CPU {
         return try readPhysical32(physical)
     }
 
-    /// ステージ 1 変換（4 KB グラニュール、TTBR0 / TTBR1）。
+    /// 変換レジーム（SCTLR / TCR / TTBR の組と TCR 形式）。
+    private struct TranslationRegime {
+        var sctlr: UInt64
+        var tcr: UInt64
+        var ttbr0: UInt64
+        var ttbr1: UInt64?
+        var el1Format: Bool   // TCR が EL1 形式（T1SZ / TG1 を持つ）か
+    }
+
+    private func currentRegime() -> TranslationRegime {
+        if currentEL == 2 {
+            // VMAPPLE のカーネルは EL2（VHE）。EL2 ストレージが実効レジームで、
+            // E2H 有効時は TTBR1 と EL1 形式 TCR を使う。
+            let e2h = (hcrEL2 >> 34) & 1 == 1
+            return TranslationRegime(sctlr: sctlrEL2, tcr: tcrEL2, ttbr0: ttbr0EL2,
+                                     ttbr1: e2h ? ttbr1EL2 : nil, el1Format: e2h)
+        }
+        return TranslationRegime(sctlr: sctlrEL1, tcr: tcrEL1, ttbr0: ttbr0EL1, ttbr1: ttbr1EL1, el1Format: true)
+    }
+
+    /// ステージ 1 変換（4 KB / 16 KB / 64 KB グラニュール、TTBR0 / TTBR1）。
     /// MMU 無効時は恒等変換。失敗時は AbortSignal を投げる。
     private func translate(address: UInt64, isWrite: Bool, isFetch: Bool) throws -> UInt64 {
-        guard sctlrEL1 & 0x1 != 0 else { return address }
-        let t0sz = Int(tcrEL1 & 0x3F)
-        let t1sz = Int((tcrEL1 >> 16) & 0x3F)
+        let regime = currentRegime()
+        guard regime.sctlr & 0x1 != 0 else { return address }
+        let t0sz = Int(regime.tcr & 0x3F)
+        let t1sz = regime.el1Format ? Int((regime.tcr >> 16) & 0x3F) : 64
         // TTBR1 領域: VA の上位ビットが（TTBR1 の VA サイズより上が）すべて 1
         var useTTBR1 = false
-        if t1sz > 0 {
+        if regime.ttbr1 != nil && t1sz < 64 {
             let vaBits1 = 64 - t1sz
             if vaBits1 < 64 && (address >> vaBits1) == (UInt64.max >> vaBits1) {
                 useTTBR1 = true
@@ -512,48 +633,68 @@ final class ARM64CPU {
         }
         let vaBits = 64 - (useTTBR1 ? t1sz : t0sz)
         guard vaBits >= 25, vaBits <= 48 else {
-            throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b000100)
+            throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b000100)
         }
         // VA の範囲検査（TTBR0 側は上位ビットが 0、TTBR1 側は 1 でなければならない）
         if useTTBR1 {
             guard address >> vaBits == (UInt64.max >> vaBits) else {
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b000100)
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b000100)
             }
         } else {
             guard address >> vaBits == 0 else {
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b000100)
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b000100)
             }
         }
-        var tableBase = (useTTBR1 ? ttbr1EL1 : ttbr0EL1) & 0x0000_FFFF_FFFF_F000
-        let levels = (vaBits - 12 + 8) / 9          // 4 KB グラニュールでの段数
-        var level = 4 - levels
+        // グラニュール: TG0 は TCR[15:14]（0=4K, 1=64K, 2=16K）、TG1 は TCR[31:30]（1=16K, 2=64K, 3=4K）
+        let pageShift: Int
+        if useTTBR1 {
+            switch Int((regime.tcr >> 30) & 0x3) {
+            case 1: pageShift = 14
+            case 2: pageShift = 16
+            default: pageShift = 12
+            }
+        } else {
+            switch Int((regime.tcr >> 14) & 0x3) {
+            case 1: pageShift = 16
+            case 2: pageShift = 14
+            default: pageShift = 12
+            }
+        }
+        let indexBits = pageShift - 3
+        let oaMask = UInt64(0x0000_FFFF_FFFF_FFFF) & ~((UInt64(1) << pageShift) - 1)
+        var tableBase = (useTTBR1 ? regime.ttbr1! : regime.ttbr0) & oaMask
+        let levelCount = (vaBits - pageShift + indexBits - 1) / indexBits
+        let startLevel = 4 - levelCount
+        let topIndexBits = vaBits - pageShift - (levelCount - 1) * indexBits
+        var level = startLevel
         var pa: UInt64 = 0
         walk: while true {
-            let indexShift = 12 + (3 - level) * 9
-            let index = Int((address >> indexShift) & 0x1FF)
+            let shift = pageShift + (3 - level) * indexBits
+            let bitsHere = level == startLevel ? topIndexBits : indexBits
+            let index = Int((address >> shift) & ((UInt64(1) << bitsHere) - 1))
             let descAddress = tableBase &+ UInt64(index * 8)
             let desc = try readTableEntry(descAddress)
             let kind = desc & 0x3
             if kind == 0 || kind == 2 {
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b000100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b000100 | UInt64(level))
             }
             if kind == 1 {
                 // ブロック記述子（レベル 1 / 2 のみ）
                 guard level == 1 || level == 2 else {
-                    throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b000100 | UInt64(level))
+                    throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b000100 | UInt64(level))
                 }
                 try checkPermissions(desc: desc, isWrite: isWrite, isFetch: isFetch, level: level, address: address)
-                let blockBits = (3 - level) * 9
-                pa = (desc & 0x0000_FFFF_FFFF_F000 & ~((UInt64(1) << (12 + blockBits)) - 1)) | (address & ((UInt64(1) << (12 + blockBits)) - 1))
+                let mask = (UInt64(1) << shift) - 1
+                pa = (desc & oaMask & ~mask) | (address & mask)
                 break walk
             }
             // テーブル記述子 or ページ記述子
             if level == 3 {
                 try checkPermissions(desc: desc, isWrite: isWrite, isFetch: isFetch, level: level, address: address)
-                pa = (desc & 0x0000_FFFF_FFFF_F000) | (address & 0xFFF)
+                pa = (desc & oaMask) | (address & ((UInt64(1) << pageShift) - 1))
                 break walk
             }
-            tableBase = desc & 0x0000_FFFF_FFFF_F000
+            tableBase = desc & oaMask
             level += 1
         }
         return pa
@@ -562,27 +703,27 @@ final class ARM64CPU {
     private func checkPermissions(desc: UInt64, isWrite: Bool, isFetch: Bool, level: Int, address: UInt64) throws {
         // アクセスフラグ（bit 10）が立っていなければアクセスフラグフォールト
         if desc & (1 << 10) == 0 {
-            throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b001000 | UInt64(level))
+            throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b001000 | UInt64(level))
         }
         let el0Access = desc & (1 << 6) != 0          // AP[1]
         let readOnly = desc & (1 << 7) != 0           // AP[2]
         if currentEL == 0 {
             if !el0Access {
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b001100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b001100 | UInt64(level))
             }
             if isWrite && readOnly {
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b001100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b001100 | UInt64(level))
             }
             if isFetch && desc & (1 << 54) != 0 {     // UXN
-                throw AbortSignal(address: address, isInstruction: true, fsc: 0b001100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: true, isWrite: false, fsc: 0b001100 | UInt64(level))
             }
         } else {
             if isWrite && readOnly {
                 // EL1 からの書き込み: AP[2] = 1（AP 0b10 / 0b11）は読み取り専用
-                throw AbortSignal(address: address, isInstruction: isFetch, fsc: 0b001100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: isFetch, isWrite: isWrite, fsc: 0b001100 | UInt64(level))
             }
             if isFetch && desc & (1 << 53) != 0 {     // PXN
-                throw AbortSignal(address: address, isInstruction: true, fsc: 0b001100 | UInt64(level))
+                throw AbortSignal(address: address, isInstruction: true, isWrite: false, fsc: 0b001100 | UInt64(level))
             }
         }
     }
@@ -598,24 +739,30 @@ final class ARM64CPU {
     // MARK: 物理メモリ / MMIO
 
     private func readPhysicalByte(_ pa: UInt64) throws -> UInt8 {
-        if pa >= Self.ramBase && pa < Self.ramBase + UInt64(memorySize) {
-            return memory[Int(pa - Self.ramBase)]
+        if pa >= ramBaseAddress && pa < ramBaseAddress + UInt64(memorySize) {
+            return memory[Int(pa - ramBaseAddress)]
         }
         return UInt8(try readMMIO(pa, size: 1) & 0xFF)
     }
 
+    /// RAM 範囲内のオフセット（アドレス加算のラップアラウンドを避けた安全な判定）。
+    private func ramOffset(_ pa: UInt64, size: Int) -> Int? {
+        guard pa >= ramBaseAddress, size >= 0 else { return nil }
+        let off = pa - ramBaseAddress
+        guard off <= UInt64(memorySize), UInt64(size) <= UInt64(memorySize) - off else { return nil }
+        return Int(off)
+    }
+
     private func readPhysical32(_ pa: UInt64) throws -> UInt32 {
-        if pa >= Self.ramBase && pa + 4 <= Self.ramBase + UInt64(memorySize) {
-            let o = Int(pa - Self.ramBase)
+        if let o = ramOffset(pa, size: 4) {
             return UInt32(memory[o]) | UInt32(memory[o + 1]) << 8 | UInt32(memory[o + 2]) << 16 | UInt32(memory[o + 3]) << 24
         }
         return UInt32(try readMMIO(pa, size: 4) & 0xFFFF_FFFF)
     }
 
     private func readPhysical(_ pa: UInt64, size: Int) throws -> UInt64 {
-        if pa >= Self.ramBase && pa + UInt64(size) <= Self.ramBase + UInt64(memorySize) {
+        if let o = ramOffset(pa, size: size) {
             var value: UInt64 = 0
-            let o = Int(pa - Self.ramBase)
             for i in 0..<size { value |= UInt64(memory[o + i]) << (8 * i) }
             return value
         }
@@ -623,8 +770,7 @@ final class ARM64CPU {
     }
 
     private func writePhysical(_ pa: UInt64, size: Int, _ value: UInt64) throws {
-        if pa >= Self.ramBase && pa + UInt64(size) <= Self.ramBase + UInt64(memorySize) {
-            let o = Int(pa - Self.ramBase)
+        if let o = ramOffset(pa, size: size) {
             for i in 0..<size { memory[o + i] = UInt8((value >> (8 * i)) & 0xFF) }
             return
         }
@@ -632,6 +778,50 @@ final class ARM64CPU {
     }
 
     private func readMMIO(_ pa: UInt64, size: Int) throws -> UInt64 {
+        if platform == .vmApple {
+            if !romData.isEmpty && pa >= 0x0010_0000 && pa < 0x0020_0000 {
+                // AVPBooter ROM（QEMU/Henge とも RAM としてマップ）
+                var v: UInt64 = 0
+                let o = Int(pa - 0x0010_0000)
+                for i in 0..<size where o + i < romData.count { v |= UInt64(romData[o + i]) << (8 * i) }
+                return v
+            }
+            if !cfgWindow.isEmpty && pa >= 0x0040_0000 && pa < 0x0050_0000 {
+                return cfgRead(offset: pa - 0x0040_0000, size: size)
+            }
+            if pa >= 0x3000_0000 && pa < 0x3020_0000 {
+                return bdifRead(offset: pa - 0x3000_0000)
+            }
+            if let bus = pcieBus {
+                if pa >= PcieBus.ecamBase && pa < PcieBus.ecamBase + 0x1000_0000 {
+                    return bus.ecamRead(offset: pa - PcieBus.ecamBase, size: size)
+                }
+                if pa >= PcieBus.mmioBase && pa < PcieBus.mmioBase + PcieBus.mmioSize {
+                    return bus.windowRead(offset: pa - PcieBus.mmioBase, size: size)
+                }
+            }
+            if let gic = gic3 {
+                if pa >= vmGICDistPA && pa < vmGICDistPA + 0x10000 {
+                    return gic.distRead(offset: pa - vmGICDistPA)
+                }
+                if pa >= vmGICRedistPA && pa < vmGICRedistPA + 0x20000 {
+                    return gic.redistRead(offset: pa - vmGICRedistPA)
+                }
+            }
+            if pa >= vmUARTPA && pa < vmUARTPA + 0x10000 {
+                return vmPL011Read(offset: pa - vmUARTPA)
+            }
+            if pa == VMAppleBoot.armIOBase + 0x10070000 {
+                return 0 // pvpanic
+            }
+            if pa >= VMAppleBoot.armIOBase + 0x30000000 && pa < VMAppleBoot.armIOBase + 0x40000000 {
+                return UInt64.max // PCIe 設定空間: デバイスなし
+            }
+            if pa >= VMAppleBoot.armIOBase && pa < VMAppleBoot.armIOBase + 0x7000_0000 {
+                noteUnknownMMIO(pa)
+                return 0
+            }
+        }
         if pa >= Self.uartBase && pa < Self.uartBase + 0x1000 {
             return uartRead(offset: pa - Self.uartBase)
         }
@@ -655,6 +845,60 @@ final class ARM64CPU {
     }
 
     private func writeMMIO(_ pa: UInt64, size: Int, _ value: UInt64) throws {
+        if platform == .vmApple {
+            if !romData.isEmpty && pa >= 0x0010_0000 && pa < 0x0020_0000 {
+                let o = Int(pa - 0x0010_0000)
+                for i in 0..<size where o + i < romData.count { romData[o + i] = UInt8((value >> (8 * i)) & 0xFF) }
+                return
+            }
+            if !cfgWindow.isEmpty && pa >= 0x0040_0000 && pa < 0x0050_0000 {
+                cfgWrite(offset: pa - 0x0040_0000, size: size, value: value)
+                return
+            }
+            if pa >= 0x3000_0000 && pa < 0x3020_0000 {
+                bdifWrite(offset: pa - 0x3000_0000, value: value)
+                return
+            }
+            if let bus = pcieBus {
+                if pa >= PcieBus.ecamBase && pa < PcieBus.ecamBase + 0x1000_0000 {
+                    bus.ecamWrite(offset: pa - PcieBus.ecamBase, value: value, size: size)
+                    return
+                }
+                if pa >= PcieBus.mmioBase && pa < PcieBus.mmioBase + PcieBus.mmioSize {
+                    bus.windowWrite(offset: pa - PcieBus.mmioBase, value: value, size: size)
+                    return
+                }
+            }
+            if let gic = gic3 {
+                if pa >= vmGICDistPA && pa < vmGICDistPA + 0x10000 {
+                    gic.distWrite(offset: pa - vmGICDistPA, value: value, size: size)
+                    return
+                }
+                if pa >= vmGICRedistPA && pa < vmGICRedistPA + 0x20000 {
+                    gic.redistWrite(offset: pa - vmGICRedistPA, value: value, size: size)
+                    return
+                }
+            }
+            if pa >= vmUARTPA && pa < vmUARTPA + 0x10000 {
+                vmPL011Write(offset: pa - vmUARTPA, value: value)
+                return
+            }
+            if pa == VMAppleBoot.armIOBase + 0x10070000 {
+                // pvpanic: ゲストパニック通知。エミュレーションを停止する。
+                if value & 1 != 0 {
+                    halted = true
+                    exitCode = 0x5041_4E49 // 'PANI'
+                }
+                return
+            }
+            if pa >= VMAppleBoot.armIOBase + 0x30000000 && pa < VMAppleBoot.armIOBase + 0x40000000 {
+                return // PCIe 設定空間（未実装デバイス分は無視）
+            }
+            if pa >= VMAppleBoot.armIOBase && pa < VMAppleBoot.armIOBase + 0x7000_0000 {
+                noteUnknownMMIO(pa)
+                return
+            }
+        }
         if pa >= Self.uartBase && pa < Self.uartBase + 0x1000 {
             uartWrite(offset: pa - Self.uartBase, value: value)
             return
@@ -706,6 +950,435 @@ final class ARM64CPU {
         }
         nvme.onIRQ = { [weak self] in
             self?.nvmeIRQLine = true
+        }
+    }
+
+    // MARK: VMAPPLE 補助（未知 MMIO 記録 / Samsung UART）
+
+    private func noteUnknownMMIO(_ pa: UInt64) {
+        if unknownMMIOAccesses.count < 128 && !unknownMMIOAccesses.contains(pa) {
+            unknownMMIOAccesses.append(pa)
+        }
+    }
+
+    /// Samsung S5L 系 UART（AppleSamsungSerial / PE 早期コンソール用レジスタ配置）。
+    private var samsungUARTStorage: [UInt64: UInt64] = [:]
+
+    private func samsungUARTRead(offset: UInt64) -> UInt64 {
+        switch offset {
+        case 0x10:  // UTRSTAT: bit0 = RX データあり, bit1 = TX バッファ空, bit2 = TX 空
+            return 0x6 | (inputQueueEmpty ? 0 : 1)
+        case 0x14:  // UERSTAT
+            return 0
+        case 0x18:  // UFSTAT: RX FIFO 件数 [5:0]
+            inputLock.lock()
+            let count = inputQueue.count
+            inputLock.unlock()
+            return UInt64(min(count, 63))
+        case 0x1C:  // UMSTAT
+            return 0
+        case 0x24:  // URXH
+            inputLock.lock()
+            defer { inputLock.unlock() }
+            if inputQueue.isEmpty { return 0 }
+            return UInt64(inputQueue.removeFirst())
+        case 0x30:  // UINTP: bit0 = TX 完了, bit1 = RX あり
+            return 0x1 | (inputQueueEmpty ? 0 : 0x2)
+        default:
+            return samsungUARTStorage[offset] ?? 0
+        }
+    }
+
+    private func samsungUARTWrite(offset: UInt64, value: UInt64) {
+        switch offset {
+        case 0x20:  // UTXH
+            onChar?(UInt8(value & 0xFF))
+        case 0x30:  // UINTP（書き込みクリア。状態は保持しない）
+            break
+        default:
+            samsungUARTStorage[offset] = value
+        }
+    }
+
+    // MARK: VMAPPLE cfg（QEMU hw/vmapple/cfg.c + Henge devices/cfg.c の実レイアウト）
+
+    private func cfgRead(offset: UInt64, size: Int) -> UInt64 {
+        if offset == 0x38 {
+            // rnd: boot ROM がバッファを乱数で埋めるために読むたび新しい値を返す
+            cfgRNGState ^= cfgRNGState << 13
+            cfgRNGState ^= cfgRNGState >> 7
+            cfgRNGState ^= cfgRNGState << 17
+            if size >= 4 { return cfgRNGState & 0xFFFF_FFFF }
+            return cfgRNGState & ((UInt64(1) << (size * 8)) - 1)
+        }
+        var v: UInt64 = 0
+        let o = Int(offset)
+        for i in 0..<size where o + i < cfgWindow.count { v |= UInt64(cfgWindow[o + i]) << (8 * i) }
+        return v
+    }
+
+    private func cfgWrite(offset: UInt64, size: Int, value: UInt64) {
+        let o = Int(offset)
+        for i in 0..<size where o + i < cfgWindow.count { cfgWindow[o + i] = UInt8((value >> (8 * i)) & 0xFF) }
+    }
+
+    // MARK: bdif（VMApple Backdoor Interface、QEMU hw/vmapple/bdif.c の再現）
+    // ROM と iBoot がディスクを読むためのチャネル。devid = offset & 0xFFFF0000
+    // （ROOT=0x00000 / AUX=0x10000 / USB=0x100000）、reg = offset & 0xFFFF。
+
+    /// bdif に root / aux ディスクイメージ（メモリ）を接続する。
+    func attachBdifDisks(root: [UInt8], aux: [UInt8]) {
+        bdifRootDisk = BdifDisk(memory: root)
+        bdifAuxDisk = BdifDisk(memory: aux)
+        setupPCIeIfNeeded()
+    }
+
+    /// bdif に root / aux ディスクファイル（スパース可）を接続する。
+    func attachBdifDiskFiles(rootPath: String, rootSize: Int, auxPath: String, auxSize: Int) {
+        bdifRootDisk = BdifDisk(fileAt: rootPath, size: rootSize)
+        bdifAuxDisk = BdifDisk(fileAt: auxPath, size: auxSize)
+        setupPCIeIfNeeded()
+    }
+
+    /// ゲスト物理メモリのバイト列読み（virtio のリング/バッファ用。RAM は直接、それ以外は MMIO 経由）
+    func physReadBytes(_ pa: UInt64, _ count: Int) -> [UInt8]? {
+        if pa >= ramBaseAddress && pa + UInt64(count) <= ramBaseAddress + UInt64(memory.count) {
+            let o = Int(pa - ramBaseAddress)
+            return [UInt8](memory[o..<o + count])
+        }
+        var out = [UInt8]()
+        out.reserveCapacity(count)
+        var done = 0
+        while done < count {
+            let n = min(8, count - done)
+            guard let v = try? readPhysical(pa + UInt64(done), size: n) else { return nil }
+            for i in 0..<n { out.append(UInt8((v >> UInt64(8 * i)) & 0xFF)) }
+            done += n
+        }
+        return out
+    }
+
+    /// ゲスト物理メモリへのバイト列書き込み
+    func physWriteBytes(_ pa: UInt64, _ bytes: [UInt8]) {
+        if pa >= ramBaseAddress && pa + UInt64(bytes.count) <= ramBaseAddress + UInt64(memory.count) {
+            writeGuestMemory(bytes, at: pa)
+            return
+        }
+        var done = 0
+        while done < bytes.count {
+            let n = min(8, bytes.count - done)
+            var v: UInt64 = 0
+            for i in 0..<n { v |= UInt64(bytes[done + i]) << UInt64(8 * i) }
+            try? writePhysical(pa + UInt64(done), size: n, v)
+            done += n
+        }
+    }
+
+    /// PCIe バスと virtio デバイス（aux blk → root blk → usb）を構築する（Henge の接続順）。
+    private func setupPCIeIfNeeded() {
+        guard platform == .vmApple, pcieBus == nil else { return }
+        guard bdifRootDisk != nil || bdifAuxDisk != nil else { return }
+        let bus = PcieBus()
+        bus.setIRQ = { [weak self] intid, level in self?.gic3?.setSPILevel(intid, level) }
+        pcieBus = bus
+        func wire(_ v: VirtioDevice) {
+            v.physRead = { [weak self] pa, n in self?.physReadBytes(pa, n) }
+            v.physWrite = { [weak self] pa, bytes in self?.physWriteBytes(pa, bytes) }
+        }
+        if let aux = bdifAuxDisk {
+            let blk = VirtioBlk(disk: aux, appleVariant: 2)   // HV_VBLK_AUX
+            wire(blk.vio)
+            bus.attach(blk.vio.pci)
+            vmAuxBlk = blk
+        }
+        if let root = bdifRootDisk {
+            let blk = VirtioBlk(disk: root, appleVariant: 1)   // HV_VBLK_ROOT
+            wire(blk.vio)
+            bus.attach(blk.vio.pci)
+            vmRootBlk = blk
+        }
+        if bdifUSBEnabled {
+            let usb = VirtioUsbDevice(cpu: self)
+            wire(usb.vio)
+            bus.attach(usb.vio.pci)
+            vmUsbDev = usb
+        }
+    }
+
+    private func bdifRead(offset: UInt64) -> UInt64 {
+        let devid = offset & 0xFFFF_0000
+        if devid == 0x0010_0000 && bdifUSBEnabled { return bdifUSBRead(reg: offset & 0xFFFF) }
+        switch offset & 0xFFFF {
+        case 0x0000: return 1                 // STATUS: ACTIVE
+        case 0x0004: return 2                 // CFG: ACTIVE
+        case 0x0008: return 0x420             // UNK1
+        case 0x0010: return 1                 // BUSY: READY
+        case 0x0400: return 1                 // UNK2
+        case 0x0434: return 0                 // UNK3
+        case 0x0420:                          // NEXT_DEVICE: ストレージでは容量（512B セクタ数）。iBoot が GPT を検証する（Henge 準拠）
+            switch devid {
+            case 0x0000_0000: return UInt64(bdifRootDisk?.size ?? 0) / 512
+            case 0x0001_0000: return UInt64(bdifAuxDisk?.size ?? 0) / 512
+            default: return UInt64.max
+            }
+        default: return UInt64.max
+        }
+    }
+
+    private func bdifWrite(offset: UInt64, value: UInt64) {
+        let devid = offset & 0xFFFF_0000
+        if devid == 0x0010_0000 && bdifUSBEnabled {
+            bdifUSBWrite(reg: offset & 0xFFFF, value: value)
+            return
+        }
+        guard offset & 0xFFFF == 0x0408 else { return }   // REG_CMD のみ
+        switch devid {
+        case 0x0000_0000: bdifVblkCommand(isAux: false, requestPA: value)
+        case 0x0001_0000: bdifVblkCommand(isAux: true, requestPA: value)
+        default: break
+        }
+    }
+
+    /// VblkReq（sector / data / retval の各 {addr, len, flags}、計 48 バイト）を処理する。
+    private func bdifVblkCommand(isAux: Bool, requestPA: UInt64) {
+        func rd64(_ pa: UInt64) -> UInt64 { readGuestMemory(address: pa, size: 8) }
+        func rd32(_ pa: UInt64) -> UInt32 { UInt32(truncatingIfNeeded: readGuestMemory(address: pa, size: 4)) }
+        let sectorAddr = rd64(requestPA), sectorLen = rd32(requestPA + 8)
+        let dataAddr = rd64(requestPA + 16), dataLen = Int(rd32(requestPA + 24)), dataFlags = rd32(requestPA + 28)
+        let retvalAddr = rd64(requestPA + 32)
+        var ret: UInt8 = 1   // FAILED
+        defer { writeGuestMemory([ret], at: retvalAddr) }
+        guard sectorLen == 16 else { return }
+        let off = Int(rd32(sectorAddr + 8)) * 512
+        guard let disk = isAux ? bdifAuxDisk : bdifRootDisk else { return }
+        if dataFlags == 0x0003_0001 {   // READ（デバイスがバッファへ書く）
+            guard let bytes = disk.read(offset: off, count: dataLen) else { return }
+            writeGuestMemory(bytes, at: dataAddr)
+            ret = 0   // SUCCESS
+        } else if dataFlags == 0x0001_0001 {   // WRITE（Henge は実装。macOS 27 の iBSS が aux へ書く）
+            var bytes = [UInt8]()
+            bytes.reserveCapacity(dataLen)
+            var pa = dataAddr
+            var left = dataLen
+            while left > 0 {
+                let n = min(8, left)
+                let v = readGuestMemory(address: pa, size: n)
+                for i in 0..<n { bytes.append(UInt8((v >> UInt64(8 * i)) & 0xFF)) }
+                pa += UInt64(n); left -= n
+            }
+            if disk.write(offset: off, bytes: bytes) { ret = 0 }   // SUCCESS
+        }
+    }
+
+    // MARK: bdif USB チャネル（devid 0x100000、インストーラ起動時のみ。Henge devices/bdif.c の USB 部再現）
+    // メッセージ形式は virtio-usb と共通: 要求は {u32 len, u8 ep, u8 type} ヘッダ＋ペイロードを
+    // queue 0 のバッファへ、応答は queue 1 のチェーン先頭 2 バイト {type, ep}＋データ。
+
+    /// USB チャネルが有効か（インストーラ起動で有効化）
+    var bdifUSBEnabled = false
+    private var usbRomOn = false
+    private var usbQsel: UInt32 = 0
+    private var usbIRQValue: UInt32 = 0
+    private var usbQueues: [(pending: UInt64, done: Bool)] = [(0, false), (0, false)]
+    /// ホスト→ゲスト要求リング / ゲスト→ホスト応答リング（HvVusbMsg 相当）
+    struct VusbMessage { var type: UInt8; var ep: UInt8; var len: UInt32; var data: [UInt8]? }
+    private var vusbOutRing: [VusbMessage] = []
+    private var vusbInRing: [VusbMessage] = []
+    private(set) var vusbOnline = false
+    private(set) var vusbSession: UInt32 = 0
+    /// USB チャネルのデバッグイベント通知（ハーネス用）
+    var onVusbEvent: ((String) -> Void)?
+
+    /// ホスト側: 要求をキューする（オンラインでなければ false）
+    func vusbSendRequest(type: UInt8, ep: UInt8, data: [UInt8]?, len: UInt32) -> Bool {
+        guard vusbOnline, vusbOutRing.count < 256 else { return false }
+        vusbOutRing.append(VusbMessage(type: type, ep: ep, len: len, data: data))
+        return true
+    }
+
+    /// ホスト側: 次の応答を取り出す
+    func vusbTakeResponse() -> VusbMessage? {
+        guard !vusbInRing.isEmpty else { return nil }
+        return vusbInRing.removeFirst()
+    }
+
+    /// virtio-usb フロントエンド用: 先頭の要求を覗く / 取り出す / 応答を返す
+    func vusbPeekRequest() -> VusbMessage? { vusbOutRing.first }
+    func vusbTakeRequest() -> VusbMessage? {
+        guard !vusbOutRing.isEmpty else { return nil }
+        return vusbOutRing.removeFirst()
+    }
+    func vusbPutResponse(type: UInt8, ep: UInt8, data: [UInt8]?) {
+        guard vusbInRing.count < 256 else { return }
+        vusbInRing.append(VusbMessage(type: type, ep: ep, len: UInt32(data?.count ?? 0), data: data))
+    }
+    func vusbSetOnlineFromDevice(_ on: Bool) { vusbSetOnline(on) }
+    func usbRomOnSet(_ on: Bool) { usbRomOn = on }
+
+    /// デバイスのポーリング（ハーネスが実行チャンクの間に呼ぶ）
+    func pollVMAppleDevices() {
+        bdifPoll()
+        vmUsbDev?.poll()
+    }
+
+    private func vusbSetOnline(_ on: Bool) {
+        if on || vusbOnline { vusbSession &+= 1 }
+        vusbOnline = on
+        vusbOutRing.removeAll()
+        vusbInRing.removeAll()
+    }
+
+    private func bdifUSBRead(reg: UInt64) -> UInt64 {
+        switch reg {
+        case 0x0000: return 1                                   // STATUS
+        case 0x0004: return 0x1A01                              // CFG: USB デバイスタイプ
+        case 0x0008: return 0x420                               // UNK1
+        case 0x0010: return usbQsel < 2 ? (usbQueues[Int(usbQsel)].done ? 1 : 0) : 0   // BUSY: 選択キューの done
+        case 0x0400: return 1                                   // UNK2
+        case 0x0404: return UInt64(usbIRQValue)
+        case 0x0410: return UInt64(usbQsel)                     // QSEL
+        case 0x0434: return 0                                   // UNK3
+        case 0x0420: return UInt64.max                          // NEXT_DEVICE
+        default: return 0
+        }
+    }
+
+    private func bdifUSBWrite(reg: UInt64, value: UInt64) {
+        switch reg {
+        case 0x0400:   // UNK2: (再)有効化。ブートチェーンの新ステージが接続する
+            usbRomOn = value != 0
+            vusbSetOnline(value != 0)
+            usbQueues = [(0, true), (0, true)]   // idle: 未送信
+            onVusbEvent?("UNK2 write v=\(value) -> online=\(vusbOnline) session=\(vusbSession) at instr \(instructionsExecuted)")
+        case 0x0404: usbIRQValue = UInt32(truncatingIfNeeded: value)
+        case 0x0410: usbQsel = UInt32(truncatingIfNeeded: value)
+        case 0x0408:   // CMD: チェーン送信
+            guard usbQsel < 2 else { break }
+            let q = Int(usbQsel)
+            usbQueues[q].done = false
+            if q == 0 {
+                usbQueues[0].pending = value
+                onVusbEvent?("Q0 submit chain=0x\(String(value, radix: 16)) at instr \(instructionsExecuted)")
+                bdifPoll()
+            } else {
+                onVusbEvent?("Q1 submit chain=0x\(String(value, radix: 16)) romOn=\(usbRomOn) at instr \(instructionsExecuted)")
+                defer { usbQueues[1].done = true }
+                guard usbRomOn else { break }
+                var buf = [UInt8]()
+                _ = bdifUSBXfer(chain: value, write: false, buf: &buf, collect: true)
+                if buf.count >= 2 {
+                    vusbInRing.append(VusbMessage(type: buf[0], ep: buf[1], len: UInt32(buf.count - 2),
+                                                  data: buf.count > 2 ? [UInt8](buf[2...]) : nil))
+                }
+            }
+        default: break
+        }
+    }
+
+    /// ディスクリプタチェーン（最大 5 個、各 16 バイト {u64 addr, u32 len, u16 one, u16 flags}）をたどる。
+    /// write=true: デバイス書き込み側（flags bit1）のバッファへ buf を書く。write=false: デバイス読み取り側から buf へ集める。
+    /// 戻り値は対象ディスクリプタの合計容量。
+    private func bdifUSBXfer(chain: UInt64, write: Bool, buf: inout [UInt8], collect: Bool = false) -> Int {
+        var total = 0
+        var done = 0
+        for i in 0..<5 {
+            let base = chain + UInt64(16 * i)
+            let addr = readGuestMemory(address: base, size: 8)
+            let len = Int(readGuestMemory(address: base + 8, size: 4))
+            let flags = readGuestMemory(address: base + 14, size: 2)   // {u64 addr, u32 len, u16 one, u16 flags}
+            let devWrites = flags & 2 != 0
+            if devWrites == write {
+                total += len
+                if collect {
+                    var pa = addr
+                    var left = len
+                    while left > 0 {
+                        let n = min(8, left)
+                        let v = readGuestMemory(address: pa, size: n)
+                        for j in 0..<n { buf.append(UInt8((v >> UInt64(8 * j)) & 0xFF)) }
+                        pa += UInt64(n); left -= n
+                    }
+                    done += len
+                } else {
+                    let n = min(len, buf.count - done)
+                    if n > 0 {
+                        writeGuestMemory([UInt8](buf[done..<done + n]), at: addr)
+                        done += n
+                    }
+                }
+            }
+            if flags & 1 == 0 { break }
+        }
+        return total
+    }
+
+    /// CPU スレッド側ポーリング: queue 0 にバッファがありホスト要求が来ていれば届ける（hv_bdif_poll 相当）。
+    func bdifPoll() {
+        guard bdifUSBEnabled, usbRomOn, usbQueues[0].pending != 0, !usbQueues[0].done else { return }
+        guard !vusbOutRing.isEmpty else { return }
+        let m = vusbOutRing.removeFirst()
+        onVusbEvent?("deliver type=\(m.type) ep=0x\(String(m.ep, radix: 16)) len=\(m.len) payload=\(m.data?.count ?? 0) at instr \(instructionsExecuted)")
+        let chain = usbQueues[0].pending
+        for i in 0..<5 {
+            let base = chain + UInt64(16 * i)
+            let a = readGuestMemory(address: base, size: 8)
+            let l = readGuestMemory(address: base + 8, size: 4)
+            let f = readGuestMemory(address: base + 14, size: 2)
+            onVusbEvent?("  desc\(i) addr=0x\(String(a, radix: 16)) len=\(l) flags=0x\(String(f, radix: 16))")
+            if f & 1 == 0 { break }
+        }
+        var probe = [UInt8]()
+        _ = bdifUSBXfer(chain: chain, write: true, buf: &probe)
+        var msg = [UInt8]()
+        let payload = m.data ?? []
+        msg += [UInt8(m.len & 0xFF), UInt8((m.len >> 8) & 0xFF), UInt8((m.len >> 16) & 0xFF), UInt8((m.len >> 24) & 0xFF), m.ep, m.type]
+        msg += payload
+        _ = bdifUSBXfer(chain: chain, write: true, buf: &msg)
+        usbQueues[0].done = true
+        usbQueues[0].pending = 0
+    }
+
+    // MARK: VMAPPLE UART（ARM PL011。DT compatible "arm,pl011" / QEMU vmapple の実デバイス）
+
+    private var vmPL011Storage: [UInt64: UInt64] = [:]
+
+    private func vmPL011Read(offset: UInt64) -> UInt64 {
+        switch offset {
+        case 0x00:  // DR: 受信データ
+            inputLock.lock()
+            defer { inputLock.unlock() }
+            if inputQueue.isEmpty { return 0 }
+            return UInt64(inputQueue.removeFirst())
+        case 0x04:  // RSR: エラーなし
+            return 0
+        case 0x18:  // FR: TX FIFO は即時ドレイン（TXFE 常時 1）、BUSY 0
+            return 0x80 | (inputQueueEmpty ? 0x10 : 0)
+        case 0x3C:  // RIS: TXRIS は FIFO 空で立つ。RXRIS は受信データあり
+            return 0x20 | (inputQueueEmpty ? 0 : 0x10)
+        case 0x40:  // MIS
+            let ris: UInt64 = 0x20 | (inputQueueEmpty ? 0 : 0x10)
+            return ris & (vmPL011Storage[0x38] ?? 0)
+        case 0xFE0: return 0x11  // PeriphID0
+        case 0xFE4: return 0x10  // PeriphID1
+        case 0xFE8: return 0x14  // PeriphID2
+        case 0xFEC: return 0x00  // PeriphID3
+        case 0xFF0: return 0x0D  // CellID0
+        case 0xFF4: return 0xF0  // CellID1
+        case 0xFF8: return 0x05  // CellID2
+        case 0xFFC: return 0xB1  // CellID3
+        default:
+            return vmPL011Storage[offset] ?? 0
+        }
+    }
+
+    private func vmPL011Write(offset: UInt64, value: UInt64) {
+        switch offset {
+        case 0x00:  // DR: 送信データ
+            onChar?(UInt8(value & 0xFF))
+        case 0x44:  // ICR: 状態は動的に生成するため何もしない
+            break
+        default:
+            vmPL011Storage[offset] = value
         }
     }
 
@@ -822,11 +1495,11 @@ final class ARM64CPU {
         case 1: return v >> amt                                 // LSR
         case 2:                                                  // ASR
             if is64 { return UInt64(bitPattern: Int64(bitPattern: v) >> amt) }
-            return UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(v))) >> amt) & width
+            return UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: v))) >> amt) & width
         default:                                                 // ROR
             if amt == 0 { return v }
             if is64 { return (v >> amt) | (v << (64 - amt)) }
-            let v32 = UInt32(v)
+            let v32 = UInt32(truncatingIfNeeded: v)
             return UInt64((v32 >> amt) | (v32 << (32 - amt)))
         }
     }
@@ -899,7 +1572,16 @@ final class ARM64CPU {
         let rm = Int((insn >> 16) & 0x1F)
 
         // --- 例外生成 / システム ---
+        if (insn & 0xFFFF_FBFF) == 0xD69F_0BFF { eret(); return }       // ERETAA / ERETAB（認証は省略）
         if (insn & 0xFFFF_FFE0) == 0xD69F_03E0 { eret(); return }       // ERET
+        if (insn & 0xFFE0_001F) == 0xD400_0002 {                        // HVC
+            executeHVC()
+            return
+        }
+        if (insn & 0xFFE0_001F) == 0xD400_0003 {                        // SMC（PSCI 用に HVC と同じ処理）
+            executeHVC()
+            return
+        }
         if (insn & 0xFFE0_001F) == 0xD400_0001 {                        // SVC
             try executeSVC(imm: Int((insn >> 5) & 0xFFFF), at: instructionPC)
             return
@@ -911,7 +1593,9 @@ final class ARM64CPU {
         if (insn & 0xFFFF_0000) == 0xD503_0000 && ((insn >> 12) & 0xF) < 4 {
             // HINT / バリア / CLREX 空間（bits[15:12] = 2: HINT、3: バリア）
             if insn == 0xD503_207F {                                    // WFI
-                if !(interruptPending && !irqMasked) { idle = true }
+                if platform == .vmApple {
+                    if !((vmAppleFIQPending && !fiqMasked) || (vmAppleIRQPending && !irqMasked)) { idle = true }
+                } else if !(interruptPending && !irqMasked) { idle = true }
             } else if insn == 0xD503_305F {                             // CLREX
                 exclusiveAddress = nil
             }
@@ -958,9 +1642,34 @@ final class ARM64CPU {
             }
             return
         }
+        if (insn & 0xFFFF_F800) == 0xD71F_0800 { pc = readReg(rn); return }        // BRAA / BRAB（認証は省略）
+        if (insn & 0xFFFF_F800) == 0xD61F_0800 { pc = readReg(rn); return }        // BRAAZ（認証は省略）
+        if (insn & 0xFFFF_F800) == 0xD63F_0800 { writeReg(30, pc); pc = readReg(rn); return } // BLRAAZ
+        if (insn & 0xFFFF_F800) == 0xD73F_0800 { writeReg(30, pc); pc = readReg(rn); return } // BLRAA / BLRAB
+        if (insn & 0xFFFF_FBFF) == 0xD65F_0BFF { pc = readReg(30); return }        // RETAA / RETAB
         if (insn & 0xFFFF_FC1F) == 0xD61F_0000 { pc = readReg(rn); return }        // BR
         if (insn & 0xFFFF_FC1F) == 0xD63F_0000 { writeReg(30, pc); pc = readReg(rn); return } // BLR
         if (insn & 0xFFFF_FC1F) == 0xD65F_0000 { pc = readReg(rn); return }        // RET
+
+        // --- ポインタ認証（NOP 化: 署名と検証を同じコアが一貫して省略する）---
+        if (insn & 0xFFE0_FC00) == 0x9AC0_3000 {                        // PACGA
+            writeReg(rd, readReg(rn))
+            return
+        }
+        if (insn & 0xFFFF_8000) == 0xDAC1_0000 {                        // PACIA/B, PACDA/B, AUTIA/B, AUTDA/B, XPAC
+            // ポインタは Xd 自身にあり、Rn は修飾子。NOP 化 = Xd をそのまま保持する
+            return
+        }
+        if (insn & 0xFF00_0000) == 0xF800_0000 && (insn & 0x0020_0000) != 0 && (insn & 0x0400) != 0 {
+            // LDRAA / LDRAB: 認証なしの 8 バイトロードとして扱う（imm9 は 8 倍スケール）
+            let imm9 = signExtend(UInt64((insn >> 12) & 0x1FF), bits: 9)
+            let address = UInt64(bitPattern: Int64(bitPattern: readReg(rn, sp: true)) &+ Int64(bitPattern: imm9) * 8)
+            writeReg(rd, try loadValue(address: address, size: 8))
+            return
+        }
+        // FP / SIMD（ロード/ストア系は executeLoadStore 内で処理）
+        if try executeFPOrSIMD(insn, rd: rd, rn: rn, rm: rm, at: instructionPC) { return }
+
 
         // --- ロード / ストア ---
         if try executeLoadStore(insn, rd: rd, rn: rn, rm: rm, at: instructionPC) { return }
@@ -996,7 +1705,7 @@ final class ARM64CPU {
             let setFlags = insn & 0x2000_0000 != 0
             var imm = UInt64((insn >> 10) & 0xFFF)
             if insn & 0x0040_0000 != 0 { imm <<= 12 }
-            let a = readReg(rn, sp: !setFlags)
+            let a = readReg(rn, sp: true)   // ソース Rn=31 はフラグ形式（CMP）でも SP（QEMU で実証）
             let b = isSub ? ~imm : imm
             let r = addWithCarry(a, b, carry: isSub, is64: sf)
             if setFlags { applyFlags(r) }
@@ -1092,7 +1801,7 @@ final class ARM64CPU {
             if sf {
                 result = imms == 0 ? lo : ((hi << (64 - imms)) | (lo >> imms))
             } else {
-                let combined = (UInt64(UInt32(hi)) << 32) | UInt64(UInt32(lo))
+                let combined = (UInt64(UInt32(truncatingIfNeeded: hi)) << 32) | UInt64(UInt32(truncatingIfNeeded: lo))
                 result = UInt64(UInt32((combined >> imms) & 0xFFFF_FFFF))
             }
             writeReg(rd, result, width64: sf)
@@ -1134,7 +1843,7 @@ final class ARM64CPU {
             let shiftType = (insn >> 22) & 0x3
             let amount = Int((insn >> 10) & 0x3F)
             let operand = shiftValue(readReg(rm), type: shiftType, amount: amount, is64: sf)
-            let a = readReg(rn)
+            let a = readReg(rn)   // シフト付きレジスタ形式では Rn/Rd=31 は常に XZR（SP が使えるのは即値/拡張形式のみ。NEG の誤動作＝根本原因 #18）
             let r = addWithCarry(a, isSub ? ~operand : operand, carry: isSub, is64: sf)
             if setFlags { applyFlags(r) }
             writeReg(rd, r.result, width64: sf)
@@ -1147,7 +1856,7 @@ final class ARM64CPU {
             let option = Int((insn >> 13) & 0x7)
             let amount = Int((insn >> 10) & 0x7)
             let operand = extendValue(readReg(rm), option: option, shift: amount)
-            let a = readReg(rn, sp: !setFlags)
+            let a = readReg(rn, sp: true)   // ソース Rn=31 はフラグ形式でも SP
             let r = addWithCarry(a, isSub ? ~operand : operand, carry: isSub, is64: sf)
             if setFlags { applyFlags(r) }
             writeReg(rd, r.result, sp: !setFlags, width64: sf)
@@ -1214,17 +1923,17 @@ final class ARM64CPU {
                 let result: UInt64
                 switch opcode {
                 case 0x00:  // RBIT
-                    result = sf ? reverseBits(a) : UInt64(reverseBits32(UInt32(a)))
+                    result = sf ? reverseBits(a) : UInt64(reverseBits32(UInt32(truncatingIfNeeded: a)))
                 case 0x01:  // REV16
                     result = sf ? byteSwap16(a) : UInt64(byteSwap16(UInt64(UInt32(a))) & 0xFFFF_FFFF)
                 case 0x02:  // REV32（32 ビット形のみ）
                     if sf { return false }
-                    result = UInt64(UInt32(a).byteSwapped)
+                    result = UInt64(UInt32(truncatingIfNeeded: a).byteSwapped)
                 case 0x03:  // REV（64 ビット形のみ）
                     if !sf { return false }
                     result = a.byteSwapped
                 case 0x04:  // CLZ
-                    result = UInt64(sf ? a.leadingZeroBitCount : UInt32(a).leadingZeroBitCount)
+                    result = UInt64(sf ? a.leadingZeroBitCount : UInt32(truncatingIfNeeded: a).leadingZeroBitCount)
                 case 0x05:  // CLS
                     result = UInt64(countLeadingSignBits(a, is64: sf))
                 default:
@@ -1270,16 +1979,16 @@ final class ARM64CPU {
                 let product = a.multipliedFullWidth(by: b)
                 writeReg(rd, product.high)
             case 0x1B20_0000 where sf:  // SMADDL
-                let product = Int64(Int32(bitPattern: UInt32(a))) * Int64(Int32(bitPattern: UInt32(b)))
+                let product = Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: a))) * Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: b)))
                 writeReg(rd, UInt64(bitPattern: Int64(bitPattern: addend) &+ product))
             case 0x1B20_8000 where sf:  // SMSUBL
-                let product = Int64(Int32(bitPattern: UInt32(a))) * Int64(Int32(bitPattern: UInt32(b)))
+                let product = Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: a))) * Int64(Int32(bitPattern: UInt32(truncatingIfNeeded: b)))
                 writeReg(rd, UInt64(bitPattern: Int64(bitPattern: addend) &- product))
             case 0x1BA0_0000 where sf:  // UMADDL
-                let product = UInt64(UInt32(a)) * UInt64(UInt32(b))
+                let product = UInt64(UInt32(truncatingIfNeeded: a)) * UInt64(UInt32(truncatingIfNeeded: b))
                 writeReg(rd, addend &+ product)
             case 0x1BA0_8000 where sf:  // UMSUBL
-                let product = UInt64(UInt32(a)) * UInt64(UInt32(b))
+                let product = UInt64(UInt32(truncatingIfNeeded: a)) * UInt64(UInt32(truncatingIfNeeded: b))
                 writeReg(rd, addend &- product)
             default:
                 return false
@@ -1366,9 +2075,42 @@ final class ARM64CPU {
 
         // 排他アクセス / CAS（0x08 空間）
         if (insn & 0x3F00_0000) == 0x0800_0000 {
+            // LDAR / STLR（順序付きアクセス）: bit23=1, bit21=0, Rs フィールド=31, bit15=1。
+            // これを STXR と誤認するとストアが排他モニタ条件で静かに落ち、
+            // チケットロックの解放（stlrb）が失われてデッドロックする。
+            if insn & 0x0080_0000 != 0 && insn & 0x0020_0000 == 0
+                && ((insn >> 16) & 0x1F) == 0x1F && insn & 0x0000_8000 != 0 {
+                if insn & 0x0040_0000 != 0 {
+                    // LDAR
+                    let value = try loadValue(address: base, size: bytes)
+                    writeReg(rd, value, width64: bytes == 8)
+                } else {
+                    // STLR
+                    try storeValue(address: base, size: bytes, readReg(rd))
+                }
+                return true
+            }
             if insn & 0x0020_0000 != 0 {
-                // CAS: Rs = 期待値、Rt = 新しい値（旧値を返す）
                 let rs = Int((insn >> 16) & 0x1F)
+                if insn & 0x0080_0000 == 0 {
+                    // CASP: レジスタペアの CAS（bit23=0）。要素サイズは bit30 で選択。
+                    // ペアレジスタは偶数かつ 30 以下が正規符号化（範囲外は未割り当てとして弾く）
+                    guard rs % 2 == 0 && rs <= 30 && rd % 2 == 0 && rd <= 30 else { return false }
+                    let elem = insn & 0x4000_0000 != 0 ? 8 : 4
+                    let maskP: UInt64 = elem == 8 ? UInt64.max : 0xFFFF_FFFF
+                    let expLo = readReg(rs) & maskP
+                    let expHi = readReg(rs + 1) & maskP
+                    let oldLo = try loadValue(address: base, size: elem)
+                    let oldHi = try loadValue(address: base &+ UInt64(elem), size: elem)
+                    if oldLo == expLo && oldHi == expHi {
+                        try storeValue(address: base, size: elem, readReg(rd) & maskP)
+                        try storeValue(address: base &+ UInt64(elem), size: elem, readReg(rd + 1) & maskP)
+                    }
+                    writeReg(rs, oldLo, width64: elem == 8)
+                    writeReg(rs + 1, oldHi, width64: elem == 8)
+                    return true
+                }
+                // CAS: Rs = 期待値、Rt = 新しい値（旧値を返す）
                 let expected = readReg(rs)
                 let old = try loadValue(address: base, size: bytes)
                 if old == (bytes == 8 ? expected : (expected & ((UInt64(1) << (bytes * 8)) - 1))) {
@@ -1400,10 +2142,15 @@ final class ARM64CPU {
         // 注意: レジスタオフセット形式のロード/ストア（bits[11:10] = 0b10）と
         // 未スケーリング即値形式（bits[22:21] = 0b10）を巻き込まないよう、
         // bits[22:21] = 0b01 かつ bits[11:10] = 0b00 まで含めて判定する。
-        if (insn & 0x3F60_0C00) == 0x3820_0000 {
+        if (insn & 0x3F20_0C00) == 0x3820_0000 {
             let rs = Int((insn >> 16) & 0x1F)
             let operand = readReg(rs)
             let old = try loadValue(address: base, size: bytes)
+            if ((insn >> 12) & 0xF) == 0b1100 {
+                // LDAPR 系: 読み取りのみ（書き戻しなし）
+                writeReg(rd, old, width64: bytes == 8)
+                return true
+            }
             let mask: UInt64 = bytes == 8 ? UInt64.max : ((UInt64(1) << (bytes * 8)) - 1)
             let newValue: UInt64
             if ((insn >> 10) & 0x3F) == 0b100000 {
@@ -1553,6 +2300,10 @@ final class ARM64CPU {
             switch (op1, op2) {
             case (0, 5):  // SPSel
                 if imm4 & 1 != 0 { pstate |= 0x1 } else { pstate &= ~0x1 }
+            case (0, 4):  // PAN（SPSR の bit22 に保持し、例外/ERET で自動的に保存・復元される）
+                if imm4 & 1 != 0 { pstate |= (1 << 22) } else { pstate &= ~(1 << 22) }
+            case (0, 3):  // UAO（bit23）
+                if imm4 & 1 != 0 { pstate |= (1 << 23) } else { pstate &= ~(1 << 23) }
             case (3, 6):  // DAIFSet
                 for i in 0..<4 where (imm4 >> i) & 1 == 1 { pstate |= UInt32(1 << (6 + i)) }
             case (3, 7):  // DAIFClr
@@ -1562,13 +2313,53 @@ final class ARM64CPU {
             }
             return
         }
-        // SYS 命令（TLBI / キャッシュ保守など）は、変換を毎回行うため無動作で正しい
+        // DC ZVA: 64 バイトブロックをゼロ化する（メモリへの実効果があるため no-op にできない）
+        if !isRead && op0 == 1 && op1 == 3 && crn == 7 && crm == 4 && op2 == 1 {
+            let blockBase = readReg(rt) & ~UInt64(0x3F)
+            for i in 0..<8 {
+                try storeValue(address: blockBase + UInt64(i * 8), size: 8, 0)
+            }
+            return
+        }
+        // AT（アドレス変換）: 結果を PAR_EL1 に書き込む。XNU の kvtophys が AT S1E1R + PAR_EL1 で
+        // VA→PA 変換を行うため、no-op では済まない（PAR が 0 のままだと変換失敗と誤認される）
+        if !isRead && op0 == 1 && crn == 7 && crm == 8 {
+            let va = readReg(rt)
+            let writeAccess = (op2 & 1) == 1
+            if let pa = try? translate(address: va, isWrite: writeAccess, isFetch: false) {
+                parEL1 = (pa & 0x0000_FFFF_FFFF_F000) | (UInt64(0b10) << 7)  // F=0、SH=インナーシェアラブル
+            } else {
+                parEL1 = 1 | (UInt64(0b000100) << 1)  // F=1、FST=変換フォルト
+            }
+            return
+        }
+        // SYS 命令（TLBI / その他のキャッシュ保守）は、変換を毎回行うため無動作で正しい
         if !isRead && op0 <= 1 { return }
 
-        let key = (op0 << 13) | (op1 << 10) | (crn << 6) | (crm << 3) | op2
+        // TPIDR_EL0 / TPIDRRO_EL0（S3_3_C13_C0_2 / _3）: writeSysReg の default は
+        // .vmApple 以外では書き込みを保持しないため、全プラットフォームで効くよう
+        // フィールドが分かれているここで専用ストレージへ振り分ける。
+        if op0 == 3 && op1 == 3 && crn == 13 && crm == 0 {
+            if op2 == 2 {  // TPIDR_EL0
+                if isRead { writeReg(rt, tpidrEL0) } else { tpidrEL0 = readReg(rt) }
+                return
+            }
+            if op2 == 3 && isRead {  // TPIDRRO_EL0（読み取り専用）
+                writeReg(rt, tpidrROEL0)
+                return
+            }
+        }
+
+        var key = (op0 << 13) | (op1 << 10) | (crn << 6) | (crm << 3) | op2
+        if platform == .vmApple && currentEL == 2 && (hcrEL2 >> 34) & 1 == 1 {
+            key = Self.vheRedirectedKey(key)
+        }
         if isRead {
-            writeReg(rt, readSysReg(key))
+            let value = readSysReg(key)
+            onSysRegAccess?(true, key, value, instructionPC)
+            writeReg(rt, value)
         } else {
+            onSysRegAccess?(false, key, readReg(rt), instructionPC)
             writeSysReg(key, readReg(rt))
         }
     }
@@ -1585,22 +2376,64 @@ final class ARM64CPU {
         case 0x6101: return elrEL1
         case 0x6150: return esrEL1
         case 0x6180: return farEL1
+        case 0x61E0: return parEL1
         case 0x6108: return spEL0
         case 0x7108: return spEL1
         case 0x6112: return UInt64(currentEL) << 2          // CurrentEL
         case 0x6D10: return UInt64(pstate & 0xF000_0000)    // NZCV
+        case 0x6113: return UInt64((pstate >> 22) & 1)       // PAN
+        case 0x6114: return UInt64((pstate >> 23) & 1)       // UAO
+        case 0x6110: return UInt64(pstate & 1)               // SPSel
         case 0x6D11: return UInt64((pstate >> 6) & 0xF) << 6  // DAIF
-        case 0x6000: return 0x410F_D034                     // MIDR（仮の実装値）
+        case 0x6C01: return 0x3444_8004                    // CTR_EL0（I/D ライン 64B、IDC/DIC）
+        case 0x6C07: return 4                              // DCZID_EL0（BS=4: ZVA ブロック 64 バイト）
+        case 0x6000: return platform == .vmApple ? 0x610F_0000 : 0x410F_D034   // MIDR
+        case 0x6020: return platform == .vmApple ? 0x0100_0111 : 0             // ID_AA64PFR0（EL0/1/2, FP/SIMD, GIC sysreg）
+        case 0x6031: return platform == .vmApple ? 0x0100_0010 : 0             // ID_AA64ISAR1（PAC アーキテクチャ）
         case 0x6005: return 0x8000_0000                     // MPIDR（単一コア）
-        case 0x6038: return 0x0FF0_0022                     // ID_AA64MMFR0（4K 対応 / 40 ビット PA / 16 ビット ASID）
+        case 0x6038:  // ID_AA64MMFR0
+            return platform == .vmApple ? 0x0000_0025 : 0x0FF0_0022   // VMAPPLE: 48bit PA / 16bit ASID / TGran16=0 (16K 対応)
         case 0x6F80: return timerFrequency                  // CNTFRQ_EL0
-        case 0x6F81, 0x6F82: return counterValue()          // CNTPCT / CNTVCT
-        case 0x6F90, 0x6FA8:                                // CNTP_TVAL / CNTV_TVAL
+        case 0x6F81: return counterValue()                  // CNTPCT_EL0
+        case 0x6F82: return counterValue() &- cntvOff       // CNTVCT_EL0
+        case 0x6F90:                                        // CNTP_TVAL
             return UInt64(UInt32(truncatingIfNeeded: cntpCval &- counterValue()))
-        case 0x6F91, 0x6FA9:                                // CNTP_CTL / CNTV_CTL
+        case 0x6F98, 0x6FA8:                                // CNTV_TVAL
+            return UInt64(UInt32(truncatingIfNeeded: cntvCval &- (counterValue() &- cntvOff)))
+        case 0x6F91:                                        // CNTP_CTL
             return (cntpCtl & 0x3) | (timerExpired ? 0x4 : 0)
-        case 0x6F92, 0x6FAA: return cntpCval                // CNTP_CVAL / CNTV_CVAL
-        default: return 0
+        case 0x6F99, 0x6FA9:                                // CNTV_CTL
+            return (cntvCtl & 0x3) | (cntvExpired ? 0x4 : 0)
+        case 0x6F92: return cntpCval                        // CNTP_CVAL
+        case 0x6F9A, 0x6FAA: return cntvCval                // CNTV_CVAL
+        // EL2 レジスタ
+        case 0x7040: return sctlrEL2                        // SCTLR_EL2
+        case 0x7048: return hcrEL2                          // HCR_EL2
+        case 0x7080: return ttbr0EL2                        // TTBR0_EL2
+        case 0x7081: return ttbr1EL2                        // TTBR1_EL2
+        case 0x7082: return tcrEL2                          // TCR_EL2
+        case 0x7290: return mairEL2                         // MAIR_EL2
+        case 0x7300: return vbarEL2                         // VBAR_EL2
+        case 0x7100: return UInt64(spsrEL2)                 // SPSR_EL2
+        case 0x7101: return elrEL2                          // ELR_EL2
+        case 0x7150: return esrEL2                          // ESR_EL2
+        case 0x7180: return farEL2                          // FAR_EL2
+        case 0x7908: return spEL2                           // SP_EL2
+        case 0x7383: return cntvOff                         // CNTVOFF_EL2
+        // GICv3 CPU インタフェース（ICC）
+        case 0x6130: return UInt64(gic3?.iccPMR ?? 0)       // ICC_PMR_EL1
+        case 0x6340: return gic3?.acknowledge(group: 0) ?? GICv3.spuriousINTID   // ICC_IAR0_EL1
+        case 0x6360: return gic3?.acknowledge(group: 1) ?? GICv3.spuriousINTID   // ICC_IAR1_EL1
+        case 0x6342: return gic3?.highestPriorityPending(group: 0) ?? GICv3.spuriousINTID  // ICC_HPPIR0_EL1
+        case 0x6362: return gic3?.highestPriorityPending(group: 1) ?? GICv3.spuriousINTID  // ICC_HPPIR1_EL1
+        case 0x635B: return gic3?.currentRunningPriority ?? 0xFF                  // ICC_RPR_EL1
+        case 0x6364: return UInt64(gic3?.iccCtlr ?? 0)      // ICC_CTLR_EL1
+        case 0x6365: return UInt64(gic3?.iccSRE ?? 0)       // ICC_SRE_EL1
+        case 0x6366: return UInt64(gic3?.iccIGRPEN0 ?? 0)   // ICC_IGRPEN0_EL1
+        case 0x6367: return UInt64(gic3?.iccIGRPEN1 ?? 0)   // ICC_IGRPEN1_EL1
+        case 0x6343: return UInt64(gic3?.iccBPR0 ?? 0)      // ICC_BPR0_EL1
+        case 0x6363: return UInt64(gic3?.iccBPR1 ?? 0)      // ICC_BPR1_EL1
+        default: return platform == .vmApple ? (sysRegStorage[key] ?? 0) : 0
         }
     }
 
@@ -1616,6 +2449,7 @@ final class ARM64CPU {
         case 0x6101: elrEL1 = value
         case 0x6150: esrEL1 = value
         case 0x6180: farEL1 = value
+        case 0x61E0: parEL1 = value
         case 0x6108: spEL0 = value
         case 0x7108: spEL1 = value
         case 0x6D10:  // NZCV
@@ -1624,17 +2458,66 @@ final class ARM64CPU {
             pstate = flags
         case 0x6D11:  // DAIF
             pstate = (pstate & ~0x3C0) | (UInt32(value) & 0x3C0)
-        case 0x6F90, 0x6FA8:  // TVAL: 現在値 + 符号拡張した 32 ビット
+        case 0x6113:  // PAN
+            if value & 1 != 0 { pstate |= (1 << 22) } else { pstate &= ~(1 << 22) }
+        case 0x6114:  // UAO
+            if value & 1 != 0 { pstate |= (1 << 23) } else { pstate &= ~(1 << 23) }
+        case 0x6110:  // SPSel
+            if value & 1 != 0 { pstate |= 1 } else { pstate &= ~1 }
+        case 0x6F90:  // CNTP_TVAL: 現在値 + 符号拡張した 32 ビット
             cntpCval = counterValue() &+ UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(value & 0xFFFF_FFFF))))
-        case 0x6F91, 0x6FA9: cntpCtl = value & 0x3
-        case 0x6F92, 0x6FAA: cntpCval = value
-        default: break
+        case 0x6F98, 0x6FA8:  // CNTV_TVAL
+            cntvCval = (counterValue() &- cntvOff) &+ UInt64(bitPattern: Int64(Int32(bitPattern: UInt32(value & 0xFFFF_FFFF))))
+        case 0x6F91: cntpCtl = value & 0x3
+        case 0x6F99, 0x6FA9: cntvCtl = value & 0x3
+        case 0x6F92: cntpCval = value
+        case 0x6F9A, 0x6FAA: cntvCval = value
+        // EL2 レジスタ
+        case 0x7040: sctlrEL2 = value
+        case 0x7048: hcrEL2 = value
+        case 0x7080: ttbr0EL2 = value
+        case 0x7081: ttbr1EL2 = value
+        case 0x7082: tcrEL2 = value
+        case 0x7290: mairEL2 = value
+        case 0x7300: vbarEL2 = value
+        case 0x7100: spsrEL2 = UInt32(value & 0xFFFF_FFFF)
+        case 0x7101: elrEL2 = value
+        case 0x7150: esrEL2 = value
+        case 0x7180: farEL2 = value
+        case 0x7908: spEL2 = value
+        case 0x7383: cntvOff = value
+        // GICv3 CPU インタフェース（ICC）
+        case 0x6130: gic3?.iccPMR = UInt32(value & 0xFF)
+        case 0x6341: gic3?.endOfInterrupt(group: 0, intid: Int(value & 0xFF_FFFF))   // ICC_EOIR0_EL1
+        case 0x6361: gic3?.endOfInterrupt(group: 1, intid: Int(value & 0xFF_FFFF))   // ICC_EOIR1_EL1
+        case 0x6359: gic3?.deactivate(intid: Int(value & 0xFF_FFFF))                 // ICC_DIR_EL1
+        case 0x635D, 0x635E, 0x635F: gic3?.generateSGI(register: value)               // ICC_SGI1R / ASGI1R / SGI0R
+        case 0x6364: gic3?.iccCtlr = UInt32(value & 0xFFFF_FFFF)
+        case 0x6365: gic3?.iccSRE = UInt32(value & 0xFFFF_FFFF)
+        case 0x6366: gic3?.iccIGRPEN0 = UInt32(value & 1)
+        case 0x6367: gic3?.iccIGRPEN1 = UInt32(value & 1)
+        case 0x6343: gic3?.iccBPR0 = UInt32(value & 0x7)
+        case 0x6363: gic3?.iccBPR1 = UInt32(value & 0x7)
+        default:
+            if platform == .vmApple { sysRegStorage[key] = value }
         }
     }
 
     // MARK: SVC（コンソールサービス / 例外）
 
     private func executeSVC(imm: Int, at instructionPC: UInt64) throws {
+        if platform == .vmApple {
+            // AVPBooter のハイパーコール・トランポリンは EL1h から svc #0 を発行する。
+            // 実機 (VZ) では HCR_EL2.TSC により EL1 の SVC はハイパーバイザへトラップされ、
+            // ROM 自身の VBAR+0x200 は到達不能な前提でパークスタブになっている。
+            // ROM 起動中はこれをハイパーバイザゲート（無動作で復帰）として扱う。
+            if !romData.isEmpty && currentEL == 1 && spSel {
+                return
+            }
+            // XNU 環境ではすべての SVC をカーネルへの同期例外として配送する
+            raiseSync(ec: 0x15, iss: UInt64(imm), elr: pc)
+            return
+        }
         switch imm {
         case 1:  // putchar
             onChar?(UInt8(registers[0] & 0xFF))
@@ -1675,5 +2558,2253 @@ final class ARM64CPU {
             // それ以外の SVC は EL1 への同期例外として配送する（ELR は次の命令）
             raiseSync(ec: 0x15, iss: UInt64(imm), elr: pc)
         }
+    }
+
+    // MARK: - VMAPPLE（HVC サービス / タイマ線 / 起動設定）
+
+    /// CNTV の期限切れ（仮想カウンタ基準）。
+    private var cntvExpired: Bool {
+        (cntvCtl & 0x1) != 0 && (counterValue() &- cntvOff) >= cntvCval
+    }
+
+    /// タイマ出力を GIC の PPI ラインへ同期する。
+    private func syncVMAppleTimerLines() {
+        guard let gic = gic3 else { return }
+        let cntpAssert = (cntpCtl & 0x1) != 0 && (cntpCtl & 0x2) == 0 && timerExpired
+        let cntvAssert = (cntvCtl & 0x1) != 0 && (cntvCtl & 0x2) == 0 && cntvExpired
+        gic.ppiLine[25 - 16] = cntpAssert   // EL2 物理タイマ
+        gic.ppiLine[26 - 16] = cntpAssert   // EL1 物理タイマ
+        gic.ppiLine[27 - 16] = cntvAssert   // 仮想タイマ
+    }
+
+    private var vmAppleFIQPending: Bool {
+        syncVMAppleTimerLines()
+        return gic3?.pendingGroup(0) ?? false
+    }
+
+    private var vmAppleIRQPending: Bool {
+        syncVMAppleTimerLines()
+        return gic3?.pendingGroup(1) ?? false
+    }
+
+    /// HVC / SMC の SMCCC サービス（PSCI + Apple PAC サービス）。
+    /// PAC 命令自体は NOP 化しているため、キー管理は成功応答のみで一貫する。
+    private func executeHVC() {
+        guard platform == .vmApple else {
+            raiseSync(ec: 0x16, iss: 0, elr: pc)
+            return
+        }
+        let fid = registers[0]
+        switch fid {
+        case 0x8400_0000:  // PSCI_VERSION → 1.1
+            registers[0] = 0x0001_0001
+        case 0x8400_0003, 0xC400_0003:  // CPU_ON（単一 CPU: 起動済みとして成功）
+            registers[0] = 0
+        case 0x8400_0002:  // CPU_OFF
+            registers[0] = 0
+        case 0x8400_0004, 0xC400_0004:  // AFFINITY_INFO → ON
+            registers[0] = 0
+        case 0x8400_000A, 0xC400_000A:  // PSCI_FEATURES → サポート
+            registers[0] = 0
+        case 0x8400_0001, 0xC400_0001:  // CPU_SUSPEND → そのまま復帰
+            registers[0] = 0
+        case 0x8400_0008:  // SYSTEM_OFF
+            halted = true
+            exitCode = 0
+        case 0x8400_0009:  // SYSTEM_RESET
+            halted = true
+            exitCode = 0x5253_5431  // 'RST1'
+        case 0xC100_0000:  // Apple PAC サービス（初期状態設定）
+            registers[0] = 0
+        case 0xC100_0001:  // Apple PAC サービス（デフォルトキー取得: pid は非ゼロ必須）
+            registers[0] = 0
+            registers[1] = 1
+            registers[2] = 2
+            registers[3] = 3
+            registers[4] = 4
+        default:
+            if fid >= 0xC100_0000 && fid <= 0xC100_FFFF {
+                registers[0] = 0  // Apple 予約域は成功として扱う
+            } else {
+                registers[0] = 0xFFFF_FFFF  // SMCCC_NOT_SUPPORTED
+            }
+        }
+    }
+
+    /// VHE（HCR_EL2.E2H）有効時に EL1 名レジスタを EL2 ストレージへ振り替える。
+    private static func vheRedirectedKey(_ key: Int) -> Int {
+        switch key {
+        case 0x6040: return 0x7040   // SCTLR_EL1 → SCTLR_EL2
+        case 0x6080: return 0x7080   // TTBR0_EL1 → TTBR0_EL2
+        case 0x6081: return 0x7081   // TTBR1_EL1 → TTBR1_EL2
+        case 0x6082: return 0x7082   // TCR_EL1 → TCR_EL2
+        case 0x6290: return 0x7290   // MAIR_EL1 → MAIR_EL2
+        case 0x6300: return 0x7300   // VBAR_EL1 → VBAR_EL2
+        case 0x6100: return 0x7100   // SPSR_EL1 → SPSR_EL2
+        case 0x6101: return 0x7101   // ELR_EL1 → ELR_EL2
+        case 0x6150: return 0x7150   // ESR_EL1 → ESR_EL2
+        case 0x6180: return 0x7180   // FAR_EL1 → FAR_EL2
+        case 0x7108: return 0x7908   // SP_EL1 → SP_EL2
+        default: return key
+        }
+    }
+
+    /// ゲスト物理アドレスへバイト列を書き込む（ブートローダ用）。
+    /// 現在の変換レジームで VA→PA を解決する（デバッグ用、失敗時は nil）
+    func debugTranslate(_ va: UInt64) -> UInt64? {
+        return try? translate(address: va, isWrite: false, isFetch: true)
+    }
+
+    /// ゲスト物理メモリの読み出し（デバッグ用）
+    func readGuestMemory(address pa: UInt64, size: Int) -> UInt64 {
+        return (try? readPhysical(pa, size: size)) ?? 0
+    }
+
+    func writeGuestMemory(_ bytes: [UInt8], at pa: UInt64) {
+        guard pa >= ramBaseAddress else { return }
+        let offset = Int(pa - ramBaseAddress)
+        guard offset + bytes.count <= memory.count else { return }
+        memory.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
+    }
+
+    /// VMAPPLE の実行開始状態を設定する（EL2h、CNTFRQ 24 MHz、GICv3 生成）。
+    func setupVMAppleEntry(pc entryPC: UInt64, bootArgsPA: UInt64, stackTop: UInt64,
+                           gicDistPA: UInt64, gicRedistPA: UInt64, uartPA: UInt64) {
+        platform = .vmApple
+        ramBaseAddress = VMAppleBoot.dramBase
+        timerFrequency = 24_000_000
+        gic3 = GICv3()
+        vmGICDistPA = gicDistPA
+        vmGICRedistPA = gicRedistPA
+        vmUARTPA = uartPA
+        pc = entryPC
+        registers[0] = bootArgsPA
+        spEL1 = stackTop
+        spEL2 = stackTop
+        // VZ は E2H 有効の VHE 環境を提示し、カーネルは EL1 レジスタモデルで動作する。
+        // ここでは EL1h で開始し、HVC（PSCI / PAC サービス）はエミュレータが直接処理する。
+        pstate = 0x3C5   // EL1h / DAIF マスク / SPSel=1
+    }
+
+    /// AVPBooter（VM ブート ROM）から起動する開始状態を設定する。
+    /// QEMU hw/vmapple + Henge devices/vmapple.c の再現: リセット時は EL1h・MMU/キャッシュ
+    /// オフ・全マスクで PC = 0x0010_0000（ROM 先頭）。ROM は RAM としてマップされ、
+    /// cfg ウィンドウ（0x0040_0000 から 1 MiB）にマシン情報が置かれる。
+    /// レイアウトは Henge devices/cfg.c の実測値（serial 0x500 / soc_name 0x584）。
+    func setupROMBoot(rom: [UInt8], installer: Bool, ecid: UInt64 = 0x0001_0203_0405_0607) {
+        platform = .vmApple
+        ramBaseAddress = VMAppleBoot.dramBase
+        timerFrequency = 24_000_000
+        gic3 = GICv3()
+        vmGICDistPA = 0x1000_0000
+        vmGICRedistPA = 0x1001_0000
+        vmUARTPA = 0x2001_0000
+        romData = [UInt8](repeating: 0, count: 0x10_0000)
+        let n = min(rom.count, romData.count)
+        romData.replaceSubrange(0..<n, with: rom.prefix(n))
+        cfgWindow = [UInt8](repeating: 0, count: 0x10_0000)
+        func put32(_ off: Int, _ v: UInt32) {
+            for i in 0..<4 { cfgWindow[off + i] = UInt8((v >> (8 * i)) & 0xFF) }
+        }
+        func put64(_ off: Int, _ v: UInt64) {
+            for i in 0..<8 { cfgWindow[off + i] = UInt8((v >> (8 * i)) & 0xFF) }
+        }
+        func putStr(_ off: Int, _ s: String) {
+            for (i, b) in s.utf8.prefix(31).enumerated() { cfgWindow[off + i] = b }
+        }
+        put32(0x00, 2)                    // version
+        put32(0x04, 1)                    // nr_cpus
+        put32(0x08, 1)                    // unk1
+        put32(0x0C, 1)                    // unk2
+        put32(0x10, 0x20)                 // unk3
+        put32(0x14, 0)                    // unk4
+        put64(0x18, ecid)                 // ecid
+        put64(0x20, UInt64(memorySize))   // ram_size
+        put32(0x28, installer ? 1 : 0)    // run_installer1
+        bdifUSBEnabled = installer        // インストーラ起動時のみ bdif USB チャネルを開く（Henge 準拠）
+        put32(0x2C, 1)                    // unk5
+        put32(0x30, 1)                    // unk6
+        put32(0x34, installer ? 1 : 0)    // run_installer2
+        // 0x38 rnd は cfgRead が動的に返す
+        for i in 0..<4 {                  // MAC アドレス（en0/en1/wifi/bt、6 バイト + 2 埋め草）
+            let base = 0x40 + i * 8
+            cfgWindow[base] = 0x02; cfgWindow[base + 1] = 0x00; cfgWindow[base + 2] = 0x00
+            cfgWindow[base + 3] = 0x00; cfgWindow[base + 4] = 0x00; cfgWindow[base + 5] = UInt8(1 + i)
+        }
+        put32(0x100, 0)                   // cpu_ids[0]
+        putStr(0x500, "1234")             // serial（Henge 既定）
+        putStr(0x520, "D/A")              // unk8
+        putStr(0x540, "VM0001")           // model（Henge 既定）
+        put32(0x580, 1)                   // unk10
+        putStr(0x584, "Apple M1 (Virtual)")  // soc_name（Henge 既定）
+        pc = 0x0010_0000
+        pstate = 0x3C5   // EL1h / DAIF マスク / SPSel=1（Henge のリセット状態）
+        sctlrEL1 = 0x30D0_0980   // アーキテクチャ既定（RES1 ビット群。Henge のリセット値と同一）
+    }
+}
+
+// MARK: - FP / SIMD 実行（NEON + 浮動小数点）
+
+extension ARM64CPU {
+
+    // MARK: レジスタ / レーン補助
+
+    /// V レジスタの 16 バイト表現（リトルエンディアン）
+    func vRegBytes(_ index: Int) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let lo = fpRegisters[index * 2]
+        let hi = fpRegisters[index * 2 + 1]
+        for j in 0..<8 {
+            bytes[j] = UInt8((lo >> (8 * j)) & 0xFF)
+            bytes[j + 8] = UInt8((hi >> (8 * j)) & 0xFF)
+        }
+        return bytes
+    }
+
+    func setVRegBytes(_ index: Int, _ bytes: [UInt8]) {
+        var lo: UInt64 = 0
+        var hi: UInt64 = 0
+        for j in 0..<8 {
+            lo |= UInt64(bytes[j]) << (8 * j)
+            hi |= UInt64(bytes[j + 8]) << (8 * j)
+        }
+        fpRegisters[index * 2] = lo
+        fpRegisters[index * 2 + 1] = hi
+    }
+
+    /// ベクタ結果の書き戻し（Q=0 のとき上位 64 ビットはゼロになる）
+    func setVRegBytes(_ index: Int, _ bytes: [UInt8], q: Bool) {
+        if q {
+            setVRegBytes(index, bytes)
+        } else {
+            var lo: UInt64 = 0
+            for j in 0..<8 { lo |= UInt64(bytes[j]) << (8 * j) }
+            fpRegisters[index * 2] = lo
+            fpRegisters[index * 2 + 1] = 0
+        }
+    }
+
+    func laneGet(_ bytes: [UInt8], _ lane: Int, _ size: Int) -> UInt64 {
+        var value: UInt64 = 0
+        for j in 0..<size { value |= UInt64(bytes[lane * size + j]) << (8 * j) }
+        return value
+    }
+
+    func laneSet(_ bytes: inout [UInt8], _ lane: Int, _ size: Int, _ value: UInt64) {
+        for j in 0..<size { bytes[lane * size + j] = UInt8((value >> (8 * j)) & 0xFF) }
+    }
+
+    func laneSigned(_ bytes: [UInt8], _ lane: Int, _ size: Int) -> Int64 {
+        Int64(bitPattern: signExtend(laneGet(bytes, lane, size), bits: size * 8))
+    }
+
+    /// スカラ FP レジスタ読み（isDouble=false は単精度）
+    func fpScalar(_ index: Int, isDouble: Bool) -> Double {
+        if isDouble { return Double(bitPattern: fpRegisters[index * 2]) }
+        return Double(Float(bitPattern: UInt32(truncatingIfNeeded: fpRegisters[index * 2])))
+    }
+
+    /// スカラ FP レジスタ書き（上位はゼロ埋め）
+    func setFPScalar(_ index: Int, _ value: Double, isDouble: Bool) {
+        if isDouble {
+            fpRegisters[index * 2] = value.bitPattern
+        } else {
+            fpRegisters[index * 2] = UInt64(Float(value).bitPattern)
+        }
+        fpRegisters[index * 2 + 1] = 0
+    }
+
+    /// 符号付き飽和（bits 幅の符号付き範囲へクランプし、ビットパターンを返す）
+    func saturateSigned(_ value: Int64, bits: Int) -> UInt64 {
+        if bits >= 64 { return UInt64(bitPattern: value) }
+        let maxV = Int64(1) << (bits - 1) - 1
+        let minV = -(Int64(1) << (bits - 1))
+        let clamped = Swift.min(Swift.max(value, minV), maxV)
+        return UInt64(bitPattern: clamped) & ((UInt64(1) << bits) - 1)
+    }
+
+    /// 符号なし飽和（負値は 0、bits 幅の最大値でクランプ）
+    func saturateUnsigned(_ value: Int64, bits: Int) -> UInt64 {
+        if value < 0 { return 0 }
+        if bits >= 64 { return UInt64(bitPattern: value) }
+        let maxV = (UInt64(1) << bits) - 1
+        return Swift.min(UInt64(bitPattern: value), maxV)
+    }
+
+    /// 偶数への丸め（最近接・タイは偶数）を適用した整数値
+    func roundToNearestEven(_ value: Double) -> Double {
+        if !value.isFinite { return value }
+        let floorV = value.rounded(.down)
+        let frac = value - floorV
+        if frac > 0.5 { return floorV + 1 }
+        if frac < 0.5 { return floorV }
+        // ちょうど 0.5: 偶数側へ
+        return floorV.truncatingRemainder(dividingBy: 2) == 0 ? floorV : floorV + 1
+    }
+
+    // MARK: ルータ
+
+    func executeFPOrSIMD(_ insn: UInt32, rd: Int, rn: Int, rm: Int, at instructionPC: UInt64) throws -> Bool {
+        // FP ロード / ストア（V ビット = bit26 が 1 の形式）
+        if insn & 0x0400_0000 != 0 {
+            if try executeFPLoadStore(insn, rd: rd, rn: rn, rm: rm, at: instructionPC) { return true }
+        }
+        // FP 3 ソース（FMADD 系）
+        if (insn & 0x7F00_0000) == 0x1F00_0000 {
+            return try executeFPThreeSource(insn, rd: rd, rn: rn, rm: rm)
+        }
+        // FP スカラ領域（0x1E / 0x9E 空間: bit30 = 0 が FP データ処理の印）
+        if (insn & 0x5E00_0000) == 0x1E00_0000 && insn & 0x4000_0000 == 0 {
+            if try executeFPScalar(insn, rd: rd, rn: rn, rm: rm) { return true }
+        }
+        // 構造体ロード / ストア（LD1〜LD4 / ST1〜ST4: 0x4C/0x4D/0x0C/0x0D 空間）
+        if try executeStructLoadStore(insn, rd: rd, rn: rn, rm: rm) { return true }
+        // SIMD ベクタ領域（スカラ空間 0x5E / 0x7E を含む）
+        if (insn & 0x0E00_0000) == 0x0E00_0000 {
+            if try executeSIMDVector(insn, rd: rd, rn: rn, rm: rm) { return true }
+        }
+        return false
+    }
+
+    // MARK: FP ロード / ストア
+
+    private func fpLoad(_ index: Int, address: UInt64, bytes: Int) throws {
+        switch bytes {
+        case 16:
+            fpRegisters[index * 2] = try loadValue(address: address, size: 8)
+            fpRegisters[index * 2 + 1] = try loadValue(address: address &+ 8, size: 8)
+        default:
+            let value = try loadValue(address: address, size: bytes)
+            fpRegisters[index * 2] = value
+            fpRegisters[index * 2 + 1] = 0
+        }
+    }
+
+    private func fpStore(_ index: Int, address: UInt64, bytes: Int) throws {
+        switch bytes {
+        case 16:
+            try storeValue(address: address, size: 8, fpRegisters[index * 2])
+            try storeValue(address: address &+ 8, size: 8, fpRegisters[index * 2 + 1])
+        default:
+            try storeValue(address: address, size: bytes, fpRegisters[index * 2])
+        }
+    }
+
+    func executeFPLoadStore(_ insn: UInt32, rd: Int, rn: Int, rm: Int, at instructionPC: UInt64) throws -> Bool {
+        let size = Int((insn >> 30) & 0x3)
+        let opc = Int((insn >> 22) & 0x3)
+        let base = readReg(rn, sp: true)
+
+        // リテラル
+        if (insn & 0x3B00_0000) == 0x1800_0000 {
+            let bytes = [4, 8, 16][size == 3 ? 0 : size]
+            if size == 3 { return false }
+            let offset = signExtend(UInt64((insn >> 5) & 0x7_FFFF) << 2, bits: 21)
+            let address = UInt64(bitPattern: Int64(bitPattern: instructionPC) &+ Int64(bitPattern: offset))
+            try fpLoad(rd, address: address, bytes: bytes)
+            return true
+        }
+
+        // ペア
+        if (insn & 0x3A00_0000) == 0x2800_0000 {
+            let isLoad = insn & 0x0040_0000 != 0
+            let mode = Int((insn >> 23) & 0x7)   // 001=ポスト、010=オフセット、011=プレ
+            let elemBytes = [4, 8, 16][size == 3 ? 0 : size]
+            if size == 3 { return false }
+            let imm7 = signExtend(UInt64((insn >> 15) & 0x7F), bits: 7)
+            let offset = Int64(bitPattern: imm7) * Int64(elemBytes)
+            let rt2 = Int((insn >> 10) & 0x1F)
+            var address = base
+            if mode != 1 {
+                address = UInt64(bitPattern: Int64(bitPattern: base) &+ offset)
+            }
+            if isLoad {
+                try fpLoad(rd, address: address, bytes: elemBytes)
+                try fpLoad(rt2, address: address &+ UInt64(elemBytes), bytes: elemBytes)
+            } else {
+                try fpStore(rd, address: address, bytes: elemBytes)
+                try fpStore(rt2, address: address &+ UInt64(elemBytes), bytes: elemBytes)
+            }
+            if mode == 1 || mode == 3 {
+                writeReg(rn, UInt64(bitPattern: Int64(bitPattern: base) &+ offset), sp: true)
+            }
+            return true
+        }
+
+        // 単一: 転送サイズ（size==0 && opc>=2 は 128 ビット）
+        let bytes = (size == 0 && opc >= 2) ? 16 : (1 << size)
+        let isLoad = (opc == 1 || opc == 3)
+        let address: UInt64
+        var writeback: UInt64? = nil
+        if (insn & 0x3B00_0000) == 0x3900_0000 {
+            // 符号なし即値オフセット（転送サイズでスケール）
+            let shift = bytes == 16 ? 4 : size
+            let imm12 = UInt64((insn >> 10) & 0xFFF) << shift
+            address = base &+ imm12
+        } else if (insn & 0x3B20_0C00) == 0x3820_0800 {
+            // レジスタオフセット
+            let option = Int((insn >> 13) & 0x7)
+            let shiftAmount = ((insn >> 12) & 1) == 1 ? (bytes == 16 ? 4 : size) : 0
+            let offset = extendValue(readReg(rm), option: option, shift: shiftAmount)
+            address = UInt64(bitPattern: Int64(bitPattern: base) &+ Int64(bitPattern: offset))
+        } else if (insn & 0x3B20_0000) == 0x3800_0000 {
+            // 即値 9 ビット（アンスケールド / プレ / ポスト）
+            let imm9 = signExtend(UInt64((insn >> 12) & 0x1FF), bits: 9)
+            let indexMode = Int((insn >> 10) & 0x3)
+            switch indexMode {
+            case 1:
+                address = base
+                writeback = UInt64(bitPattern: Int64(bitPattern: base) &+ Int64(bitPattern: imm9))
+            case 3:
+                address = UInt64(bitPattern: Int64(bitPattern: base) &+ Int64(bitPattern: imm9))
+                writeback = address
+            default:
+                address = UInt64(bitPattern: Int64(bitPattern: base) &+ Int64(bitPattern: imm9))
+            }
+        } else {
+            return false
+        }
+        if isLoad {
+            try fpLoad(rd, address: address, bytes: bytes)
+        } else {
+            try fpStore(rd, address: address, bytes: bytes)
+        }
+        if let writeback = writeback {
+            writeReg(rn, writeback, sp: true)
+        }
+        return true
+    }
+
+    // MARK: FP スカラ
+
+    /// FP 即値の展開（VFPExpandImm 相当）: 値 = ±(1 + frac/16) × 2^e
+    private func expandFPImmediate(_ imm8: UInt32, isDouble: Bool) -> Double {
+        let e3 = Int((imm8 >> 4) & 0x7)
+        let e = e3 >= 4 ? e3 - 7 : e3 + 1
+        var value = (1.0 + Double(imm8 & 0xF) / 16.0) * pow(2.0, Double(e))
+        if imm8 & 0x80 != 0 { value = -value }
+        return value
+    }
+
+    private func fpCompareFlags(a: Double, b: Double) {
+        if a.isNaN || b.isNaN {
+            setNZCV(n: false, z: false, c: true, v: true)
+        } else {
+            setNZCV(n: a < b, z: a == b, c: a >= b, v: false)
+        }
+    }
+
+    func executeFPThreeSource(_ insn: UInt32, rd: Int, rn: Int, rm: Int) throws -> Bool {
+        let isDouble = insn & 0x0040_0000 != 0
+        let negateAll = insn & 0x0020_0000 != 0   // o1 (bit21)
+        let subtract = insn & 0x0000_8000 != 0    // o3 (bit15)
+        let ra = Int((insn >> 10) & 0x1F)
+        let n = fpScalar(rn, isDouble: isDouble)
+        let m = fpScalar(rm, isDouble: isDouble)
+        let a = fpScalar(ra, isDouble: isDouble)
+        let product = n * m
+        var result = subtract ? (a - product) : (a + product)
+        if negateAll { result = -result }
+        setFPScalar(rd, result, isDouble: isDouble)
+        return true
+    }
+
+    func executeFPScalar(_ insn: UInt32, rd: Int, rn: Int, rm: Int) throws -> Bool {
+        let isDouble = insn & 0x0040_0000 != 0   // type = bit22（変換系では別途解釈）
+
+        // FMOV（汎用レジスタ ⇔ FP レジスタ）
+        switch insn & 0xFFFF_FC00 {
+        case 0x1E27_0000:   // Sd ← Wn
+            fpRegisters[rd * 2] = readReg(rn) & 0xFFFF_FFFF
+            fpRegisters[rd * 2 + 1] = 0
+            return true
+        case 0x9E67_0000:   // Dd ← Xn
+            fpRegisters[rd * 2] = readReg(rn)
+            fpRegisters[rd * 2 + 1] = 0
+            return true
+        case 0x1E26_0000:   // Wd ← Sn
+            writeReg(rd, fpRegisters[rn * 2] & 0xFFFF_FFFF, width64: false)
+            return true
+        case 0x9E66_0000:   // Xd ← Dn
+            writeReg(rd, fpRegisters[rn * 2])
+            return true
+        default:
+            break
+        }
+
+        // FMOV（即値）
+        if (insn & 0x7FA0_1FE0) == 0x1E20_1000 {
+            let imm8 = (insn >> 13) & 0xFF
+            setFPScalar(rd, expandFPImmediate(imm8, isDouble: isDouble), isDouble: isDouble)
+            return true
+        }
+
+        let bits1110 = Int((insn >> 10) & 0x3)
+        let bit21 = insn & 0x0020_0000 != 0
+
+        // 2 ソース（FMUL/FDIV/FADD/FSUB/FMAX/FMIN/FNMUL）
+        if bits1110 == 0x2 && bit21 {
+            let opc = Int((insn >> 12) & 0xF)
+            let n = fpScalar(rn, isDouble: isDouble)
+            let m = fpScalar(rm, isDouble: isDouble)
+            switch opc {
+            case 0: setFPScalar(rd, n * m, isDouble: isDouble)
+            case 1: setFPScalar(rd, n / m, isDouble: isDouble)
+            case 2: setFPScalar(rd, n + m, isDouble: isDouble)
+            case 3: setFPScalar(rd, n - m, isDouble: isDouble)
+            case 4: setFPScalar(rd, fpMax(n, m), isDouble: isDouble)
+            case 5: setFPScalar(rd, fpMin(n, m), isDouble: isDouble)
+            case 6: setFPScalar(rd, -(n * m), isDouble: isDouble)
+            default: return false
+            }
+            return true
+        }
+
+        // FCSEL
+        if bits1110 == 0x3 && bit21 {
+            let cond = Int((insn >> 12) & 0xF)
+            let source = conditionHolds(cond) ? rn : rm
+            fpRegisters[rd * 2] = fpRegisters[source * 2]
+            fpRegisters[rd * 2 + 1] = 0
+            return true
+        }
+
+        // FCCMP
+        if bits1110 == 0x1 && bit21 {
+            let cond = Int((insn >> 12) & 0xF)
+            if conditionHolds(cond) {
+                fpCompareFlags(a: fpScalar(rn, isDouble: isDouble), b: fpScalar(rm, isDouble: isDouble))
+            } else {
+                let nzcv = (insn >> 0) & 0xF
+                setNZCV(n: nzcv & 0x8 != 0, z: nzcv & 0x4 != 0, c: nzcv & 0x2 != 0, v: nzcv & 0x1 != 0)
+            }
+            return true
+        }
+
+        if bits1110 == 0x0 {
+            // 1 ソース（レジスタ移動系）: bit21 = 0
+            if !bit21 {
+                let opc = Int((insn >> 15) & 0xF)
+                let n = fpScalar(rn, isDouble: isDouble)
+                switch opc {
+                case 0:   // FMOV（レジスタ）
+                    fpRegisters[rd * 2] = fpRegisters[rn * 2]
+                    fpRegisters[rd * 2 + 1] = 0
+                case 1:   // FABS
+                    setFPScalar(rd, abs(n), isDouble: isDouble)
+                case 2:   // FNEG
+                    setFPScalar(rd, -n, isDouble: isDouble)
+                case 3:   // FSQRT
+                    setFPScalar(rd, n.squareRoot(), isDouble: isDouble)
+                default:
+                    return false
+                }
+                return true
+            }
+            // FCMP
+            if ((insn >> 12) & 0xF) == 0x2 {
+                let b = (insn & 0x8) != 0 ? 0.0 : fpScalar(rm, isDouble: isDouble)
+                fpCompareFlags(a: fpScalar(rn, isDouble: isDouble), b: b)
+                return true
+            }
+            // 変換（FP ⇔ 整数）: bits[15:12] = 0（FRINT より先に判定する）
+            if ((insn >> 12) & 0xF) == 0x0 {
+                return try executeFPConvert(insn, rd: rd, rn: rn)
+            }
+            let opc1815 = Int((insn >> 15) & 0xF)
+            // FRINT 系
+            if opc1815 >= 8 {
+                let n = fpScalar(rn, isDouble: isDouble)
+                let rounded: Double
+                switch opc1815 {
+                case 8: rounded = roundToNearestEven(n)                    // FRINTN
+                case 9: rounded = n.rounded(.up)                           // FRINTP
+                case 10: rounded = n.rounded(.down)                        // FRINTM
+                case 11: rounded = n.rounded(.towardZero)                  // FRINTZ
+                case 12: rounded = n.rounded(.toNearestOrAwayFromZero)     // FRINTA
+                default: rounded = roundToNearestEven(n)                   // FRINTX / FRINTI
+                }
+                setFPScalar(rd, rounded, isDouble: isDouble)
+                return true
+            }
+            // FCVT（FP ⇔ FP）
+            if ((insn >> 12) & 0xF) == 0x4 || ((insn >> 12) & 0xF) == 0xC {
+                let srcType = Int((insn >> 22) & 0x3)   // 0=S, 1=D, 3=H
+                let dstType = Int((insn >> 15) & 0x3)   // 0=S, 1=D, 3=H
+                if srcType == 3 || dstType == 3 { return false }   // 半精度は未対応
+                let value = fpScalar(rn, isDouble: srcType == 1)
+                setFPScalar(rd, value, isDouble: dstType == 1)
+                return true
+            }
+            return false
+        }
+        return false
+    }
+
+    /// バイト列のレーンから FP 値を読む（ペアワイズ用）
+    private func fpScalarFromBytes(_ bytes: [UInt8], lane: Int, isDouble: Bool) -> Double {
+        if isDouble {
+            var bits: UInt64 = 0
+            for i in 0..<8 { bits |= UInt64(bytes[lane * 8 + i]) << (8 * i) }
+            return Double(bitPattern: bits)
+        }
+        var bits: UInt32 = 0
+        for i in 0..<4 { bits |= UInt32(bytes[lane * 4 + i]) << (8 * i) }
+        return Double(Float(bitPattern: bits))
+    }
+
+    private func fpMax(_ a: Double, _ b: Double) -> Double {
+        if a.isNaN { return b }
+        if b.isNaN { return a }
+        if a == b { return (a.sign == .minus && b.sign == .plus) ? b : a }  // +0 を優先（FMAX の仕様近似）
+        return Swift.max(a, b)
+    }
+
+    private func fpMin(_ a: Double, _ b: Double) -> Double {
+        if a.isNaN { return b }
+        if b.isNaN { return a }
+        if a == b { return (a.sign == .minus || b.sign == .minus) ? (a.sign == .minus ? a : b) : a }
+        return Swift.min(a, b)
+    }
+
+    /// FCVT 系（FP ⇔ 整数変換）
+    private func executeFPConvert(_ insn: UInt32, rd: Int, rn: Int) throws -> Bool {
+        let opc5 = Int((insn >> 16) & 0x1F)
+        let isDouble = insn & 0x0040_0000 != 0
+        let sf = insn & 0x8000_0000 != 0
+        switch opc5 {
+        case 2, 3:
+            // SCVTF (2) / UCVTF (3): 整数 → FP
+            let raw = readReg(rn)
+            let value: Double
+            if opc5 == 2 {
+                value = sf ? Double(Int64(bitPattern: raw)) : Double(Int32(bitPattern: UInt32(truncatingIfNeeded: raw)))
+            } else {
+                value = sf ? Double(raw) : Double(UInt32(truncatingIfNeeded: raw))
+            }
+            setFPScalar(rd, value, isDouble: isDouble)
+            return true
+        case 0, 1, 4, 5, 8, 9, 16, 17, 24, 25:
+            // FCVT{N,P,M,Z,A}{S,U}: FP → 整数
+            let unsigned = opc5 & 1 == 1
+            let mode = opc5 & ~1
+            let source = fpScalar(rn, isDouble: isDouble)
+            let rounded: Double
+            if source.isNaN {
+                writeReg(rd, 0, width64: sf)
+                return true
+            }
+            switch mode {
+            case 0: rounded = roundToNearestEven(source)                 // N
+            case 8: rounded = source.rounded(.up)                        // P
+            case 16: rounded = source.rounded(.down)                     // M
+            case 24: rounded = source.rounded(.towardZero)               // Z
+            default: rounded = source.rounded(.toNearestOrAwayFromZero) // A (4)
+            }
+            let result: UInt64
+            if unsigned {
+                let limit: Double = sf ? 18446744073709551616.0 : 4294967296.0
+                if rounded <= 0 { result = 0 }
+                else if rounded >= limit { result = sf ? UInt64.max : 0xFFFF_FFFF }
+                else { result = UInt64(rounded) }
+            } else {
+                let maxV: Double = sf ? 9223372036854775808.0 : 2147483648.0
+                if rounded >= maxV { result = sf ? 0x7FFF_FFFF_FFFF_FFFF : 0x7FFF_FFFF }
+                else if rounded < -maxV { result = sf ? 0x8000_0000_0000_0000 : 0xFFFF_FFFF_8000_0000 }
+                else { result = UInt64(bitPattern: Int64(rounded)) }
+            }
+            writeReg(rd, result, width64: sf)
+            return true
+        default:
+            return false
+        }
+    }
+
+    // MARK: SIMD ベクタ
+
+    func fpLane(_ bytes: [UInt8], _ lane: Int, isDouble: Bool) -> Double {
+        if isDouble { return Double(bitPattern: laneGet(bytes, lane, 8)) }
+        return Double(Float(bitPattern: UInt32(truncatingIfNeeded: laneGet(bytes, lane, 4))))
+    }
+
+    func setFPLane(_ bytes: inout [UInt8], _ lane: Int, _ value: Double, isDouble: Bool) {
+        if isDouble {
+            laneSet(&bytes, lane, 8, value.bitPattern)
+        } else {
+            laneSet(&bytes, lane, 4, UInt64(Float(value).bitPattern))
+        }
+    }
+
+    /// 切り捨て丸め + 飽和で FP → 整数変換（ベクタ FCVTZ 用）
+    func fpToIntSaturated(_ value: Double, bits: Int, unsigned: Bool) -> UInt64 {
+        if value.isNaN { return 0 }
+        let t = value.rounded(.towardZero)
+        if unsigned {
+            if t <= 0 { return 0 }
+            if bits >= 64 {
+                if t >= 18446744073709551616.0 { return UInt64.max }
+            } else if t >= Double(UInt64(1) << bits) {
+                return (UInt64(1) << bits) - 1
+            }
+            return UInt64(t)
+        } else {
+            if bits >= 64 {
+                if t >= 9223372036854775808.0 { return 0x7FFF_FFFF_FFFF_FFFF }
+                if t < -9223372036854775808.0 { return 0x8000_0000_0000_0000 }
+                return UInt64(bitPattern: Int64(t))
+            }
+            let limit = Double(Int64(1) << (bits - 1))
+            if t >= limit { return (UInt64(1) << (bits - 1)) - 1 }
+            if t < -limit { return UInt64(1) << (bits - 1) }
+            return UInt64(bitPattern: Int64(t)) & ((UInt64(1) << bits) - 1)
+        }
+    }
+
+    /// LD1〜LD4 / ST1〜ST4（複数構造・単一構造・レプリケート、ポストインデックス付き）
+    func executeStructLoadStore(_ insn: UInt32, rd: Int, rn: Int, rm: Int) throws -> Bool {
+        let top = (insn >> 24) & 0xBF
+        guard top == 0x0C || top == 0x0D else { return false }
+        let q = insn & 0x4000_0000 != 0
+        let isLoad = insn & 0x0040_0000 != 0
+        let postIndex = insn & 0x0080_0000 != 0
+        let single = insn & 0x0100_0000 != 0
+        let base = readReg(rn, sp: true)
+        var transferBytes = 0
+        if !single {
+            // 複数構造: opcode = bits[15:12]、要素サイズ = bits[11:10]
+            let opc = Int((insn >> 12) & 0xF)
+            let esize = 1 << Int((insn >> 10) & 0x3)
+            let lanes = (q ? 16 : 8) / esize
+            let nStruct: Int
+            let interleaved: Bool
+            switch opc {
+            case 7: nStruct = 1; interleaved = false
+            case 10: nStruct = 2; interleaved = false
+            case 6: nStruct = 3; interleaved = false
+            case 2: nStruct = 4; interleaved = false
+            case 8: nStruct = 2; interleaved = true
+            case 4: nStruct = 3; interleaved = true
+            case 0: nStruct = 4; interleaved = true
+            default: return false
+            }
+            transferBytes = nStruct * lanes * esize
+            if isLoad {
+                var regs: [[UInt8]] = (0..<nStruct).map { _ in [UInt8](repeating: 0, count: 16) }
+                if interleaved {
+                    for e in 0..<(lanes * nStruct) {
+                        let v = try loadValue(address: base &+ UInt64(e * esize), size: esize)
+                        laneSet(&regs[e % nStruct], e / nStruct, esize, v)
+                    }
+                } else {
+                    for k in 0..<nStruct {
+                        for l in 0..<lanes {
+                            let v = try loadValue(address: base &+ UInt64((k * lanes + l) * esize), size: esize)
+                            laneSet(&regs[k], l, esize, v)
+                        }
+                    }
+                }
+                for k in 0..<nStruct { setVRegBytes((rd + k) & 0x1F, regs[k], q: q) }
+            } else {
+                let regs: [[UInt8]] = (0..<nStruct).map { vRegBytes((rd + $0) & 0x1F) }
+                if interleaved {
+                    for e in 0..<(lanes * nStruct) {
+                        try storeValue(address: base &+ UInt64(e * esize), size: esize,
+                                       laneGet(regs[e % nStruct], e / nStruct, esize))
+                    }
+                } else {
+                    for k in 0..<nStruct {
+                        for l in 0..<lanes {
+                            try storeValue(address: base &+ UInt64((k * lanes + l) * esize), size: esize,
+                                           laneGet(regs[k], l, esize))
+                        }
+                    }
+                }
+            }
+        } else {
+            // 単一構造 / レプリケート: opc = bits[15:13]、R = bit21、T = bits[12:10]
+            let opc = Int((insn >> 13) & 0x7)
+            let rBit = insn & 0x0020_0000 != 0
+            let t = Int((insn >> 10) & 0x7)
+            if opc >= 6 {
+                // レプリケート: T = 要素サイズ log2
+                let nStruct = opc == 6 ? (rBit ? 2 : 1) : (rBit ? 4 : 3)
+                let esize = 1 << t
+                transferBytes = nStruct * esize
+                guard isLoad else { return false }
+                for k in 0..<nStruct {
+                    let v = try loadValue(address: base &+ UInt64(k * esize), size: esize)
+                    var out = [UInt8](repeating: 0, count: 16)
+                    let total = q ? 16 : 8
+                    for l in 0..<(total / esize) { laneSet(&out, l, esize, v) }
+                    setVRegBytes((rd + k) & 0x1F, out, q: q)
+                }
+            } else {
+                let nStruct: Int
+                let esizeLog2: Int
+                switch opc {
+                case 0, 1: nStruct = opc == 0 ? (rBit ? 2 : 1) : (rBit ? 4 : 3); esizeLog2 = 0
+                case 2, 3: nStruct = opc == 2 ? (rBit ? 2 : 1) : (rBit ? 4 : 3); esizeLog2 = 1
+                default: nStruct = opc == 4 ? (rBit ? 2 : 1) : (rBit ? 4 : 3); esizeLog2 = t & 1 == 1 ? 3 : 2
+                }
+                let esize = 1 << esizeLog2
+                let u = ((q ? 1 : 0) << 3) | t
+                let index = u >> esizeLog2
+                transferBytes = nStruct * esize
+                if isLoad {
+                    for k in 0..<nStruct {
+                        let v = try loadValue(address: base &+ UInt64(k * esize), size: esize)
+                        var out = vRegBytes((rd + k) & 0x1F)
+                        laneSet(&out, index, esize, v)
+                        setVRegBytes((rd + k) & 0x1F, out)
+                    }
+                } else {
+                    for k in 0..<nStruct {
+                        let out = vRegBytes((rd + k) & 0x1F)
+                        try storeValue(address: base &+ UInt64(k * esize), size: esize,
+                                       laneGet(out, index, esize))
+                    }
+                }
+            }
+        }
+        if postIndex {
+            let delta = rm == 31 ? UInt64(transferBytes) : readReg(rm)
+            writeReg(rn, base &+ delta, sp: true)
+        }
+        return true
+    }
+
+
+    // MARK: - 暗号命令（SHA1 / SHA256 / SHA512 / AES）
+    // 意味論は QEMU の crypto_helper.c（ARM ARM 準拠）を移植し、qemu-aarch64 の
+    // 実行結果（オラクル）と全命令・複数入力で一致を検証済み（tests/crypto）。
+
+    static let aesSBox: [UInt8] = [
+        0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+        0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+        0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+        0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+        0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+        0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+        0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+        0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+        0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+        0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+        0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+        0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+        0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+        0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+        0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+        0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+    ]
+    static let aesInvSBox: [UInt8] = [
+        0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB,
+        0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB,
+        0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E,
+        0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25,
+        0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92,
+        0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84,
+        0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06,
+        0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B,
+        0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73,
+        0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85, 0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E,
+        0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B,
+        0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4,
+        0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F,
+        0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF,
+        0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61,
+        0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
+    ]
+
+    func executeCrypto(_ insn: UInt32, rd: Int, rn: Int, rm: Int) -> Bool {
+        func w32(_ r: Int, _ i: Int) -> UInt32 {
+            let v = i < 2 ? fpRegisters[r * 2] : fpRegisters[r * 2 + 1]
+            return UInt32(truncatingIfNeeded: v >> (32 * (i & 1)))
+        }
+        func setW(_ r: Int, _ w: [UInt32]) {
+            fpRegisters[r * 2] = UInt64(w[0]) | (UInt64(w[1]) << 32)
+            fpRegisters[r * 2 + 1] = UInt64(w[2]) | (UInt64(w[3]) << 32)
+        }
+        func rol32(_ v: UInt32, _ n: UInt32) -> UInt32 { (v << n) | (v >> (32 - n)) }
+        func ror32(_ v: UInt32, _ n: UInt32) -> UInt32 { (v >> n) | (v << (32 - n)) }
+        func rol64(_ v: UInt64, _ n: UInt64) -> UInt64 { (v << n) | (v >> (64 - n)) }
+        func ror64(_ v: UInt64, _ n: UInt64) -> UInt64 { (v >> n) | (v << (64 - n)) }
+        func cho(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { (x & (y ^ z)) ^ z }
+        func par(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { x ^ y ^ z }
+        func maj(_ x: UInt32, _ y: UInt32, _ z: UInt32) -> UInt32 { (x & y) | ((x | y) & z) }
+
+        // AES: (insn & 0xFFFF8C00) == 0x4E280800、opcode = bits[14:12]
+        if (insn & 0xFFFF_8C00) == 0x4E28_0800 {
+            let opc = Int((insn >> 12) & 0x7)
+            switch opc {
+            case 4, 5:  // AESE / AESD: Rd ^= Rn の後に 1 ラウンド（MixColumns なし）
+                var b = vRegBytes(rd)
+                let k = vRegBytes(rn)
+                for i in 0..<16 { b[i] ^= k[i] }
+                if opc == 4 {
+                    for i in 0..<16 { b[i] = Self.aesSBox[Int(b[i])] }
+                    var out = [UInt8](repeating: 0, count: 16)
+                    for c in 0..<4 { for r in 0..<4 { out[r + 4 * c] = b[r + 4 * ((c + r) & 3)] } }
+                    setVRegBytes(rd, out)
+                } else {
+                    var sh = [UInt8](repeating: 0, count: 16)
+                    for c in 0..<4 { for r in 0..<4 { sh[r + 4 * c] = b[r + 4 * ((c + 4 - r) & 3)] } }
+                    for i in 0..<16 { sh[i] = Self.aesInvSBox[Int(sh[i])] }
+                    setVRegBytes(rd, sh)
+                }
+                return true
+            case 6, 7:  // AESMC / AESIMC: Rn に対する MixColumns / InvMixColumns のみ
+                let b = vRegBytes(rn)
+                func mul(_ a: UInt8, _ f: UInt8) -> UInt8 {
+                    var x = a, r: UInt8 = 0, f = f
+                    for _ in 0..<8 {
+                        if f & 1 != 0 { r ^= x }
+                        x = (x << 1) ^ ((x & 0x80) != 0 ? 0x1B : 0)
+                        f >>= 1
+                    }
+                    return r
+                }
+                var out = [UInt8](repeating: 0, count: 16)
+                for c in 0..<4 {
+                    let a0 = b[4 * c], a1 = b[4 * c + 1], a2 = b[4 * c + 2], a3 = b[4 * c + 3]
+                    if opc == 6 {
+                        out[4 * c] = mul(a0, 2) ^ mul(a1, 3) ^ a2 ^ a3
+                        out[4 * c + 1] = a0 ^ mul(a1, 2) ^ mul(a2, 3) ^ a3
+                        out[4 * c + 2] = a0 ^ a1 ^ mul(a2, 2) ^ mul(a3, 3)
+                        out[4 * c + 3] = mul(a0, 3) ^ a1 ^ a2 ^ mul(a3, 2)
+                    } else {
+                        out[4 * c] = mul(a0, 14) ^ mul(a1, 11) ^ mul(a2, 13) ^ mul(a3, 9)
+                        out[4 * c + 1] = mul(a0, 9) ^ mul(a1, 14) ^ mul(a2, 11) ^ mul(a3, 13)
+                        out[4 * c + 2] = mul(a0, 13) ^ mul(a1, 9) ^ mul(a2, 14) ^ mul(a3, 11)
+                        out[4 * c + 3] = mul(a0, 11) ^ mul(a1, 13) ^ mul(a2, 9) ^ mul(a3, 14)
+                    }
+                }
+                setVRegBytes(rd, out)
+                return true
+            default:
+                return false
+            }
+        }
+
+        // SHA1 / SHA256 3 レジスタ: (insn & 0xFF208C00) == 0x5E000000、opcode = bits[14:12]
+        if (insn & 0xFF20_8C00) == 0x5E00_0000 {
+            let opc = Int((insn >> 12) & 0x7)
+            switch opc {
+            case 0, 1, 2:  // SHA1C / SHA1P / SHA1M
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                var e = w32(rn, 0)
+                let m = [w32(rm, 0), w32(rm, 1), w32(rm, 2), w32(rm, 3)]
+                let f: (UInt32, UInt32, UInt32) -> UInt32 = opc == 0 ? cho : (opc == 1 ? par : maj)
+                for i in 0..<4 {
+                    var t = f(d[1], d[2], d[3])
+                    t = t &+ rol32(d[0], 5) &+ e &+ m[i]
+                    e = d[3]
+                    d[3] = d[2]
+                    d[2] = ror32(d[1], 2)
+                    d[1] = d[0]
+                    d[0] = t
+                }
+                setW(rd, d)
+                return true
+            case 3:  // SHA1SU0
+                let dLo = fpRegisters[rd * 2], dHi = fpRegisters[rd * 2 + 1]
+                let nLo = fpRegisters[rn * 2]
+                let mLo = fpRegisters[rm * 2], mHi = fpRegisters[rm * 2 + 1]
+                fpRegisters[rd * 2] = dHi ^ dLo ^ mLo
+                fpRegisters[rd * 2 + 1] = nLo ^ dHi ^ mHi
+                return true
+            case 4:  // SHA256H
+                func s1(_ x: UInt32) -> UInt32 { ror32(x, 6) ^ ror32(x, 11) ^ ror32(x, 25) }
+                func s0(_ x: UInt32) -> UInt32 { ror32(x, 2) ^ ror32(x, 13) ^ ror32(x, 22) }
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                var n = [w32(rn, 0), w32(rn, 1), w32(rn, 2), w32(rn, 3)]
+                let m = [w32(rm, 0), w32(rm, 1), w32(rm, 2), w32(rm, 3)]
+                for i in 0..<4 {
+                    var t = cho(n[0], n[1], n[2]) &+ n[3] &+ s1(n[0]) &+ m[i]
+                    n[3] = n[2]; n[2] = n[1]; n[1] = n[0]
+                    n[0] = d[3] &+ t
+                    t = t &+ maj(d[0], d[1], d[2]) &+ s0(d[0])
+                    d[3] = d[2]; d[2] = d[1]; d[1] = d[0]; d[0] = t
+                }
+                setW(rd, d)
+                return true
+            case 5:  // SHA256H2
+                func s1(_ x: UInt32) -> UInt32 { ror32(x, 6) ^ ror32(x, 11) ^ ror32(x, 25) }
+                func s0(_ x: UInt32) -> UInt32 { ror32(x, 2) ^ ror32(x, 13) ^ ror32(x, 22) }
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                let n = [w32(rn, 0), w32(rn, 1), w32(rn, 2), w32(rn, 3)]
+                let m = [w32(rm, 0), w32(rm, 1), w32(rm, 2), w32(rm, 3)]
+                for i in 0..<4 {
+                    var t = cho(d[0], d[1], d[2]) &+ d[3] &+ s1(d[0]) &+ m[i]
+                    d[3] = d[2]; d[2] = d[1]; d[1] = d[0]
+                    d[0] = n[3 - i] &+ t
+                }
+                setW(rd, d)
+                return true
+            case 6:  // SHA256SU1
+                func s1(_ x: UInt32) -> UInt32 { ror32(x, 17) ^ ror32(x, 19) ^ (x >> 10) }
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                let n = [w32(rn, 0), w32(rn, 1), w32(rn, 2), w32(rn, 3)]
+                let m = [w32(rm, 0), w32(rm, 1), w32(rm, 2), w32(rm, 3)]
+                d[0] = d[0] &+ s1(m[2]) &+ n[1]
+                d[1] = d[1] &+ s1(m[3]) &+ n[2]
+                d[2] = d[2] &+ s1(d[0]) &+ n[3]
+                d[3] = d[3] &+ s1(d[1]) &+ m[0]
+                setW(rd, d)
+                return true
+            default:
+                return false
+            }
+        }
+
+        // SHA1 / SHA256 2 レジスタ: (insn & 0xFF208C00) == 0x5E200800、opcode = bits[14:12]
+        if (insn & 0xFF20_8C00) == 0x5E20_0800 {
+            let opc = Int((insn >> 12) & 0x7)
+            switch opc {
+            case 0:  // SHA1H: Rd.w0 = ror(Rn.w0, 2)、他は 0
+                setW(rd, [ror32(w32(rn, 0), 2), 0, 0, 0])
+                return true
+            case 1:  // SHA1SU1
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                let m = [w32(rn, 0), w32(rn, 1), w32(rn, 2), w32(rn, 3)]
+                d[0] = rol32(d[0] ^ m[1], 1)
+                d[1] = rol32(d[1] ^ m[2], 1)
+                d[2] = rol32(d[2] ^ m[3], 1)
+                d[3] = rol32(d[3] ^ d[0], 1)
+                setW(rd, d)
+                return true
+            case 2:  // SHA256SU0
+                func s0(_ x: UInt32) -> UInt32 { ror32(x, 7) ^ ror32(x, 18) ^ (x >> 3) }
+                var d = [w32(rd, 0), w32(rd, 1), w32(rd, 2), w32(rd, 3)]
+                d[0] = d[0] &+ s0(d[1])
+                d[1] = d[1] &+ s0(d[2])
+                d[2] = d[2] &+ s0(d[3])
+                d[3] = d[3] &+ s0(w32(rn, 0))
+                setW(rd, d)
+                return true
+            default:
+                return false
+            }
+        }
+
+        // SHA512 3 レジスタ: (insn & 0xFFE0F000) == 0xCE608000、opcode = bits[11:10]
+        if (insn & 0xFFE0_F000) == 0xCE60_8000 {
+            let opc = Int((insn >> 10) & 0x3)
+            var d0 = fpRegisters[rd * 2], d1 = fpRegisters[rd * 2 + 1]
+            let n0 = fpRegisters[rn * 2], n1 = fpRegisters[rn * 2 + 1]
+            let m0 = fpRegisters[rm * 2], m1 = fpRegisters[rm * 2 + 1]
+            func cho512(_ x: UInt64, _ y: UInt64, _ z: UInt64) -> UInt64 { (x & (y ^ z)) ^ z }
+            func maj512(_ x: UInt64, _ y: UInt64, _ z: UInt64) -> UInt64 { (x & y) | ((x | y) & z) }
+            func bigS1(_ x: UInt64) -> UInt64 { ror64(x, 14) ^ ror64(x, 18) ^ ror64(x, 41) }
+            func bigS0(_ x: UInt64) -> UInt64 { ror64(x, 28) ^ ror64(x, 34) ^ ror64(x, 39) }
+            func smallS1(_ x: UInt64) -> UInt64 { ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6) }
+            switch opc {
+            case 0:  // SHA512H
+                d1 = d1 &+ bigS1(m1) &+ cho512(m1, n0, n1)
+                d0 = d0 &+ bigS1(d1 &+ m0) &+ cho512(d1 &+ m0, m1, n0)
+            case 1:  // SHA512H2
+                d1 = d1 &+ bigS0(m0) &+ maj512(n0, m1, m0)
+                d0 = d0 &+ bigS0(d1) &+ maj512(d1, m0, m1)
+            case 2:  // SHA512SU1
+                d0 = d0 &+ smallS1(n0) &+ m0
+                d1 = d1 &+ smallS1(n1) &+ m1
+            default:
+                return false
+            }
+            fpRegisters[rd * 2] = d0
+            fpRegisters[rd * 2 + 1] = d1
+            return true
+        }
+
+        // SHA512SU0 2 レジスタ: (insn & 0xFFE0FC00) == 0xCEC08000
+        if (insn & 0xFFE0_FC00) == 0xCEC0_8000 {
+            func smallS0(_ x: UInt64) -> UInt64 { ror64(x, 1) ^ ror64(x, 8) ^ (x >> 7) }
+            let d0 = fpRegisters[rd * 2], d1 = fpRegisters[rd * 2 + 1]
+            fpRegisters[rd * 2] = d0 &+ smallS0(d1)
+            fpRegisters[rd * 2 + 1] = d1 &+ smallS0(fpRegisters[rn * 2])
+            return true
+        }
+
+        return false
+    }
+
+    func executeSIMDVector(_ insn: UInt32, rd: Int, rn: Int, rm: Int) throws -> Bool {
+        // 暗号命令（SHA1/SHA256/SHA512/AES）: 他のデコード空間と衝突し得るため最優先で判定
+        if executeCrypto(insn, rd: rd, rn: rn, rm: rm) { return true }
+        // 構造体ロード / ストア（LD1〜LD4 / ST1〜ST4）
+        if try executeStructLoadStore(insn, rd: rd, rn: rn, rm: rm) { return true }
+        // テーブル参照（TBL / TBX）: bit21 = 0、bit10 = 0、並べ替えより手前で判定
+        if (insn & 0xBF00_8000) == 0x0E00_0000 && (insn & 0x0000_0C00) == 0 {
+            let q = insn & 0x4000_0000 != 0
+            let len = Int((insn >> 13) & 0x3)
+            let isTBX = insn & 0x0000_1000 != 0
+            var table: [UInt8] = []
+            for k in 0...len { table += vRegBytes((rn + k) & 0x1F) }
+            let idx = vRegBytes(rm)
+            let orig = vRegBytes(rd)
+            var out = [UInt8](repeating: 0, count: 16)
+            let total = q ? 16 : 8
+            for i in 0..<total {
+                let ix = Int(idx[i])
+                out[i] = ix < table.count ? table[ix] : (isTBX ? orig[i] : 0)
+            }
+            setVRegBytes(rd, out, q: q)
+            return true
+        }
+        // 変更即値 / シフト即値（bit24 = 1）
+        if insn & 0x0100_0000 != 0 {
+            if ((insn >> 19) & 0xF) == 0 {
+                return executeModifiedImmediate(insn, rd: rd)
+            }
+            return executeShiftImmediate(insn, rd: rd, rn: rn)
+        }
+        // コピーグループ
+        if executeSIMDCopy(insn, rd: rd, rn: rn, rm: rm) { return true }
+        let bit10 = insn & 0x0000_0400 != 0
+        if !bit10 {
+            if insn & 0x0020_0000 == 0 {
+                // 並べ替え（EXT / ZIP / UZP / TRN）: bit21 = 0
+                return executeSIMDPermute(insn, rd: rd, rn: rn, rm: rm)
+            }
+            if insn & 0x0000_0800 == 0 {
+                // 3 ソース（異なる幅、ロング / ワイド）: bit21 = 1、bit11 = 0
+                return executeSIMDThreeDifferent(insn, rd: rd, rn: rn, rm: rm)
+            }
+            // 2 レジスタ雑多: bit21 = 1、bit11 = 1
+            return executeSIMDTwoRegMisc(insn, rd: rd, rn: rn)
+        }
+        // 3 ソース
+        return try executeSIMDThreeSame(insn, rd: rd, rn: rn, rm: rm,
+                                        scalar: (insn & 0x1E00_0000) == 0x1E00_0000)
+    }
+
+    // MARK: 変更即値（MOVI / MVNI / ORR / BIC 即値）
+
+    func executeModifiedImmediate(_ insn: UInt32, rd: Int) -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let op = insn & 0x2000_0000 != 0
+        let cmode = Int((insn >> 12) & 0xF)
+        let imm8 = ((insn >> 16) & 0x7) << 5 | ((insn >> 5) & 0x1F)
+        var out = [UInt8](repeating: 0, count: 16)
+        let total = q ? 16 : 8
+        // cmode の偶奇が命令形を分ける（clang の出力で実証）:
+        //   LSL 形: 偶数 cmode = MOVI/MVNI（代入）、奇数 cmode = ORR/BIC（宛先との読み替え合成）
+        //   MSL 形（12/13）とバイト形（14）は MOVI/MVNI のみで、ORR/BIC には存在しない。
+        //   cmode 9 は「16 ビット MSL」ではなく ORR/BIC の 16 ビット LSL #0、
+        //   cmode 11 は ORR/BIC の 16 ビット LSL #8（AVPBooter が使用。未対応だと未定義命令になる）。
+        let rmw = (cmode % 2 == 1) && cmode <= 11
+        func apply(laneBytes: Int, value: UInt64) {
+            let mask: UInt64 = laneBytes >= 8 ? UInt64.max : (UInt64(1) << UInt64(laneBytes * 8)) - 1
+            if rmw {
+                let d = vRegBytes(rd)
+                for i in 0..<(total / laneBytes) {
+                    let cur = laneGet(d, i, laneBytes)
+                    laneSet(&out, i, laneBytes, (op ? cur & ~value : cur | value) & mask)
+                }
+            } else {
+                let v = (op ? ~value : value) & mask
+                for i in 0..<(total / laneBytes) { laneSet(&out, i, laneBytes, v) }
+            }
+        }
+        switch cmode {
+        case 0, 1, 2, 3, 4, 5, 6, 7:
+            // 32 ビットレーン LSL（シフト量は cmode<2:1> * 8）
+            apply(laneBytes: 4, value: UInt64(UInt32(imm8) << UInt32((cmode >> 1) * 8)))
+        case 8, 9:
+            // 16 ビットレーン LSL #0（8 = MOVI/MVNI、9 = ORR/BIC）
+            apply(laneBytes: 2, value: UInt64(imm8))
+        case 10, 11:
+            // 16 ビットレーン LSL #8（10 = MOVI/MVNI、11 = ORR/BIC）
+            apply(laneBytes: 2, value: UInt64(imm8) << 8)
+        case 12:
+            // 32 ビットレーン MSL #8（MOVI/MVNI のみ）
+            apply(laneBytes: 4, value: UInt64((UInt32(imm8) << 8) | 0xFF))
+        case 13:
+            // 32 ビットレーン MSL #16（MOVI/MVNI のみ）
+            apply(laneBytes: 4, value: UInt64((UInt32(imm8) << 16) | 0xFFFF))
+        case 14:
+            if op {
+                // 64 ビット: 各ビットをバイトへ展開（MOVI のみ）
+                var value: UInt64 = 0
+                for i in 0..<8 where (imm8 >> i) & 1 != 0 {
+                    value |= UInt64(0xFF) << (8 * i)
+                }
+                laneSet(&out, 0, 8, value)
+                if q { laneSet(&out, 1, 8, value) }
+            } else {
+                // バイト複製
+                for i in 0..<total { out[i] = UInt8(imm8) }
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: q)
+        return true
+    }
+
+    // MARK: シフト即値
+
+    func executeShiftImmediate(_ insn: UInt32, rd: Int, rn: Int) -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let u = insn & 0x2000_0000 != 0
+        let immh = Int((insn >> 19) & 0xF)
+        let combined = Int((insn >> 16) & 0x7F)
+        let opc = Int((insn >> 11) & 0x1F)
+        let elemBits = immh >= 8 ? 64 : immh >= 4 ? 32 : immh >= 2 ? 16 : 8
+        let elemBytes = elemBits / 8
+        let scalar = (insn & 0x1E00_0000) == 0x1E00_0000
+        let n = vRegBytes(rn)
+        var out = [UInt8](repeating: 0, count: 16)
+
+        // ナローイング（SHRN 系）: 要素幅は宛先幅、ソースは 2 倍幅
+        if opc == 16 || opc == 18 {
+            // 宛先要素幅 destBits に対し combined は [destBits, 2*destBits) の範囲。
+            // 下限ちょうど（例: 8 ビット宛先でシフト 8）も正規の符号化なので含める。
+            // 範囲外は未割り当て符号化として弾く（無限ループでのオーバーフロー trap 回避）。
+            guard combined >= 8 && combined <= 127 else { return false }
+            var destBits = 8
+            while !(combined >= destBits && combined < 2 * destBits) { destBits *= 2 }
+            let elemBits = destBits
+            let elemBytes = destBits / 8
+            let shift = 2 * elemBits - combined
+            let srcBytes = elemBytes * 2
+            let count = 8 / elemBytes
+            for i in 0..<count {
+                let r: UInt64
+                if opc == 16 {
+                    // SHRN: 論理シフトして下位を取る
+                    let sv = laneGet(n, i, srcBytes)
+                    r = (shift >= 64 ? 0 : (sv >> shift)) & ((UInt64(1) << elemBits) - 1)
+                } else if !u {
+                    // SQSHRN
+                    let sv = laneSigned(n, i, srcBytes)
+                    let shifted = shift >= 64 ? (sv < 0 ? Int64(-1) : 0) : (sv >> shift)
+                    r = saturateSigned(shifted, bits: elemBits)
+                } else {
+                    // UQSHRN
+                    let sv = laneSigned(n, i, srcBytes)
+                    let shifted = shift >= 64 ? (sv < 0 ? Int64(-1) : 0) : (sv >> shift)
+                    r = saturateUnsigned(shifted, bits: elemBits)
+                }
+                laneSet(&out, i, elemBytes, r)
+            }
+            setVRegBytes(rd, out, q: false)
+            return true
+        }
+
+        // ロングシフト（SSHLL / USHLL）: 宛先要素はソースの 2 倍幅、宛先は常に 128 ビット
+        if opc == 20 {
+            let shift = combined - elemBits
+            guard shift >= 0 && shift < elemBits else { return false }   // 範囲外は未割り当て符号化
+            let srcLanes = 8 / elemBytes
+            let baseLane = q ? srcLanes : 0
+            let destMask: UInt64 = elemBits * 2 >= 64 ? UInt64.max : ((UInt64(1) << (elemBits * 2)) - 1)
+            for i in 0..<srcLanes {
+                let v: UInt64 = u ? laneGet(n, baseLane + i, elemBytes)
+                                  : UInt64(bitPattern: laneSigned(n, baseLane + i, elemBytes))
+                laneSet(&out, i, elemBytes * 2, (shift >= 64 ? 0 : (v << shift)) & destMask)
+            }
+            setVRegBytes(rd, out)
+            return true
+        }
+
+        let total = scalar ? elemBytes : (q ? 16 : 8)
+        let lanes = total / elemBytes
+        let elemMask: UInt64 = elemBits >= 64 ? UInt64.max : (UInt64(1) << elemBits) - 1
+        switch (opc, u) {
+        case (10, false):
+            // SHL
+            let shift = combined - elemBits
+            guard shift >= 0 && shift < elemBits else { return false }
+            for i in 0..<lanes {
+                laneSet(&out, i, elemBytes, (laneGet(n, i, elemBytes) << shift) & elemMask)
+            }
+        case (10, true):
+            // SLI: シフト結果の下位ビットへ元の宛先を挿入
+            let shift = combined - elemBits
+            guard shift >= 0 && shift < elemBits else { return false }
+            let d = vRegBytes(rd)
+            let keepMask: UInt64 = shift == 0 ? 0 : ((shift >= 64 ? UInt64.max : (UInt64(1) << shift) - 1) & elemMask)
+            for i in 0..<lanes {
+                laneSet(&out, i, elemBytes, ((laneGet(n, i, elemBytes) << shift) & elemMask) | (laneGet(d, i, elemBytes) & keepMask))
+            }
+        case (0, false), (0, true):
+            // SSHR / USHR
+            let shift = 2 * elemBits - combined
+            for i in 0..<lanes {
+                if u {
+                    laneSet(&out, i, elemBytes, shift >= 64 ? 0 : (laneGet(n, i, elemBytes) >> shift))
+                } else if shift >= 64 {
+                    laneSet(&out, i, elemBytes, laneSigned(n, i, elemBytes) < 0 ? elemMask : 0)
+                } else {
+                    laneSet(&out, i, elemBytes, UInt64(bitPattern: laneSigned(n, i, elemBytes) >> shift) & elemMask)
+                }
+            }
+        case (2, false), (2, true):
+            // SSRA / USRA（宛先へ累算）
+            let shift = 2 * elemBits - combined
+            let d = vRegBytes(rd)
+            for i in 0..<lanes {
+                let shifted: UInt64
+                if u {
+                    shifted = shift >= 64 ? 0 : (laneGet(n, i, elemBytes) >> shift)
+                } else if shift >= 64 {
+                    shifted = laneSigned(n, i, elemBytes) < 0 ? elemMask : 0
+                } else {
+                    shifted = UInt64(bitPattern: laneSigned(n, i, elemBytes) >> shift) & elemMask
+                }
+                laneSet(&out, i, elemBytes, (laneGet(d, i, elemBytes) &+ shifted) & elemMask)
+            }
+        case (8, true):
+            // SRI: シフト結果の上位ビットへ元の宛先を残す
+            let shift = 2 * elemBits - combined
+            let d = vRegBytes(rd)
+            for i in 0..<lanes {
+                let lowMask: UInt64 = shift >= elemBits ? elemMask : ((UInt64(1) << (elemBits - shift)) - 1)
+                let keep = laneGet(d, i, elemBytes) & ~lowMask & elemMask
+                let shifted = shift >= 64 ? 0 : (laneGet(n, i, elemBytes) >> shift)
+                laneSet(&out, i, elemBytes, (shifted | keep) & elemMask)
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: scalar ? false : q)
+        return true
+    }
+
+    // MARK: コピーグループ（DUP / INS / UMOV / SMOV）
+
+    func executeSIMDCopy(_ insn: UInt32, rd: Int, rn: Int, rm: Int) -> Bool {
+        guard insn & 0x0020_0000 == 0, insn & 0x0000_0400 != 0 else { return false }
+        guard (insn & 0x9F00_0000) == 0x0E00_0000 else { return false }
+        let q = insn & 0x4000_0000 != 0
+        let imm5 = Int((insn >> 16) & 0x1F)
+        // U=1 は INS（要素間）専用空間。それ以外は bits[14:11] がオプコード
+        let copyOp = insn & 0x2000_0000 != 0 ? -1 : Int((insn >> 11) & 0xF)
+        func decodeImm5(_ v: Int) -> (size: Int, index: Int)? {
+            for s in 0...3 where v & (1 << s) != 0 {
+                return (s, v >> (s + 1))
+            }
+            return nil
+        }
+        switch copyOp {
+        case -1:
+            // INS（要素間）: imm5 = 宛先、imm4 = ソース（index << size）
+            guard let (sz, dstIdx) = decodeImm5(imm5) else { return false }
+            let elemBytes = 1 << sz
+            let srcIdx = Int((insn >> 11) & 0xF) >> sz
+            var d = vRegBytes(rd)
+            let s = vRegBytes(rn)
+            laneSet(&d, dstIdx, elemBytes, laneGet(s, srcIdx, elemBytes))
+            setVRegBytes(rd, d)
+            return true
+        case 0b0101:
+            // SMOV
+            guard let (sz, idx) = decodeImm5(imm5) else { return false }
+            let signed = laneSigned(vRegBytes(rn), idx, 1 << sz)
+            writeReg(rd, UInt64(bitPattern: signed), width64: q)
+            return true
+        case 0b0111:
+            // UMOV
+            guard let (sz, idx) = decodeImm5(imm5) else { return false }
+            writeReg(rd, laneGet(vRegBytes(rn), idx, 1 << sz), width64: q)
+            return true
+        case 0b0011:
+            // INS（汎用レジスタから）
+            guard let (sz, dstIdx) = decodeImm5(imm5) else { return false }
+            var d = vRegBytes(rd)
+            laneSet(&d, dstIdx, 1 << sz, readReg(rn))
+            setVRegBytes(rd, d)
+            return true
+        case 0b0000, 0b0001:
+            // DUP（要素 / 汎用レジスタ）: bit11 で区別
+            guard let (sz, idx) = decodeImm5(imm5) else { return false }
+            let elemBytes = 1 << sz
+            let total = q ? 16 : 8
+            var out = [UInt8](repeating: 0, count: 16)
+            if insn & 0x0000_0800 != 0 {
+                // DUP（汎用レジスタから）
+                let value = readReg(rn)
+                for i in 0..<(total / elemBytes) { laneSet(&out, i, elemBytes, value) }
+            } else {
+                // DUP（要素）
+                let value = laneGet(vRegBytes(rn), idx, elemBytes)
+                for i in 0..<(total / elemBytes) { laneSet(&out, i, elemBytes, value) }
+            }
+            setVRegBytes(rd, out, q: q)
+            return true
+        default:
+            return false
+        }
+    }
+
+    // MARK: 並べ替え（EXT / ZIP / UZP / TRN）
+
+    func executeSIMDPermute(_ insn: UInt32, rd: Int, rn: Int, rm: Int) -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let u = insn & 0x2000_0000 != 0
+        let size = Int((insn >> 22) & 0x3)
+        let elemBytes = 1 << size
+        let total = q ? 16 : 8
+        let lanes = total / elemBytes
+        let n = vRegBytes(rn)
+        let m = vRegBytes(rm)
+        var out = [UInt8](repeating: 0, count: 16)
+        if u && (insn & 0x0000_8000) == 0 {
+            // EXT
+            let imm4 = Int((insn >> 11) & 0xF)
+            let concat = n + m
+            for i in 0..<total { out[i] = concat[imm4 + i] }
+            setVRegBytes(rd, out, q: q)
+            return true
+        }
+        let opc = Int((insn >> 11) & 0x1F)
+        switch opc {
+        case 0b00111, 0b01111:
+            // ZIP1 / ZIP2
+            let half = lanes / 2
+            let base = opc == 0b00111 ? 0 : half
+            for i in 0..<half {
+                laneSet(&out, 2 * i, elemBytes, laneGet(n, base + i, elemBytes))
+                laneSet(&out, 2 * i + 1, elemBytes, laneGet(m, base + i, elemBytes))
+            }
+        case 0b00011, 0b01011:
+            // UZP1 / UZP2
+            let odd = opc == 0b01011 ? 1 : 0
+            let half = lanes / 2
+            for i in 0..<lanes {
+                let src = i < half
+                    ? laneGet(n, 2 * i + odd, elemBytes)
+                    : laneGet(m, 2 * (i - half) + odd, elemBytes)
+                laneSet(&out, i, elemBytes, src)
+            }
+        case 0b00101, 0b01101:
+            // TRN1 / TRN2
+            let odd = opc == 0b01101 ? 1 : 0
+            for i in 0..<lanes {
+                let src = i % 2 == 0
+                    ? laneGet(n, i + odd, elemBytes)
+                    : laneGet(m, i - 1 + odd, elemBytes)
+                laneSet(&out, i, elemBytes, src)
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: q)
+        return true
+    }
+
+    // MARK: 2 レジスタ雑多
+
+    func executeSIMDTwoRegMisc(_ insn: UInt32, rd: Int, rn: Int) -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let u = insn & 0x2000_0000 != 0
+        let size = Int((insn >> 22) & 0x3)
+        let hi = Int((insn >> 16) & 0x1F)
+        let opc = Int((insn >> 11) & 0x1F)
+        let scalar = (insn & 0x1E00_0000) == 0x1E00_0000
+        let n = vRegBytes(rn)
+        var out = [UInt8](repeating: 0, count: 16)
+        let total = scalar ? 8 : (q ? 16 : 8)
+        // スカラペアワイズ（結果は Vn の隣接 2 レーンから作る）
+        if scalar && hi == 17 && opc == 23 && !u {
+            // ADDP（整数、D のみ）
+            let elemBytes = 1 << size
+            laneSet(&out, 0, elemBytes, laneGet(n, 0, elemBytes) &+ laneGet(n, 1, elemBytes))
+            setVRegBytes(rd, out)
+            return true
+        }
+        if scalar && hi == 16 && u && (opc == 27 || opc == 31) {
+            // FADDP (opc=27) / FMAXP・FMINP (opc=31, bit23 で区別)
+            let isDouble = size == 1 || size == 3
+            let a = fpScalarFromBytes(n, lane: 0, isDouble: isDouble)
+            let b = fpScalarFromBytes(n, lane: 1, isDouble: isDouble)
+            let r: Double
+            if opc == 27 { r = a + b }
+            else if insn & 0x0080_0000 != 0 { r = fpMin(a, b) }
+            else { r = fpMax(a, b) }
+            setFPScalar(rd, r, isDouble: isDouble)
+            return true
+        }
+        // リダクション（ベクタ全体 → スカラ 1 要素）
+        if !scalar && opc == 21 && (hi == 16 || hi == 17) {
+            // MAXV (hi=16) / MINV (hi=17)、U で符号を選択
+            let elemBytes = 1 << size
+            let lanes = total / elemBytes
+            func signedVal(_ raw: UInt64) -> Int64 {
+                let bits = elemBytes * 8
+                if bits >= 64 { return Int64(bitPattern: raw) }
+                let shift = 64 - bits
+                return (Int64(bitPattern: raw << shift)) >> shift
+            }
+            var best = laneGet(n, 0, elemBytes)
+            for i in 1..<lanes {
+                let v = laneGet(n, i, elemBytes)
+                let take: Bool
+                if u {
+                    take = hi == 16 ? v > best : v < best
+                } else {
+                    take = hi == 16 ? signedVal(v) > signedVal(best) : signedVal(v) < signedVal(best)
+                }
+                if take { best = v }
+            }
+            laneSet(&out, 0, elemBytes, best)
+            setVRegBytes(rd, out)
+            return true
+        }
+        if !scalar && hi == 16 && opc == 7 && u {
+            // UADDLV（全レーンの符号なし和、結果は 2 倍幅）
+            let elemBytes = 1 << size
+            var sum: UInt64 = 0
+            for i in 0..<(total / elemBytes) { sum &+= laneGet(n, i, elemBytes) }
+            laneSet(&out, 0, elemBytes * 2, sum)
+            setVRegBytes(rd, out)
+            return true
+        }
+        if !scalar && hi == 17 && opc == 23 && !u {
+            // ADDV（全レーンの和）
+            let elemBytes = 1 << size
+            var sum: UInt64 = 0
+            for i in 0..<(total / elemBytes) { sum &+= laneGet(n, i, elemBytes) }
+            laneSet(&out, 0, elemBytes, sum)
+            setVRegBytes(rd, out)
+            return true
+        }
+        if !scalar && hi == 16 && opc == 25 && u {
+            // FMAXNMV (bit23=0) / FMINNMV (bit23=1)、S のみ対応
+            if size == 0 || size == 2 {
+                let isMin = insn & 0x0080_0000 != 0
+                var best = fpScalarFromBytes(n, lane: 0, isDouble: false)
+                for i in 1..<(total / 4) {
+                    let v = fpScalarFromBytes(n, lane: i, isDouble: false)
+                    best = isMin ? fpMin(best, v) : fpMax(best, v)
+                }
+                setFPScalar(rd, best, isDouble: false)
+                return true
+            }
+            return false
+        }
+        // ゼロとの比較（整数）: CMEQ / CMLE / CMGT / CMGE / CMLT
+        if hi == 0 && (opc == 17 || opc == 19 || opc == 21) {
+            let elemBytes = 1 << size
+            for i in 0..<(total / elemBytes) {
+                let sv = laneSigned(n, i, elemBytes)
+                let r: Bool
+                switch (opc, u) {
+                case (19, false): r = sv == 0
+                case (19, true): r = sv <= 0
+                case (17, false): r = sv > 0
+                case (17, true): r = sv >= 0
+                default: r = sv < 0
+                }
+                laneSet(&out, i, elemBytes, r ? UInt64.max : 0)
+            }
+            setVRegBytes(rd, out)
+            return true
+        }
+        // ゼロとの比較（浮動小数点）: FCMEQ / FCMLE / FCMGT / FCMGE
+        if hi == 0 && (opc == 25 || opc == 27) {
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            for i in 0..<(total / elemBytes) {
+                let v = fpScalarFromBytes(n, lane: i, isDouble: isDouble)
+                let r: Bool
+                switch (opc, u) {
+                case (27, false): r = v == 0
+                case (27, true): r = v <= 0
+                case (25, false): r = v > 0
+                default: r = v >= 0
+                }
+                laneSet(&out, i, elemBytes, r ? UInt64.max : 0)
+            }
+            setVRegBytes(rd, out)
+            return true
+        }
+        switch (hi, opc) {
+        case (0, 1):
+            // REV64 (U=0) / REV32 (U=1)
+            // どちらも size は 0 固定で、反転粒度はコンテナ全体（REV64=8 バイト、REV32=4 バイト）。
+            // 以前は 1<<size バイト単位の反転だったため size=0 で恒等写像（無反転）になっていた。
+            let container = u ? 4 : 8
+            for c in stride(from: 0, to: total, by: container) {
+                for j in 0..<container {
+                    out[c + j] = n[c + (container - 1 - j)]
+                }
+            }
+        case (0, 3):
+            // REV16
+            for i in 0..<(total / 2) {
+                out[2 * i] = n[2 * i + 1]
+                out[2 * i + 1] = n[2 * i]
+            }
+        case (0, 9):
+            // CLS (U=0) / CLZ (U=1)
+            let elemBytes = 1 << size
+            let bits = elemBytes * 8
+            for i in 0..<(total / elemBytes) {
+                let v = laneGet(n, i, elemBytes)
+                let r: UInt64
+                if u {
+                    r = UInt64(v.leadingZeroBitCount - (64 - bits))
+                } else {
+                    let signBit = (v >> (bits - 1)) & 1
+                    var count = 0
+                    var j = bits - 2
+                    while j >= 0 && ((v >> j) & 1) == signBit {
+                        count += 1
+                        j -= 1
+                    }
+                    r = UInt64(count)
+                }
+                laneSet(&out, i, elemBytes, r)
+            }
+        case (0, 11):
+            if u {
+                // MVN / NOT（バイト反転）
+                for i in 0..<total { out[i] = ~n[i] }
+            } else {
+                // CNT（バイト単位ポップカウント）
+                for i in 0..<total { out[i] = UInt8(n[i].nonzeroBitCount) }
+            }
+        case (0, 7):
+            // SUQADD (U=0) / USQADD (U=1)（宛先がアキュムレータ）
+            let elemBytes = 1 << size
+            let bits = elemBytes * 8
+            let d = vRegBytes(rd)
+            for i in 0..<(total / elemBytes) {
+                let dv = laneGet(d, i, elemBytes)
+                let nv = laneGet(n, i, elemBytes)
+                let r: UInt64
+                if !u {
+                    let ns = laneSigned(n, i, elemBytes)
+                    if bits >= 64 {
+                        if ns >= 0 {
+                            let (s, of) = dv.addingReportingOverflow(UInt64(bitPattern: ns))
+                            r = of ? UInt64.max : s
+                        } else {
+                            let mag = UInt64(bitPattern: 0 &- ns)
+                            r = dv >= mag ? dv - mag : 0
+                        }
+                    } else {
+                        let t = Int64(dv) + ns
+                        r = t < 0 ? 0 : min(UInt64(t), (UInt64(1) << bits) - 1)
+                    }
+                } else {
+                    let ds = laneSigned(d, i, elemBytes)
+                    if bits >= 64 {
+                        if ds >= 0 {
+                            let (s, of) = UInt64(ds).addingReportingOverflow(nv)
+                            r = of || s > UInt64(Int64.max) ? UInt64(bitPattern: Int64.max) : s
+                        } else {
+                            let mag = UInt64(bitPattern: 0 &- ds)
+                            if nv >= mag {
+                                let v = nv - mag
+                                r = v > UInt64(Int64.max) ? UInt64(bitPattern: Int64.max) : v
+                            } else {
+                                r = (0 as UInt64) &- (mag - nv)
+                            }
+                        }
+                    } else {
+                        r = saturateSigned(ds + Int64(nv), bits: bits)
+                    }
+                }
+                laneSet(&out, i, elemBytes, r)
+            }
+        case (0, 15):
+            // SQABS (U=0) / SQNEG (U=1)
+            let elemBytes = 1 << size
+            let bits = elemBytes * 8
+            for i in 0..<(total / elemBytes) {
+                let v = laneSigned(n, i, elemBytes)
+                let minV: Int64 = bits >= 64 ? Int64.min : -(Int64(1) << (bits - 1))
+                let maxV: Int64 = bits >= 64 ? Int64.max : (Int64(1) << (bits - 1)) - 1
+                let r: Int64 = v == minV ? maxV : (u ? -v : (v < 0 ? -v : v))
+                laneSet(&out, i, elemBytes, UInt64(bitPattern: r))
+            }
+        case (0, 23):
+            // ABS (U=0) / NEG (U=1)
+            let elemBytes = 1 << size
+            for i in 0..<(total / elemBytes) {
+                let v = laneSigned(n, i, elemBytes)
+                let r = u ? (0 &- v) : (v < 0 ? (0 &- v) : v)
+                laneSet(&out, i, elemBytes, UInt64(bitPattern: r))
+            }
+        case (1, 5), (1, 9):
+            // XTN (opc=5) / SQXTN (opc=9, U=0) / UQXTN (opc=9, U=1)
+            let srcBytes = 1 << (size + 1)
+            let dstBytes = srcBytes / 2
+            let count = 8 / dstBytes
+            for i in 0..<count {
+                let r: UInt64
+                if opc == 5 {
+                    r = laneGet(n, i, srcBytes) & ((UInt64(1) << (dstBytes * 8)) - 1)
+                } else if !u {
+                    r = saturateSigned(laneSigned(n, i, srcBytes), bits: dstBytes * 8)
+                } else {
+                    r = saturateUnsigned(laneSigned(n, i, srcBytes), bits: dstBytes * 8)
+                }
+                laneSet(&out, i, dstBytes, r)
+            }
+            setVRegBytes(rd, out, q: false)
+            return true
+        case (0, 31), (1, 31):
+            // FABS (hi=0,U=0) / FNEG (hi=0,U=1) / FSQRT (hi=1)
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            for i in 0..<(total / elemBytes) {
+                let v = fpLane(n, i, isDouble: isDouble)
+                let r = hi == 1 ? v.squareRoot() : (u ? -v : abs(v))
+                setFPLane(&out, i, r, isDouble: isDouble)
+            }
+        case (1, 17):
+            // FRINT（ベクタ、最近接偶数）
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            for i in 0..<(total / elemBytes) {
+                setFPLane(&out, i, roundToNearestEven(fpLane(n, i, isDouble: isDouble)), isDouble: isDouble)
+            }
+        case (1, 23):
+            // FCVTZS (U=0) / FCVTZU (U=1)（ベクタ）
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            for i in 0..<(total / elemBytes) {
+                let r = fpToIntSaturated(fpLane(n, i, isDouble: isDouble), bits: elemBytes * 8, unsigned: u)
+                laneSet(&out, i, elemBytes, r)
+            }
+        case (1, 27):
+            // SCVTF (U=0) / UCVTF (U=1)（ベクタ）
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            for i in 0..<(total / elemBytes) {
+                let value = u ? Double(laneGet(n, i, elemBytes)) : Double(laneSigned(n, i, elemBytes))
+                setFPLane(&out, i, value, isDouble: isDouble)
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: scalar ? false : q)
+        return true
+    }
+
+    // MARK: 多項式乗算ヘルパ
+
+    /// キャリーレス乗算（8 ビット → 16 ビット）
+    func carrylessMultiply8(_ a: UInt8, _ b: UInt8) -> UInt16 {
+        var r: UInt16 = 0
+        var aa = UInt16(a)
+        var bb = b
+        while bb != 0 {
+            if bb & 1 != 0 { r ^= aa }
+            aa <<= 1
+            bb >>= 1
+        }
+        return r
+    }
+
+    /// キャリーレス乗算（64 ビット → 128 ビット、(low, high) を返す）
+    func carrylessMultiply64(_ a: UInt64, _ b: UInt64) -> (UInt64, UInt64) {
+        var lo: UInt64 = 0
+        var hi: UInt64 = 0
+        var bb = b
+        var shift = 0
+        while bb != 0 {
+            if bb & 1 != 0 {
+                if shift == 0 { lo ^= a }
+                else if shift < 64 {
+                    lo ^= a << shift
+                    hi ^= a >> (64 - shift)
+                } else {
+                    hi ^= a << (shift - 64)
+                }
+            }
+            bb >>= 1
+            shift += 1
+        }
+        return (lo, hi)
+    }
+
+    // MARK: 3 ソース（異なる幅: ロング / ワイド）
+
+    func executeSIMDThreeDifferent(_ insn: UInt32, rd: Int, rn: Int, rm: Int) -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let u = insn & 0x2000_0000 != 0
+        let size = Int((insn >> 22) & 0x3)
+        let opc = Int((insn >> 12) & 0xF)
+        let srcBytes = 1 << size
+        let srcBits = srcBytes * 8
+        let dstBytes = srcBytes * 2
+        let dstBits = srcBits * 2
+        let srcLanes = 64 / srcBits
+        let halfOffset = q ? srcLanes : 0
+        let n = vRegBytes(rn)
+        let m = vRegBytes(rm)
+        let d = vRegBytes(rd)
+        var out = [UInt8](repeating: 0, count: 16)
+        let dstMask: UInt64 = dstBits >= 64 ? UInt64.max : (UInt64(1) << dstBits) - 1
+        func extN(_ i: Int) -> UInt64 {
+            if u { return laneGet(n, halfOffset + i, srcBytes) }
+            return UInt64(bitPattern: laneSigned(n, halfOffset + i, srcBytes)) & dstMask
+        }
+        func extM(_ i: Int) -> UInt64 {
+            if u { return laneGet(m, halfOffset + i, srcBytes) }
+            return UInt64(bitPattern: laneSigned(m, halfOffset + i, srcBytes)) & dstMask
+        }
+        func absDiff(_ i: Int) -> UInt64 {
+            if u {
+                let a = laneGet(n, halfOffset + i, srcBytes)
+                let b = laneGet(m, halfOffset + i, srcBytes)
+                return a >= b ? a - b : b - a
+            }
+            let a = laneSigned(n, halfOffset + i, srcBytes)
+            let b = laneSigned(m, halfOffset + i, srcBytes)
+            let ua = UInt64(bitPattern: a), ub = UInt64(bitPattern: b)
+            return a >= b ? ua &- ub : ub &- ua
+        }
+        func qdmulSat(_ i: Int) -> UInt64 {
+            // SQDMULL 系: 符号付き積を 2 倍して宛先幅で飽和（srcBits <= 32 前提）
+            let a = laneSigned(n, halfOffset + i, srcBytes)
+            let b = laneSigned(m, halfOffset + i, srcBytes)
+            let p = a &* b
+            if p > Int64.max / 2 { return dstMask >> 1 }
+            if p < Int64.min / 2 { return UInt64(1) << (dstBits - 1) }
+            return saturateSigned(p * 2, bits: dstBits)
+        }
+        switch opc {
+        case 0:
+            // SADDL / UADDL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (extN(i) &+ extM(i)) & dstMask) }
+        case 1:
+            // SADDW / UADDW（Rn がワイド側）
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(n, i, dstBytes) &+ extM(i)) & dstMask) }
+        case 2:
+            // SSUBL / USUBL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (extN(i) &- extM(i)) & dstMask) }
+        case 3:
+            // SSUBW / USUBW（Rn がワイド側）
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(n, i, dstBytes) &- extM(i)) & dstMask) }
+        case 5:
+            // SABAL / UABAL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(d, i, dstBytes) &+ absDiff(i)) & dstMask) }
+        case 7:
+            // SABDL / UABDL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, absDiff(i) & dstMask) }
+        case 8:
+            // SMLAL / UMLAL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(d, i, dstBytes) &+ (extN(i) &* extM(i))) & dstMask) }
+        case 9 where !u:
+            // SQDMLAL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(d, i, dstBytes) &+ qdmulSat(i)) & dstMask) }
+        case 10:
+            // SMLSL / UMLSL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(d, i, dstBytes) &- (extN(i) &* extM(i))) & dstMask) }
+        case 11 where !u:
+            // SQDMLSL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (laneGet(d, i, dstBytes) &- qdmulSat(i)) & dstMask) }
+        case 12:
+            // SMULL / UMULL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, (extN(i) &* extM(i)) & dstMask) }
+        case 13 where !u:
+            // SQDMULL
+            for i in 0..<srcLanes { laneSet(&out, i, dstBytes, qdmulSat(i) & dstMask) }
+        case 14 where !u:
+            // PMULL / PMULL2（要素サイズは B または D のみ）
+            guard size == 0 || size == 3 else { return false }
+            if size == 3 {
+                let (lo, hi) = carrylessMultiply64(laneGet(n, halfOffset, 8), laneGet(m, halfOffset, 8))
+                laneSet(&out, 0, 8, lo)
+                laneSet(&out, 1, 8, hi)
+            } else {
+                for i in 0..<srcLanes {
+                    laneSet(&out, i, 2, UInt64(carrylessMultiply8(UInt8(truncatingIfNeeded: laneGet(n, halfOffset + i, 1)), UInt8(truncatingIfNeeded: laneGet(m, halfOffset + i, 1)))))
+                }
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: true)
+        return true
+    }
+
+    // MARK: 3 ソース（ベクタ / スカラ）
+
+    func executeSIMDThreeSame(_ insn: UInt32, rd: Int, rn: Int, rm: Int, scalar: Bool) throws -> Bool {
+        let q = insn & 0x4000_0000 != 0
+        let u = insn & 0x2000_0000 != 0
+        let size = Int((insn >> 22) & 0x3)
+        let opc = Int((insn >> 11) & 0x1F)
+        let n = vRegBytes(rn)
+        let m = vRegBytes(rm)
+        var out = [UInt8](repeating: 0, count: 16)
+
+        // 論理演算（opc = 00011、演算は size で選択）
+        if opc == 0b00011 {
+            let total = q ? 16 : 8
+            let d = vRegBytes(rd)
+            for i in 0..<total {
+                switch (u, size) {
+                case (false, 0): out[i] = n[i] & m[i]        // AND
+                case (false, 1): out[i] = n[i] & ~m[i]       // BIC
+                case (false, 2): out[i] = n[i] | m[i]        // ORR / MOV
+                case (false, 3): out[i] = n[i] | ~m[i]       // ORN
+                case (true, 0): out[i] = n[i] ^ m[i]         // EOR
+                case (true, 1): out[i] = (d[i] & n[i]) | (~d[i] & m[i])   // BSL: 選択子は宛先レジスタ自身（QEMU do_bitsel 準拠）
+                case (true, 2): out[i] = (n[i] & m[i]) | (d[i] & ~m[i])   // BIT
+                case (true, 3): out[i] = (m[i] & d[i]) | (~m[i] & n[i])   // BIF: マスク 1 で宛先を保持、0 で Rn を取る（BIT と逆）
+                default: return false
+                }
+            }
+            setVRegBytes(rd, out, q: q)
+            return true
+        }
+
+        // ベクタ FP（opc >= 11001）
+        if opc >= 0b11001 {
+            let isDouble = insn & 0x0040_0000 != 0
+            let elemBytes = isDouble ? 8 : 4
+            let lanes = (q ? 16 : 8) / elemBytes
+            let sub = insn & 0x0080_0000 != 0   // bit23
+            let d = vRegBytes(rd)
+            for i in 0..<lanes {
+                let a = fpLane(n, i, isDouble: isDouble)
+                let b = fpLane(m, i, isDouble: isDouble)
+                switch opc {
+                case 0b11010 where u:
+                    // FABD
+                    setFPLane(&out, i, abs(a - b), isDouble: isDouble)
+                case 0b11010:
+                    // FADD / FSUB
+                    setFPLane(&out, i, sub ? a - b : a + b, isDouble: isDouble)
+                case 0b11011 where !u:
+                    // FMULX（0 × ∞ のとき符号付き 2.0）
+                    if (a == 0 && b.isInfinite) || (b == 0 && a.isInfinite) {
+                        let s: Double = (a.sign == .minus) != (b.sign == .minus) ? -2.0 : 2.0
+                        setFPLane(&out, i, s, isDouble: isDouble)
+                    } else {
+                        setFPLane(&out, i, a * b, isDouble: isDouble)
+                    }
+                case 0b11011 where u:
+                    // FMUL
+                    setFPLane(&out, i, a * b, isDouble: isDouble)
+                case 0b11111 where u:
+                    // FDIV
+                    setFPLane(&out, i, a / b, isDouble: isDouble)
+                case 0b11001:
+                    // FMLA (bit23=0) / FMLS (bit23=1)
+                    let acc = fpLane(d, i, isDouble: isDouble)
+                    setFPLane(&out, i, sub ? acc - a * b : acc + a * b, isDouble: isDouble)
+                case 0b11100:
+                    // FCMEQ (U=0) / FCMGE (U=1, bit23=0) / FCMGT (U=1, bit23=1)
+                    let result: Bool
+                    if !u { result = a == b }
+                    else if sub { result = a > b }
+                    else { result = a >= b }
+                    laneSet(&out, i, elemBytes, result ? UInt64.max : 0)
+                case 0b11110:
+                    // FMAX (bit23=0) / FMIN (bit23=1)
+                    setFPLane(&out, i, sub ? fpMin(a, b) : fpMax(a, b), isDouble: isDouble)
+                default:
+                    return false
+                }
+            }
+            setVRegBytes(rd, out, q: q)
+            return true
+        }
+
+        // 整数
+        let elemBytes = 1 << size
+        let elemBits = elemBytes * 8
+        let elemMask: UInt64 = elemBits >= 64 ? UInt64.max : (UInt64(1) << elemBits) - 1
+        let lanes = scalar ? 1 : (q ? 16 : 8) / elemBytes
+        func pairOp(_ f: (UInt64, UInt64) -> UInt64) {
+            // ペアワイズ: 結果の前半は Vn の隣接ペア、後半は Vm の隣接ペア
+            let half = lanes / 2
+            for i in 0..<half {
+                laneSet(&out, i, elemBytes, f(laneGet(n, 2 * i, elemBytes), laneGet(n, 2 * i + 1, elemBytes)))
+                laneSet(&out, half + i, elemBytes, f(laneGet(m, 2 * i, elemBytes), laneGet(m, 2 * i + 1, elemBytes)))
+            }
+        }
+        switch (opc, u) {
+        case (0b10000, false):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, (laneGet(n, i, elemBytes) &+ laneGet(m, i, elemBytes)) & elemMask) }
+        case (0b10000, true):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, (laneGet(n, i, elemBytes) &- laneGet(m, i, elemBytes)) & elemMask) }
+        case (0b10011, false):
+            // MUL
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, (laneGet(n, i, elemBytes) &* laneGet(m, i, elemBytes)) & elemMask) }
+        case (0b10010, false), (0b10010, true):
+            // MLA / MLS（宛先がアキュムレータ）
+            let d = vRegBytes(rd)
+            for i in 0..<lanes {
+                let product = laneGet(n, i, elemBytes) &* laneGet(m, i, elemBytes)
+                let base = laneGet(d, i, elemBytes)
+                laneSet(&out, i, elemBytes, (u ? base &- product : base &+ product) & elemMask)
+            }
+        case (0b10001, true):
+            // CMEQ
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, laneGet(n, i, elemBytes) == laneGet(m, i, elemBytes) ? elemMask : 0) }
+        case (0b00110, false):
+            // CMGT（符号付き）
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, laneSigned(n, i, elemBytes) > laneSigned(m, i, elemBytes) ? elemMask : 0) }
+        case (0b00110, true):
+            // CMHI（符号なし）
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, laneGet(n, i, elemBytes) > laneGet(m, i, elemBytes) ? elemMask : 0) }
+        case (0b00111, false):
+            // CMGE（符号付き）
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, laneSigned(n, i, elemBytes) >= laneSigned(m, i, elemBytes) ? elemMask : 0) }
+        case (0b00111, true):
+            // CMHS（符号なし）
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, laneGet(n, i, elemBytes) >= laneGet(m, i, elemBytes) ? elemMask : 0) }
+        case (0b00001, false):
+            // SQADD
+            for i in 0..<lanes {
+                let r = laneSigned(n, i, elemBytes) &+ laneSigned(m, i, elemBytes)
+                if elemBits == 64 {
+                    let (sum, overflow) = laneSigned(n, i, elemBytes).addingReportingOverflow(laneSigned(m, i, elemBytes))
+                    laneSet(&out, i, elemBytes, overflow ? (laneSigned(n, i, elemBytes) < 0 ? 0x8000_0000_0000_0000 : 0x7FFF_FFFF_FFFF_FFFF) : UInt64(bitPattern: sum))
+                } else {
+                    laneSet(&out, i, elemBytes, saturateSigned(r, bits: elemBits))
+                }
+            }
+        case (0b00001, true):
+            // UQADD
+            for i in 0..<lanes {
+                let (sum, overflow) = laneGet(n, i, elemBytes).addingReportingOverflow(laneGet(m, i, elemBytes))
+                laneSet(&out, i, elemBytes, overflow ? elemMask : (sum & elemMask))
+            }
+        case (0b00101, false):
+            // SQSUB
+            for i in 0..<lanes {
+                if elemBits == 64 {
+                    let (diff, overflow) = laneSigned(n, i, elemBytes).subtractingReportingOverflow(laneSigned(m, i, elemBytes))
+                    laneSet(&out, i, elemBytes, overflow ? (laneSigned(n, i, elemBytes) < 0 ? 0x8000_0000_0000_0000 : 0x7FFF_FFFF_FFFF_FFFF) : UInt64(bitPattern: diff))
+                } else {
+                    laneSet(&out, i, elemBytes, saturateSigned(laneSigned(n, i, elemBytes) &- laneSigned(m, i, elemBytes), bits: elemBits))
+                }
+            }
+        case (0b00101, true):
+            // UQSUB
+            for i in 0..<lanes {
+                let a = laneGet(n, i, elemBytes)
+                let b = laneGet(m, i, elemBytes)
+                laneSet(&out, i, elemBytes, a >= b ? a - b : 0)
+            }
+        case (0b01100, false):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, UInt64(bitPattern: max(laneSigned(n, i, elemBytes), laneSigned(m, i, elemBytes))) & elemMask) }
+        case (0b01100, true):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, max(laneGet(n, i, elemBytes), laneGet(m, i, elemBytes))) }
+        case (0b01101, false):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, UInt64(bitPattern: min(laneSigned(n, i, elemBytes), laneSigned(m, i, elemBytes))) & elemMask) }
+        case (0b01101, true):
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, min(laneGet(n, i, elemBytes), laneGet(m, i, elemBytes))) }
+        case (0b10111, false):
+            // ADDP
+            if scalar {
+                laneSet(&out, 0, elemBytes, (laneGet(n, 0, elemBytes) &+ laneGet(n, 1, elemBytes)) & elemMask)
+            } else {
+                pairOp { ($0 &+ $1) & elemMask }
+            }
+        case (0b10100, false):
+            pairOp { UInt64(bitPattern: max(Int64(bitPattern: signExtend($0, bits: elemBits)), Int64(bitPattern: signExtend($1, bits: elemBits)))) & elemMask }
+        case (0b10100, true):
+            pairOp { max($0, $1) }
+        case (0b10101, false):
+            pairOp { UInt64(bitPattern: min(Int64(bitPattern: signExtend($0, bits: elemBits)), Int64(bitPattern: signExtend($1, bits: elemBits)))) & elemMask }
+        case (0b10101, true):
+            pairOp { min($0, $1) }
+        case (0b00000, false), (0b00000, true):
+            // SHADD / UHADD: (n + m) >> 1
+            for i in 0..<lanes {
+                if elemBits == 64 {
+                    if u {
+                        let a = laneGet(n, i, 8), b = laneGet(m, i, 8)
+                        laneSet(&out, i, 8, (a >> 1) &+ (b >> 1) &+ ((a & b) & 1))
+                    } else {
+                        let a = laneSigned(n, i, 8), b = laneSigned(m, i, 8)
+                        let carry = Int64((UInt64(bitPattern: a) & UInt64(bitPattern: b)) & 1)
+                        laneSet(&out, i, 8, UInt64(bitPattern: (a >> 1) &+ (b >> 1) &+ carry))
+                    }
+                } else if u {
+                    laneSet(&out, i, elemBytes, ((laneGet(n, i, elemBytes) + laneGet(m, i, elemBytes)) >> 1) & elemMask)
+                } else {
+                    laneSet(&out, i, elemBytes, UInt64(bitPattern: (laneSigned(n, i, elemBytes) + laneSigned(m, i, elemBytes)) >> 1) & elemMask)
+                }
+            }
+        case (0b00010, false), (0b00010, true):
+            // SRHADD / URHADD: (n + m + 1) >> 1
+            for i in 0..<lanes {
+                if elemBits == 64 {
+                    if u {
+                        let a = laneGet(n, i, 8), b = laneGet(m, i, 8)
+                        laneSet(&out, i, 8, (a >> 1) &+ (b >> 1) &+ (((a & 1) + (b & 1) + 1) >> 1))
+                    } else {
+                        let a = laneSigned(n, i, 8), b = laneSigned(m, i, 8)
+                        let carry = Int64(((UInt64(bitPattern: a) & 1) + (UInt64(bitPattern: b) & 1) + 1) >> 1)
+                        laneSet(&out, i, 8, UInt64(bitPattern: (a >> 1) &+ (b >> 1) &+ carry))
+                    }
+                } else if u {
+                    laneSet(&out, i, elemBytes, ((laneGet(n, i, elemBytes) + laneGet(m, i, elemBytes) + 1) >> 1) & elemMask)
+                } else {
+                    laneSet(&out, i, elemBytes, UInt64(bitPattern: (laneSigned(n, i, elemBytes) + laneSigned(m, i, elemBytes) + 1) >> 1) & elemMask)
+                }
+            }
+        case (0b00100, false), (0b00100, true):
+            // SHSUB / UHSUB: (n - m) >> 1（中間値は符号付き）
+            for i in 0..<lanes {
+                if elemBits == 64 {
+                    let aU = laneGet(n, i, 8), bU = laneGet(m, i, 8)
+                    let borrow = (bU & 1) & (~aU & 1)
+                    if u {
+                        laneSet(&out, i, 8, (aU >> 1) &- (bU >> 1) &- borrow)
+                    } else {
+                        let a = laneSigned(n, i, 8), b = laneSigned(m, i, 8)
+                        laneSet(&out, i, 8, UInt64(bitPattern: (a >> 1) &- (b >> 1) &- Int64(borrow)))
+                    }
+                } else {
+                    let diff = Int64(laneGet(n, i, elemBytes)) - Int64(laneGet(m, i, elemBytes))
+                    let sd = u ? diff : laneSigned(n, i, elemBytes) - laneSigned(m, i, elemBytes)
+                    laneSet(&out, i, elemBytes, UInt64(bitPattern: sd >> 1) & elemMask)
+                }
+            }
+        case (0b01000, false), (0b01000, true), (0b01001, false), (0b01001, true), (0b01010, false), (0b01010, true):
+            // SSHL / USHL (opc=8)、SQSHL / UQSHL (9)、SRSHL / URSHL (10)
+            let saturating = opc == 0b01001
+            let rounding = opc == 0b01010
+            for i in 0..<lanes {
+                let shiftRaw = laneSigned(m, i, elemBytes)
+                let aU = laneGet(n, i, elemBytes)
+                let aS = laneSigned(n, i, elemBytes)
+                var r: UInt64 = 0
+                if shiftRaw >= 0 {
+                    let s = Int(shiftRaw)
+                    if saturating {
+                        if u {
+                            if s >= elemBits { r = aU == 0 ? 0 : elemMask }
+                            else {
+                                let v = aU << s
+                                r = (v >> s) == aU ? v & elemMask : elemMask
+                            }
+                        } else if s >= elemBits {
+                            r = aS == 0 ? 0 : (aS > 0 ? (elemMask >> 1) : (UInt64(1) << (elemBits - 1)))
+                        } else if elemBits == 64 {
+                            let v = aS &<< s
+                            r = (v &>> s) == aS ? UInt64(bitPattern: v) : (aS > 0 ? 0x7FFF_FFFF_FFFF_FFFF : 0x8000_0000_0000_0000)
+                        } else {
+                            r = saturateSigned(aS << s, bits: elemBits)
+                        }
+                    } else {
+                        r = s >= 64 ? 0 : (aU << s) & elemMask
+                    }
+                } else {
+                    let s = shiftRaw == Int64.min ? 1000 : Int(-shiftRaw)
+                    if rounding {
+                        if s >= 65 { r = 0 }
+                        else if u { r = ((aU >> s) &+ ((aU >> (s - 1)) & 1)) & elemMask }
+                        else { r = UInt64(bitPattern: (aS >> s) &+ Int64((UInt64(bitPattern: aS) >> UInt64(s - 1)) & 1)) & elemMask }
+                    } else if u {
+                        r = s >= 64 ? 0 : (aU >> s) & elemMask
+                    } else {
+                        r = s >= 64 ? (aS < 0 ? elemMask : 0) : UInt64(bitPattern: aS >> s) & elemMask
+                    }
+                }
+                laneSet(&out, i, elemBytes, r)
+            }
+        case (0b01110, false), (0b01110, true):
+            // SABD / UABD
+            for i in 0..<lanes {
+                if u {
+                    let a = laneGet(n, i, elemBytes), b = laneGet(m, i, elemBytes)
+                    laneSet(&out, i, elemBytes, a >= b ? a - b : b - a)
+                } else if elemBits == 64 {
+                    let a = laneSigned(n, i, 8), b = laneSigned(m, i, 8)
+                    laneSet(&out, i, 8, a >= b ? UInt64(bitPattern: a &- b) : UInt64(bitPattern: b &- a))
+                } else {
+                    let diff = laneSigned(n, i, elemBytes) - laneSigned(m, i, elemBytes)
+                    laneSet(&out, i, elemBytes, UInt64(bitPattern: diff < 0 ? -diff : diff) & elemMask)
+                }
+            }
+        case (0b10001, false):
+            // CMTST
+            for i in 0..<lanes { laneSet(&out, i, elemBytes, (laneGet(n, i, elemBytes) & laneGet(m, i, elemBytes)) != 0 ? elemMask : 0) }
+        case (0b10011, true):
+            // PMUL（バイト多項式乗算の下位 8 ビット）
+            guard size == 0 else { return false }
+            let total = scalar ? 8 : (q ? 16 : 8)
+            for i in 0..<total { out[i] = UInt8(truncatingIfNeeded: carrylessMultiply8(n[i], m[i])) }
+        case (0b10110, false), (0b10110, true):
+            // SQDMULH (U=0) / SQRDMULH (U=1)、要素は H / S のみ
+            guard elemBits == 16 || elemBits == 32 else { return false }
+            for i in 0..<lanes {
+                let a = laneSigned(n, i, elemBytes)
+                let b = laneSigned(m, i, elemBytes)
+                let prod = a.multipliedFullWidth(by: b)
+                var hi = prod.high
+                var lo = prod.low
+                let newLo = lo << 1
+                hi = (hi << 1) | Int64(lo >> 63)
+                lo = newLo
+                if u {
+                    let (sumLo, carry) = lo.addingReportingOverflow(UInt64(1) << (elemBits - 1))
+                    lo = sumLo
+                    if carry { hi &+= 1 }
+                }
+                let res = (hi << (64 - elemBits)) &+ Int64(bitPattern: lo >> UInt64(elemBits))
+                laneSet(&out, i, elemBytes, saturateSigned(res, bits: elemBits))
+            }
+        default:
+            return false
+        }
+        setVRegBytes(rd, out, q: scalar ? false : q)
+        return true
+    }
+}
+
+// MARK: - bdif ディスク（メモリ / ファイルのどちらでも裏付けできる）
+
+/// bdif に接続するディスク。ファイル裏付けではスパースファイルを使い、
+/// 容量の大きな root ディスク（数十 GiB）でも RAM を消費しない。
+final class BdifDisk {
+    let size: Int
+    private var memory: [UInt8]?
+    private var handle: FileHandle?
+
+    init(memory: [UInt8]) {
+        self.memory = memory
+        self.size = memory.count
+    }
+
+    /// ファイルを開く（なければ作る）。size に切り詰め/拡張する（スパース）。
+    init?(fileAt path: String, size: Int) {
+        self.size = size
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: path) {
+            guard fm.createFile(atPath: path, contents: nil) else { return nil }
+        }
+        guard let h = FileHandle(forUpdatingAtPath: path) else { return nil }
+        h.truncateFile(atOffset: UInt64(size))
+        handle = h
+    }
+
+    func read(offset: Int, count: Int) -> [UInt8]? {
+        guard offset >= 0, count >= 0, offset + count <= size else { return nil }
+        if let memory {
+            return [UInt8](memory[offset..<offset + count])
+        }
+        guard let handle else { return nil }
+        handle.seek(toFileOffset: UInt64(offset))
+        let data = handle.readData(ofLength: count)
+        guard data.count == count else { return nil }
+        return [UInt8](data)
+    }
+
+    @discardableResult
+    func write(offset: Int, bytes: [UInt8]) -> Bool {
+        guard offset >= 0, offset + bytes.count <= size else { return false }
+        if memory != nil {
+            memory!.replaceSubrange(offset..<offset + bytes.count, with: bytes)
+            return true
+        }
+        guard let handle else { return false }
+        handle.seek(toFileOffset: UInt64(offset))
+        handle.write(Data(bytes))
+        return true
     }
 }

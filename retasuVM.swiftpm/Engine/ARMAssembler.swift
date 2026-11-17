@@ -337,12 +337,15 @@ struct ARMAssembler {
             }
             return cond | 0x0F000000 | UInt32(number)
         case "mul", "mla":
+            guard operands.count >= 3 else { throw ARMAssemblerError.syntax(line: lineNumber, message: "mul/mla にはレジスタが 3 つ必要です") }
+            if mnemonic.base == "mla" {
+                guard operands.count == 4 else { throw ARMAssemblerError.syntax(line: lineNumber, message: "mla には加算レジスタが必要です") }
+            }
             let rd = try parseRegister(operands[0], lineNumber: lineNumber)
             let rm = try parseRegister(operands[1], lineNumber: lineNumber)
             let rs = try parseRegister(operands[2], lineNumber: lineNumber)
             var word = cond | (UInt32(rd) << 16) | (UInt32(rs) << 8) | 0x90 | UInt32(rm)
             if mnemonic.base == "mla" {
-                guard operands.count == 4 else { throw ARMAssemblerError.syntax(line: lineNumber, message: "mla には加算レジスタが必要です") }
                 let rn = try parseRegister(operands[3], lineNumber: lineNumber)
                 word |= (1 << 21) | (UInt32(rn) << 12)
             }
@@ -651,7 +654,7 @@ struct ARMAssembler {
             }
             return UInt32(count)
         case ".align":
-            let power = Int(parseNumber(argument) ?? 0)
+            let power = min(16, max(0, Int(parseNumber(argument) ?? 0)))
             let alignment = 1 << power
             if alignment <= 1 { return 0 }
             let remainder = Int(currentAddress) % alignment
@@ -699,7 +702,7 @@ struct ARMAssembler {
         case ".space":
             cursor += Int(parseNumber(argument) ?? 0)
         case ".align":
-            let power = Int(parseNumber(argument) ?? 0)
+            let power = min(16, max(0, Int(parseNumber(argument) ?? 0)))
             let alignment = 1 << power
             if alignment > 1 {
                 cursor = (cursor + alignment - 1) / alignment * alignment

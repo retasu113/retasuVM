@@ -6,7 +6,7 @@ import Foundation
 /// BIOS ブート ISO / RISC-V サンプル ISO）と同一内容をアプリへ同梱し、
 /// ファイルを用意しなくてもそのまま起動できるようにする。
 /// バイナリ本体は `BuiltInSampleData`（Base64）にあり、初回アクセス時に
-/// 復号してキャッシュする。各ケースの `sha256` は配布物と一致すること。
+/// デコードしてキャッシュする。各ケースの `sha256` は配布物と一致すること。
 enum BuiltInSample: String, Codable, CaseIterable, Identifiable {
     case kernel
     case lm

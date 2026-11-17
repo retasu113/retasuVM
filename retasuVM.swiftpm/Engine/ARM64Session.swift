@@ -65,7 +65,7 @@ final class ARM64Session: GuestSession {
     }
 
     private func runLoop() async {
-        while !isTerminated {
+        while !isTerminated && !Task.isCancelled {
             if isPaused {
                 try? await Task.sleep(nanoseconds: 30_000_000)
                 continue
@@ -77,6 +77,7 @@ final class ARM64Session: GuestSession {
                 if !isTerminated { onFault?((error as? ARM64Fault)?.description ?? error.localizedDescription) }
                 return
             }
+            flushOutput()
             if cpu.halted {
                 flushOutput()
                 if !isTerminated { onHalt?(cpu.exitCode) }
@@ -129,6 +130,7 @@ final class ARM64Session: GuestSession {
         terminatedFlag = true
         stateLock.unlock()
         runTask?.cancel()
+        runTask = nil
     }
 
     func sendInput(_ text: String) {

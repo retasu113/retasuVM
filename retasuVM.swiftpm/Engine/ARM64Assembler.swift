@@ -231,9 +231,16 @@ struct ARM64Assembler {
         case ".xword":
             return UInt64(splitOperands(argument).count * 8)
         case ".space":
-            return UInt64(try evaluate(argument, lineNumber: lineNumber))
+            let count = try evaluate(argument, lineNumber: lineNumber)
+            guard count >= 0 else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: ".space の個数が負です")
+            }
+            return UInt64(count)
         case ".align":
             let power = try evaluate(argument, lineNumber: lineNumber)
+            guard power >= 0 && power <= 16 else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: ".align の指数が範囲外です")
+            }
             let alignment = UInt64(1) << power
             let aligned = (currentOffset + alignment - 1) & ~(alignment - 1)
             return aligned - currentOffset
@@ -281,9 +288,16 @@ struct ARM64Assembler {
                 offset += 8
             }
         case ".space":
-            offset += UInt64(try evaluate(argument, lineNumber: lineNumber))
+            let count = try evaluate(argument, lineNumber: lineNumber)
+            guard count >= 0 else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: ".space の個数が負です")
+            }
+            offset += UInt64(count)
         case ".align":
             let power = try evaluate(argument, lineNumber: lineNumber)
+            guard power >= 0 && power <= 16 else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: ".align の指数が範囲外です")
+            }
             let alignment = UInt64(1) << power
             offset = (offset + alignment - 1) & ~(alignment - 1)
         default:
@@ -310,7 +324,7 @@ struct ARM64Assembler {
                     case "0": bytes.append(0x00)
                     case "\\": bytes.append(0x5C)
                     case "\"": bytes.append(0x22)
-                    default: bytes.append(UInt8(ascii: " "))
+                    default: bytes.append(contentsOf: String(trimmed[next]).utf8)   // 未知のエスケープは文字そのもの
                     }
                     index = trimmed.index(after: next)
                     continue
@@ -363,6 +377,9 @@ struct ARM64Assembler {
             guard let cond = Self.conditionCodes[condName] else {
                 throw ARM64AssemblerError.syntax(line: lineNumber, message: "未知の条件 '\(condName)'")
             }
+            guard operands.count >= 1 else {
+                throw ARM64AssemblerError.syntax(line: lineNumber, message: "分岐先が必要です")
+            }
             let target = try evaluate(operands[0], lineNumber: lineNumber)
             let offset = Int64(bitPattern: UInt64(bitPattern: target)) &- Int64(bitPattern: address)
             guard offset % 4 == 0, offset >= -(1 << 20), offset < (1 << 20) else {
@@ -376,8 +393,14 @@ struct ARM64Assembler {
         case "wfi": return 0xD503_207F
         case "eret": return 0xD69F_03E0
         case "svc":
+            guard operands.count >= 1 else {
+                throw ARM64AssemblerError.syntax(line: lineNumber, message: "即値が必要です")
+            }
             let imm = try parseImmediate(operands[0], lineNumber: lineNumber)
-            return 0xD400_0001 | (UInt32(imm & 0xFFFF) << 5)
+            guard imm >= 0 && imm <= 0xFFFF else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "svc 即値が範囲外です")
+            }
+            return 0xD400_0001 | (UInt32(imm) << 5)
         case "mrs", "msr":
             return try encodeSystemRegister(mnemonic: mnemonic, operands: operands, lineNumber: lineNumber)
         case "b", "bl":
@@ -392,22 +415,28 @@ struct ARM64Assembler {
             let rn = operands.isEmpty ? 30 : (parseRegister(operands[0])?.number ?? 30)
             return 0xD65F_0000 | (UInt32(rn) << 5)
         case "br", "blr":
-            guard let reg = parseRegister(operands[0]) else {
+            guard operands.count >= 1, let reg = parseRegister(operands[0]) else {
                 throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタが必要です")
             }
             let base: UInt32 = mnemonic == "br" ? 0xD61F_0000 : 0xD63F_0000
             return base | (UInt32(reg.number) << 5)
         case "cbz", "cbnz", "tbz", "tbnz":
-            guard let reg = parseRegister(operands[0]) else {
+            guard operands.count >= 1, let reg = parseRegister(operands[0]) else {
                 throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタが必要です")
             }
             let isTB = mnemonic.hasPrefix("t")
             let targetIndex = isTB ? 2 : 1
+            guard operands.count > targetIndex else {
+                throw ARM64AssemblerError.syntax(line: lineNumber, message: "分岐先が必要です")
+            }
             let target = try evaluate(operands[targetIndex], lineNumber: lineNumber)
             let offset = target &- Int64(bitPattern: address)
             let invert = mnemonic.hasSuffix("nz") || mnemonic.hasSuffix("bnz")
             if isTB {
                 let bit = try parseImmediate(operands[1], lineNumber: lineNumber)
+                guard bit >= 0 && bit < (reg.is64 ? 64 : 32) else {
+                    throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "ビット位置が範囲外です")
+                }
                 guard offset % 4 == 0, offset >= -(1 << 15), offset < (1 << 15) else {
                     throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "分岐先が範囲外です")
                 }
@@ -420,7 +449,7 @@ struct ARM64Assembler {
             return ((reg.is64 ? UInt32(1) : 0) << 31) | ((invert ? UInt32(1) : 0) << 24) | 0x3400_0000
                 | (UInt32((offset >> 2) & 0x7_FFFF) << 5) | UInt32(reg.number)
         case "adr", "adrp":
-            guard let reg = parseRegister(operands[0]) else {
+            guard operands.count >= 2, let reg = parseRegister(operands[0]) else {
                 throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタが必要です")
             }
             let target = try evaluate(operands[1], lineNumber: lineNumber)
@@ -433,7 +462,11 @@ struct ARM64Assembler {
                 return 0x1000_0000 | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5) | UInt32(reg.number)
             }
             let offset = (target & ~Int64(0xFFF)) &- (Int64(bitPattern: address) & ~Int64(0xFFF))
-            let imm = UInt32(bitPattern: Int32(offset >> 12))
+            let pageOffset = offset >> 12
+            guard pageOffset >= -(1 << 20), pageOffset < (1 << 20) else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "ADRP の範囲外です")
+            }
+            let imm = UInt32(bitPattern: Int32(pageOffset))
             return 0x9000_0000 | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5) | UInt32(reg.number)
         default:
             break
@@ -533,8 +566,8 @@ struct ARM64Assembler {
     }
 
     private func encodeLoadStore(mnemonic: String, operands: [String], line: String, lineNumber: Int, address: UInt64, poolAddress: UInt64) throws -> UInt32 {
-        guard let rt = parseRegister(operands[0]) else {
-            throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタが必要です")
+        guard operands.count >= 2, let rt = parseRegister(operands[0]) else {
+            throw ARM64AssemblerError.syntax(line: lineNumber, message: "レジスタとメモリオペランドが必要です")
         }
         let (size, opc) = loadStoreFields(mnemonic: mnemonic, rtIs64: rt.is64)
         let rest = operands.dropFirst().joined(separator: ", ")
@@ -580,7 +613,7 @@ struct ARM64Assembler {
             memoryText = String(memoryText.dropFirst())
         }
         let inner = splitOperands(memoryText)
-        guard let rnReg = parseRegister(inner[0]) else {
+        guard !inner.isEmpty, let rnReg = parseRegister(inner[0]) else {
             throw ARM64AssemblerError.syntax(line: lineNumber, message: "ベースレジスタが必要です")
         }
         let baseFields = (size << 30) | (opc << 22) | (UInt32(rnReg.number) << 5) | UInt32(rt.number)
@@ -672,7 +705,7 @@ struct ARM64Assembler {
             memoryText = String(memoryText.dropFirst())
         }
         let inner = splitOperands(memoryText)
-        guard let rnReg = parseRegister(inner[0]) else {
+        guard !inner.isEmpty, let rnReg = parseRegister(inner[0]) else {
             throw ARM64AssemblerError.syntax(line: lineNumber, message: "ベースレジスタが必要です")
         }
         if inner.count == 2 {
@@ -734,9 +767,15 @@ struct ARM64Assembler {
                 let shiftParts = operands[2].split(separator: " ").map(String.init)
                 if shiftParts.count == 2 { shift = Int(try parseImmediate(shiftParts[1], lineNumber: lineNumber)) }
             }
+            guard value >= 0 && value <= 0xFFFF else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "movz/movn/movk 即値は 16 ビット範囲が必要です")
+            }
+            guard shift >= 0 && shift <= (rd.is64 ? 48 : 16) && shift % 16 == 0 else {
+                throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "シフトは 16 の倍数で範囲内が必要です")
+            }
             let opc: UInt32 = mnemonic == "movn" ? 0 : (mnemonic == "movz" ? 2 : 3)
             return ((rd.is64 ? UInt32(1) : 0) << 31) | (opc << 29) | 0x1280_0000
-                | (UInt32(shift / 16) << 21) | (UInt32(value & 0xFFFF) << 5) | UInt32(rd.number)
+                | (UInt32(shift / 16) << 21) | (UInt32(value) << 5) | UInt32(rd.number)
         }
 
         // エイリアス
@@ -849,6 +888,9 @@ struct ARM64Assembler {
             let width: UInt32 = rd.is64 ? 64 : 32
             if operands[2].hasPrefix("#") {
                 let amount = UInt32(try parseImmediate(operands[2], lineNumber: lineNumber))
+                guard amount < width else {
+                    throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "シフト量が範囲外です")
+                }
                 switch mnemonic {
                 case "lsl":
                     let immr = (width - amount) % width
@@ -896,13 +938,8 @@ struct ARM64Assembler {
                 return ((rd.is64 ? UInt32(1) : 0) << 31) | 0x1280_0000 | (UInt32(shift / 16) << 21) | (imm16 << 5) | UInt32(rd.number)
             }
         }
-        // ADD 即値で表現できる場合（0〜4095、または 12 ビットシフト）
-        if v <= 0xFFF {
-            return ((rd.is64 ? UInt32(1) : 0) << 31) | 0x1100_0000 | (UInt32(v) << 10) | (31 << 5) | UInt32(rd.number)
-        }
-        if v & 0xFFF == 0 && (v >> 12) <= 0xFFF {
-            return ((rd.is64 ? UInt32(1) : 0) << 31) | 0x1100_0000 | (1 << 22) | (UInt32(v >> 12) << 10) | (31 << 5) | UInt32(rd.number)
-        }
+        // ここで ADD 即値へのフォールバックはしない: ADD/SUB 即値形式の Rn=31 は
+        // XZR ではなく SP を意味するため、mov の代用にすると SP 相対の値になってしまう。
         throw ARM64AssemblerError.outOfRange(line: lineNumber, message: "MOV 即値で表現できません（ldr rd, =式 を使ってください）")
     }
 

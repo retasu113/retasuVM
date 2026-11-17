@@ -161,14 +161,15 @@ final class ARM64NVMe {
             case 0x05:  // Create I/O Completion Queue
                 let qid = Int((cdw10 >> 16) & 0xFFFF)
                 let qsize = Int(cdw10 & 0xFFFF) + 1
-                if qid == 0 || qsize < 2 { status = 0x02 } else {
+                // CAP.MQES=1023 のため最大 1024 エントリ。それを超える要求は Invalid Field
+                if qid == 0 || qsize < 2 || qsize > 1024 { status = 0x02 } else {
                     completionQueues[qid] = CompletionQueue(base: prp1, size: qsize, tail: 0, phase: 1, interruptsEnabled: cdw11 & 0x2 != 0)
                 }
             case 0x01:  // Create I/O Submission Queue
                 let qid = Int((cdw10 >> 16) & 0xFFFF)
                 let qsize = Int(cdw10 & 0xFFFF) + 1
                 let cqid = Int((cdw11 >> 16) & 0xFFFF)
-                if qid == 0 || qsize < 2 || completionQueues[cqid] == nil { status = 0x02 } else {
+                if qid == 0 || qsize < 2 || qsize > 1024 || completionQueues[cqid] == nil { status = 0x02 } else {
                     submissionQueues[qid] = SubmissionQueue(base: prp1, size: qsize, head: 0, completionQueueID: cqid)
                 }
             case 0x06:  // Identify
@@ -201,7 +202,7 @@ final class ARM64NVMe {
             case 0x01, 0x02:  // Write / Read
                 let lba = UInt64(cdw10) | UInt64(cdw11) << 32
                 let count = Int(cdw12 & 0xFFFF) + 1
-                if lba + UInt64(count) > sectorCount {
+                if lba > sectorCount || UInt64(count) > sectorCount - lba {
                     status = 0x80   // LBA Out of Range
                 } else if opcode == 0x02 {
                     var data = [UInt8](repeating: 0, count: count * 512)
@@ -264,6 +265,17 @@ final class ARM64NVMe {
         }
         var listEntries: [UInt64] = []
         var listIndex = 0
+        var listPagesLeft = pageCount - 1   // リストから取るデータページ数
+        func loadListPage(_ base: UInt64) -> [UInt64] {
+            let page = readRAM?(base & ~0xFFF, 4096) ?? []
+            var entries: [UInt64] = []
+            for i in 0..<(page.count / 8) {
+                var value: UInt64 = 0
+                for j in 0..<8 { value |= UInt64(page[i * 8 + j]) << (8 * j) }
+                entries.append(value)
+            }
+            return entries
+        }
         var isFirst = true
         while remaining > 0 {
             let length = min(remaining, 4096 - Int(current & 0xFFF))
@@ -273,15 +285,16 @@ final class ARM64NVMe {
             if isFirst && pageCount == 2 {
                 current = prp2
             } else {
-                if listEntries.isEmpty {
-                    let page = readRAM?(prp2 & ~0xFFF, 4096) ?? []
-                    for i in 0..<(page.count / 8) {
-                        var value: UInt64 = 0
-                        for j in 0..<8 { value |= UInt64(page[i * 8 + j]) << (8 * j) }
-                        listEntries.append(value)
-                    }
+                if listEntries.isEmpty { listEntries = loadListPage(prp2) }
+                // リストページの最終エントリ（511）は、まだデータページが残る場合は
+                // 次のリストページへのチェインポインタ（NVMe 仕様）
+                if listIndex == 511 && listPagesLeft > 1 {
+                    listEntries = loadListPage(listEntries[511])
+                    listIndex = 0
                 }
-                if listIndex < listEntries.count { current = listEntries[listIndex]; listIndex += 1 } else { break }
+                if listIndex < listEntries.count {
+                    current = listEntries[listIndex]; listIndex += 1; listPagesLeft -= 1
+                } else { break }
             }
             isFirst = false
         }
@@ -325,7 +338,7 @@ final class ARM64NVMe {
         putString(4, 20, "RETASUVM0001") // SN
         putString(24, 40, "retasuVM NVMe") // MN
         putString(64, 8, "0.15")         // FR
-        data[77] = 4                     // MDTS: 最大 16 KiB
+        data[77] = 4                     // MDTS: 2^4 × 4 KiB = 最大 64 KiB
         put16(78, 1)                     // CNTLID
         put32(80, 0x0001_0400)           // VER: 1.4.0
         put32(516, 1)                    // NN: 名前空間 1 つ
