@@ -104,7 +104,7 @@ enum ElTorito {
             return BootImage(
                 bytesToLoad: Array(image.prefix(512)),
                 loadAddress: 0x7C00,
-                entrySegment: 0,
+                entrySegment: 0x07C0,
                 diskData: image,
                 diskSectorSize: 512,
                 heads: 2,
@@ -118,7 +118,7 @@ enum ElTorito {
             return BootImage(
                 bytesToLoad: Array(image.prefix(512)),
                 loadAddress: 0x7C00,
-                entrySegment: 0,
+                entrySegment: 0x07C0,
                 diskData: image,
                 diskSectorSize: 512,
                 heads: 255,

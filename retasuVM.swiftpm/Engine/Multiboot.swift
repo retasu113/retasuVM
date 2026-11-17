@@ -100,6 +100,7 @@ enum Multiboot {
             entry = read32(imageData, 24)
             let programHeaderOffset = Int(read32(imageData, 28))
             let entrySize = Int(read16(imageData, 42))
+            guard entrySize >= 32 else { throw MultibootError.unsupportedImage }   // Elf32_Phdr は 32 バイト
             let count = Int(read16(imageData, 44))
             for index in 0..<count {
                 let offset = programHeaderOffset + index * entrySize

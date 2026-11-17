@@ -265,12 +265,12 @@ struct RISCVAssembler {
                         appendBytes((0..<4).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) })
                     }
                 case ".space", ".zero":
-                    guard let count = parseNumber(operandPart(statement)) else {
+                    guard let count = parseNumber(operandPart(statement)), count >= 0 else {
                         throw AssemblerError.syntax(line: line.number, message: ".space の値が不正です")
                     }
                     appendBytes([UInt8](repeating: 0, count: Int(count)))
                 case ".align":
-                    guard let power = parseNumber(operandPart(statement)) else {
+                    guard let power = parseNumber(operandPart(statement)), power >= 0, power <= 16 else {
                         throw AssemblerError.syntax(line: line.number, message: ".align の値が不正です")
                     }
                     let alignment = 1 << Int(power)
@@ -318,9 +318,9 @@ struct RISCVAssembler {
         case ".word", ".long", ".int":
             return splitOperands(operandPart(statement)).count * 4
         case ".space", ".zero":
-            return Int(parseNumber(operandPart(statement)) ?? 0)
+            return max(0, Int(parseNumber(operandPart(statement)) ?? 0))
         case ".align":
-            let power = Int(parseNumber(operandPart(statement)) ?? 0)
+            let power = min(16, max(0, Int(parseNumber(operandPart(statement)) ?? 0)))
             let alignment = 1 << power
             return (alignment - sectionOffset % alignment) % alignment
         default:

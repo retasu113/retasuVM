@@ -69,18 +69,22 @@ enum MacPlatform {
     }
 
     /// ADT を CPU の RAM へ配置し、プラットフォームを Apple Silicon 方式へ切り替える。
-    static func installDeviceTree(cpu: ARM64CPU) {
+    /// 配置できなかった場合は false（呼び出し側は X0 を設定してはいけない）。
+    @discardableResult
+    static func installDeviceTree(cpu: ARM64CPU) -> Bool {
         cpu.platform = .appleSilicon
         let adt = buildDeviceTree(memorySize: cpu.memorySize)
         let offset = Int(adtAddress - ARM64CPU.ramBase)
-        guard offset >= 0 && offset + adt.count <= cpu.memory.count else { return }
+        guard offset >= 0 && offset + adt.count <= cpu.memory.count else { return false }
         cpu.memory.replaceSubrange(offset..<(offset + adt.count), with: adt)
+        return true
     }
 
     /// ELF64 カーネルを読み込み、Mac ブート方式で開始できる状態にする（X0 = ADT）。
     static func bootELF(cpu: ARM64CPU, elf: [UInt8]) throws {
         _ = try cpu.loadELF64(elf)
-        installDeviceTree(cpu: cpu)
+        // ADT が置けていないのに X0 だけ設定すると、ゲストはゴミをデバイスツリーとして読む
+        precondition(installDeviceTree(cpu: cpu), "ADT を RAM へ配置できませんでした")
         cpu.setBootArgument(adtAddress)
     }
 }

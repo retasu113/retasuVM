@@ -105,6 +105,12 @@ iso_info:
     lb t1, 3(t0)
     li t2, 48
     bne t1, t2, iso_not_iso
+    lb t1, 4(t0)
+    li t2, 48
+    bne t1, t2, iso_not_iso
+    lb t1, 5(t0)
+    li t2, 49
+    bne t1, t2, iso_not_iso
     la a0, iso_confirmed_text
     call print_str
     la a0, iso_volume_text
