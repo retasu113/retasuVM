@@ -1017,7 +1017,15 @@ final class X86PCIHost {
     }
 
     func readPort(_ port: UInt16, size: Int) -> UInt32 {
-        if port == 0xCF8 { return configAddress }
+        if (0xCF8...0xCFB).contains(port) {
+            // CONFIG_ADDRESS のバイトレーン読み（書き込み側のマージと対称）
+            var value: UInt32 = 0
+            let lane = Int(port - 0xCF8)
+            for i in 0..<size where lane + i < 4 {
+                value |= ((configAddress >> (8 * (lane + i))) & 0xFF) << (8 * i)
+            }
+            return value
+        }
         guard port >= 0xCFC, let key = selectedDevice(), let config = devices[key] else {
             return 0xFFFFFFFF
         }
@@ -1460,7 +1468,7 @@ final class X86LAPIC {
         currentNow = now
         guard timerArmed, timerInitial > 0, now >= timerDeadline else { return }
         let periodic = (lvtTimer >> 17) & 0x3 == 1
-        if lvtTimer & 0x10000 == 0 {
+        if lvtTimer & 0x10000 == 0 && enabled {   // ソフトウェア無効中は実機同様ラッチしない
             requestInterrupt(vector: UInt8(lvtTimer & 0xFF))
         }
         if periodic {

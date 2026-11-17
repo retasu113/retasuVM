@@ -90,7 +90,7 @@ final class X86Session: GuestSession {
     }
 
     private func runLoop() async {
-        while !isTerminated {
+        while !isTerminated && !Task.isCancelled {
             if isPaused {
                 try? await Task.sleep(nanoseconds: 30_000_000)
                 continue
@@ -102,6 +102,7 @@ final class X86Session: GuestSession {
                 if !isTerminated { onFault?((error as? X86Fault)?.description ?? error.localizedDescription) }
                 return
             }
+            flushOutput()
             if cpu.halted {
                 flushOutput()
                 if !isTerminated { onHalt?(cpu.exitCode) }

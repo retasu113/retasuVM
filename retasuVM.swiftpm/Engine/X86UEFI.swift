@@ -283,7 +283,11 @@ enum X86UEFI {
                 var entryOffset = offset + 8
                 while entryOffset + 2 <= offset + blockSize {
                     let entry = read16(image, entryOffset)
-                    if entry >> 12 == 10 { // IMAGE_REL_BASED_DIR64
+                    let relocType = entry >> 12
+                    if relocType != 0 && relocType != 10 {
+                        return false   // 未対応の再配置は黙って読み込むより失敗させる
+                    }
+                    if relocType == 10 { // IMAGE_REL_BASED_DIR64
                         let target = pageRVA + Int(entry & 0xFFF)
                         guard target + 8 <= image.count else { return false }
                         let value = read64(image, target)
@@ -1044,7 +1048,11 @@ enum X86UEFI {
             case .fileDelete:
                 guard let object = fileObjects[rcx], let volume = fatVolume,
                       let entry = object.entry else { return invalidParameter }
-                try? volume.deleteFile(directoryPath: object.path, name: entry.name)
+                do {
+                    try volume.deleteFile(directoryPath: object.path, name: entry.name)
+                } catch {
+                    return deviceError   // 削除に失敗したのに成功を報告しない
+                }
                 fileObjects[rcx] = nil
                 syncDisk()
                 return success
@@ -1405,7 +1413,6 @@ enum X86UEFI {
                 (0x000000, 0x80, 7), // 通常メモリ（0〜512 KiB）
                 (0x080000, 0x80, 0), // 予約（BIOS / ACPI 領域を含む）
                 (0x100000, 0x100, 3), // ファームウェア構造（ページ表・GDT・IDT）
-                (imageBase, imagePages, 2), // ローダコード（イメージ）
                 (0x300000, 0x1, 5), // ランタイムサービスコード（システムテーブル等）
                 (0x301000, 0x2, 5), // ランタイムサービスコード（スタブ）
                 (0x303000, 0xD, 3), // ブートサービス領域（アリーナ等）
@@ -1413,6 +1420,15 @@ enum X86UEFI {
                 (0x3F0000, 0x10, 3), // スタック
                 (0x400000, 0x100, 7), // 通常メモリ
             ]
+            // イメージ領域は静的領域と重なる場合は追加しない（メモリマップの
+            // ディスクリプタは重なってはならないという UEFI 仕様のため）
+            let imageEnd = imageBase + imagePages * 4096
+            let staticRanges: [(UInt64, UInt64)] = [
+                (0x100000, 0x200000), (0x300000, 0x310000), (0x3F0000, 0x400000), (0x400000, 0x500000),
+            ]
+            if !staticRanges.contains(where: { imageBase < $0.1 && $0.0 < imageEnd }) {
+                regions.append((imageBase, imagePages, 2)) // ローダコード（イメージ）
+            }
             // ヒープ領域はページ記録から動的に分割する
             var index = 0
             while index < pageUsed.count {
@@ -1859,7 +1875,7 @@ enum X86UEFI {
 
         private func writeFileInfo(at address: UInt64, entry: FATVolume.Entry) {
             var info = [UInt8](repeating: 0, count: 80)
-            put64(&info, 0, UInt64(80 + (entry.name.count + 1) * 2))
+            put64(&info, 0, UInt64(80 + (entry.name.utf16.count + 1) * 2))
             put64(&info, 8, UInt64(entry.size))
             put64(&info, 16, UInt64(entry.size))
             put64(&info, 72, entry.isDirectory ? 0x10 : 0)
@@ -1878,7 +1894,7 @@ enum X86UEFI {
                     return success
                 }
                 let entry = listing[object.directoryIndex]
-                let infoSize = 80 + (entry.name.count + 1) * 2
+                let infoSize = 80 + (entry.name.utf16.count + 1) * 2
                 guard capacity >= infoSize else {
                     write(sizeAddress, UInt64(infoSize), size: 8)
                     return bufferTooSmall
@@ -2620,6 +2636,19 @@ enum X86UEFI {
             func videoOffset(_ x: UInt64, _ y: UInt64) -> UInt64 {
                 framebuffer + y * UInt64(pitch) + x * 4
             }
+            // GOP 仕様の範囲検証: フレームバッファをはみ出す Blt は
+            // EFI_INVALID_PARAMETER（隣接メモリへの書き込みや無限ループを防ぐ）
+            let fbW = UInt64(framebufferWidth), fbH = UInt64(framebufferHeight)
+            guard width <= fbW, height <= fbH else { return invalidParameter }
+            func rectInside(_ x: UInt64, _ y: UInt64) -> Bool {
+                x <= fbW - width && y <= fbH - height
+            }
+            switch operation {
+            case 0, 2: guard rectInside(destinationX, destinationY) else { return invalidParameter }
+            case 1: guard rectInside(sourceX, sourceY) else { return invalidParameter }
+            case 3: guard rectInside(sourceX, sourceY), rectInside(destinationX, destinationY) else { return invalidParameter }
+            default: return invalidParameter
+            }
             switch operation {
             case 0: // VideoFill: バッファ先頭の 1 ピクセルで矩形を塗る
                 let pixel = read(buffer, size: 4)
@@ -2824,7 +2853,7 @@ enum X86UEFI {
             }
             guard nextIndex < ordered.count else { return notFound }
             let next = ordered[nextIndex]
-            let needed = (next.name.count + 1) * 2
+            let needed = (next.name.utf16.count + 1) * 2
             guard capacity >= needed else {
                 write(sizeAddress, UInt64(needed), size: 8)
                 return bufferTooSmall

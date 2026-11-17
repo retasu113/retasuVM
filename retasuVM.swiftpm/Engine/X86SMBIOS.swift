@@ -101,9 +101,9 @@ enum X86SMBIOS {
         add(chassis, ["Apple Inc.", "1.0", "RETASUCHASSIS1"])
 
         // タイプ 4: プロセッサ情報
-        var processor = [UInt8](repeating: 0, count: 0x28)
+        var processor = [UInt8](repeating: 0, count: 0x2A)
         processor[0] = 4
-        processor[1] = 0x28
+        processor[1] = 0x2A
         write16(&processor, at: 2, 0x0400)
         processor[4] = 1 // ソケット
         processor[5] = 3 // 中央プロセッサ
@@ -116,10 +116,10 @@ enum X86SMBIOS {
         write16(&processor, at: 22, 2300) // 現在速度 MHz
         processor[24] = 0x41 // 装着済み + 有効
         processor[25] = 1 // アップグレード: その他
-        write16(&processor, at: 26, 0xFFFF)
-        write16(&processor, at: 28, 0xFFFF)
-        write16(&processor, at: 30, 0xFFFF)
-        write16(&processor, at: 0x1A, 0x00C6) // ファミリ 2
+        write16(&processor, at: 26, 0xFFFF)   // L1 キャッシュハンドル（なし）
+        write16(&processor, at: 28, 0xFFFF)   // L2 キャッシュハンドル（なし）
+        write16(&processor, at: 30, 0xFFFF)   // L3 キャッシュハンドル（なし）
+        write16(&processor, at: 0x28, 0x00C6) // ファミリ 2（オフセット 0x28）
         processor[35] = 1 // コア数
         processor[36] = 1 // 有効コア数
         processor[37] = 1 // スレッド数

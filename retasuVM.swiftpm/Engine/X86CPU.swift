@@ -778,7 +778,7 @@ final class X86CPU {
         let errorCode = UInt32(segments[segmentIndex] & 0xFFFC)
         guard cache.present else { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
         if isWrite && !cache.permitsWrite { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
-        if !isWrite && !cache.permitsRead && !cache.isCode { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }
+        if !isWrite && !cache.permitsRead { throw CPUTrap.exception(vector: 13, errorCode: errorCode) }   // 実行専用コードセグメントからのデータ読みも #GP
         let last = offset &+ UInt64(size - 1)
         if cache.isExpandDown {
             let floor = UInt64(cache.limit) &+ 1
@@ -1759,12 +1759,12 @@ final class X86CPU {
             try writeOperand(modRM, size: 2, UInt64(segments[modRM.reg]))
         case 0x8D: // LEA
             let modRM = try decodeModRM()
-            guard !modRM.isRegister else { throw X86Fault.unimplementedOpcode(opcode, address: address) }
+            guard !modRM.isRegister else { throw opcodeFault(opcode, address: address) }   // レジスタ形式は #UD
             setRegisterValue(modRM.reg, size: operandSize, resolvedOffset(modRM))
         case 0x8E: // MOV r/m → セグメント
             let modRM = try decodeModRM()
             guard modRM.reg <= 5 else { throw CPUTrap.exception(vector: 6, errorCode: 0) }
-            guard modRM.reg != 1 else { throw X86Fault.unimplementedOpcode(opcode, address: address) }
+            guard modRM.reg != 1 else { throw opcodeFault(opcode, address: address) }   // CS への MOV は #UD
             let value = try readOperand(modRM, size: 2)
             try loadSegmentRegister(modRM.reg, UInt16(value & 0xFFFF))
             if modRM.reg == 2 { interruptInhibit = 2 } // MOV SS の割り込みシャドウ
@@ -2994,7 +2994,11 @@ final class X86CPU {
     private func fpuStoreInt(_ operand: ModRM, size: Int, popAfter: Bool, truncate: Bool = false) throws {
         let rounded = truncate ? fpuST(0).rounded(.towardZero) : fpuRoundedInteger(fpuST(0))
         let value: UInt64
-        if rounded.isNaN || rounded >= 9.223372036854776e18 || rounded < -9.223372036854776e18 {
+        // 対象サイズに収まらない場合は切り捨てず整数不定値を格納する
+        let outOfRange = rounded.isNaN || rounded >= 9.223372036854776e18 || rounded < -9.223372036854776e18
+            || (size == 2 && (rounded > 32767 || rounded < -32768))
+            || (size == 4 && (rounded > 2147483647 || rounded < -2147483648))
+        if outOfRange {
             value = size == 8 ? 0x8000000000000000 : (size == 4 ? 0x80000000 : 0x8000) // 整数不定値
         } else {
             value = UInt64(bitPattern: Int64(rounded)) & mask(forSize: size)
@@ -3713,10 +3717,10 @@ final class X86CPU {
                 for lane in 0..<4 where src[lane * 4 + 3] & 0x80 != 0 { maskValue |= UInt64(1 << lane) }
             } else { throw opcodeFault(opcode, address: address) }
             setRegisterValue(modRM.reg, size: 4, maskValue)
-        case 0x2A: // CVTSI2SS / CVTSI2SD
+        case 0x2A: // CVTSI2SS / CVTSI2SD（宛先の上位ビットは保持される）
             let modRM = try decodeModRM()
             let raw = try readOperand(modRM, size: operandSize == 8 ? 8 : 4)
-            var result = [UInt8](repeating: 0, count: 16)
+            var result = xmmRegisters[modRM.reg & 15]
             if variant == .ss {
                 let value = operandSize == 8 ? Float(Int64(bitPattern: raw)) : Float(Int32(bitPattern: UInt32(raw)))
                 putLE32(&result, 0, value.bitPattern)
@@ -3750,9 +3754,11 @@ final class X86CPU {
                 for lane in 0..<2 { putLE64(&result, lane * 8, Double(Float(bitPattern: le32(src, lane * 4))).bitPattern) }
             case .pd:
                 for lane in 0..<2 { putLE32(&result, lane * 4, Float(Double(bitPattern: le64(src, lane * 8))).bitPattern) }
-            case .ss:
+            case .ss:   // CVTSS2SD: 宛先の上位 64 ビットは保持
+                result = xmmRegisters[modRM.reg & 15]
                 putLE64(&result, 0, Double(Float(bitPattern: le32(src, 0))).bitPattern)
-            case .sd:
+            case .sd:   // CVTSD2SS: 宛先の上位 96 ビットは保持
+                result = xmmRegisters[modRM.reg & 15]
                 putLE32(&result, 0, Float(Double(bitPattern: le64(src, 0))).bitPattern)
             }
             xmmRegisters[modRM.reg & 15] = result
@@ -4369,9 +4375,14 @@ final class X86CPU {
                 putLE64(&result, lane * 8, doubleOp(a, b).bitPattern)
             }
         case .sd:
-            let a = Double(bitPattern: le64(destBytes, 0))
-            let b = Double(bitPattern: le64(src, 0))
-            putLE64(&result, 0, doubleOp(a, b).bitPattern)
+            if opcode == 0x52 {   // RSQRTSS（F2 0F 52）: 単精度として計算する
+                let b = Float(bitPattern: le32(src, 0))
+                putLE32(&result, 0, (1 / sqrt(b)).bitPattern)
+            } else {
+                let a = Double(bitPattern: le64(destBytes, 0))
+                let b = Double(bitPattern: le64(src, 0))
+                putLE64(&result, 0, doubleOp(a, b).bitPattern)
+            }
         }
         xmmRegisters[dest] = result
     }

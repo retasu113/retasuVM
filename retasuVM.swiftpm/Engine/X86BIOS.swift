@@ -39,6 +39,9 @@ final class X86BIOS {
     private var heads = 255
     private var sectorsPerTrack = 63
     private(set) var bootDrive: UInt8 = 0x80
+    /// INT 10h カーソル状態（AH=01 で設定した形状、AH=02 で設定した位置）。
+    private var cursorShape: UInt16 = 0x0607
+    private var cursorPosition: UInt16 = 0
     private let startTime = Date()
     /// INT 1Ah の日付変更フラグ用: 最後に報告した日番号。
     private var lastTickDay: UInt64 = 0
@@ -147,9 +150,13 @@ final class X86BIOS {
             cpu.setRegister8(0, cpu.devices.biosVideoMode) // AL: 現在のモード
             cpu.setRegister8(4, 80) // AH: 桁数
             cpu.setRegister8(7, 0)  // BH: ページ
-        case 0x03: // カーソル位置取得
-            cpu.setRegister16(2, 0)
-            cpu.setRegister16(1, 0x0607)
+        case 0x01: // カーソル形状設定（CX）
+            cursorShape = cpu.register16(1)
+        case 0x02: // カーソル位置設定（DX: DH=行, DL=列）
+            cursorPosition = cpu.register16(2)
+        case 0x03: // カーソル位置取得（設定した値を返す）
+            cpu.setRegister16(2, cursorPosition)
+            cpu.setRegister16(1, cursorShape)
         default:
             break
         }
