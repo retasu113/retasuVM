@@ -379,7 +379,11 @@ final class VirtioDevice {
         guard let hdr = physRead(q.avail, 4 + 2 * Int(q.size)) else { return nil }
         let idx = UInt16(hdr[2]) | UInt16(hdr[3]) << 8
         if q.lastAvail == idx { return nil }
-        let headSlot = 2 + Int(q.lastAvail % q.size) * 2
+        // avail リングのエントリはバイトオフセット 4 + 2*k（flags/idx の後）。
+        // Henge hv_virtq_pop の avail[2 + last_avail % size] は uint16_t* の要素
+        // インデックスであり、バイト換算では 4 + 2*k になる（旧コードは要素
+        // インデックスの「2」をバイト位置に流用し idx フィールドを読んでいた）。
+        let headSlot = 4 + Int(q.lastAvail % q.size) * 2
         let head = UInt16(hdr[headSlot]) | UInt16(hdr[headSlot + 1]) << 8
         if head >= q.size { return nil }   // まだ書かれていない: 次回に回す（Henge 準拠）
         q.lastAvail &+= 1

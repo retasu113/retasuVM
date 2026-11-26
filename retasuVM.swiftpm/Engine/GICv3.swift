@@ -191,6 +191,13 @@ final class GICv3 {
         spiLevel[intid] = level
     }
 
+    /// SPI をエッジ保留する（MSI ドアベル用。Henge hv_gicv3_pend 相当:
+    /// ラッチを立て、IAR 読み取りでクリアされる）。
+    func pendSPI(_ intid: Int) {
+        guard intid >= 32 && intid < 1024 else { return }
+        spiPending[intid] = true
+    }
+
     // MARK: - ディストリビュータ MMIO
 
     func distRead(offset: UInt64) -> UInt64 {
