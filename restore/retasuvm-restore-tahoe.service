@@ -1,0 +1,20 @@
+[Unit]
+Description=retasuVM restore supervisor - Tahoe 26.6.2 (WSL, parallel instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=retasu
+WorkingDirectory=/home/retasu/retasuvm
+Environment=RB_TAG=tahoe
+Environment=RB_IPSW=/home/retasu/retasuvm/ipsw26/tahoe_26.6.2.ipsw
+Environment=RB_DONE=DONE_26.6.2
+ExecStart=/home/retasu/retasuvm/restore/supervise_restore_multi.sh
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

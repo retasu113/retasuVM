@@ -1,0 +1,15 @@
+[Unit]
+Description=retasuVM Sequoia restore supervisor (DFU->iBEC->ASR cycle, auto-restart)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/home/hatch/workspace/retasuvm/restore/supervise_restore.sh
+WorkingDirectory=/home/hatch/workspace/retasuvm
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=retasuVM restore supervisor - Golden Gate 27.2 (WSL, parallel instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=retasu
+WorkingDirectory=/home/retasu/retasuvm
+Environment=RB_TAG=gg
+Environment=RB_IPSW=/home/retasu/retasuvm/ipsw27/gg_27.2.ipsw
+Environment=RB_DONE=DONE_27.2
+ExecStart=/home/retasu/retasuvm/restore/supervise_restore_multi.sh
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

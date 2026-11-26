@@ -1,0 +1,17 @@
+[Unit]
+Description=retasuVM Sequoia restore supervisor (WSL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=retasu
+WorkingDirectory=/home/retasu/retasuvm
+ExecStart=/home/retasu/retasuvm/restore/supervise_restore_pc.sh
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
